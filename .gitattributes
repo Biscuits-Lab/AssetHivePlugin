@@ -1,0 +1,4 @@
+* text=auto
+*.uasset -text
+*.umap -text
+*.png -text

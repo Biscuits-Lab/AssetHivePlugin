@@ -1,0 +1,25 @@
+{
+	"FileVersion": 3,
+	"Version": 3,
+	"VersionName": "1.1.1",
+	"FriendlyName": "AssetHive",
+	"Description": "AssetHive live import over local TCP, with configurable project import root",
+	"Category": "Importers",
+	"CreatedBy": "AssetHive",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"EnabledByDefault": true,
+	"IsBetaVersion": false,
+	"Installed": true,
+	"Modules": [
+		{
+			"Name": "AssetHive",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"IsExperimentalVersion": false
+}

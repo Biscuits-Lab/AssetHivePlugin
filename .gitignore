@@ -1,0 +1,10 @@
+# Unreal generated files
+**/Binaries/
+**/Intermediate/
+**/Saved/
+**/DerivedDataCache/
+.vs/
+.idea/
+*.sln
+*.suo
+*.log
