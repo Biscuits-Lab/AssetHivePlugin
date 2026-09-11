@@ -975,8 +975,10 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params) {
 }
 
 int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
-    const FString& DestinationPath, TFunction<void(int32, const FString&)> OnProgress) {
+    const FString& DestinationPath, TFunction<void(int32, const FString&)> OnProgress,
+    TArray<FString>* OutImportedFolders) {
   TGuardValue<bool> SaveFailureGuard(GAssetHiveSaveFailed, false);
+  if (OutImportedFolders) OutImportedFolders->Reset();
   if (!Root.IsValid() || !UAssetHiveSettings::IsValidImportRootPath(DestinationPath)) {
     UE_LOG(LogTemp, Error, TEXT("Invalid import job or import root path: %s"), *DestinationPath);
     return 1;
@@ -1608,6 +1610,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       SaveAssetPackage(StaticMesh);
     }
 
+    if (OutImportedFolders && FAssetRegistryModule::GetRegistry().HasAssets(FName(*AssetFolder), true)) {
+      OutImportedFolders->AddUnique(AssetFolder);
+    }
     SetStageProgress(static_cast<float>(AssetEndProgress),
                      FString::Printf(TEXT("资产完成: %s"), *AssetName));
     AssetIndex++;

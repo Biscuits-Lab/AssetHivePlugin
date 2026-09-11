@@ -3,6 +3,8 @@
 #include "AssetHiveEditorToolbar.h"
 #include "AssetHiveImportCommandlet.h"
 #include "AssetHiveTCPServer.h"
+#include "ContentBrowserModule.h"
+#include "IContentBrowserSingleton.h"
 #include "Dom/JsonObject.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
@@ -169,10 +171,11 @@ void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJso
     TStrongObjectPtr<UAssetHiveImportCommandlet> Importer(NewObject<UAssetHiveImportCommandlet>(GetTransientPackage()));
     // Read the project setting for each NEW import. Desktop payloads cannot override it.
     const FString Root = UAssetHiveSettings::GetImportRootPath();
+    TArray<FString> ImportedFolders;
     const int32 ExitCode = Importer->ImportJob(Job, Root, [this, RequestId](int32 Percent, const FString& Stage)
     {
         RecordProgress(RequestId, Percent, Stage);
-    });
+    }, &ImportedFolders);
     auto Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("type"), ExitCode == 0 ? TEXT("complete") : TEXT("error"));
     Result->SetStringField(TEXT("requestId"), RequestId);
@@ -190,4 +193,9 @@ void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJso
     SendJson(Result);
     FSlateNotificationManager::Get().CancelProgressNotification(*ImportProgressHandle);
     ImportProgressHandle.Reset();
+    if (ExitCode == 0 && !ImportedFolders.IsEmpty() && !IsRunningCommandlet())
+    {
+        FContentBrowserModule& ContentBrowser = FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser"));
+        ContentBrowser.Get().SyncBrowserToFolders(ImportedFolders, false, true);
+    }
 }
