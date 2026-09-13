@@ -19,7 +19,7 @@ private:
     void SendJson(const TSharedRef<FJsonObject>& Json);
     void Reply(const FString& RequestId, const FString& Type, const FString& Message);
     void RunImport(const FString& RequestId, const TSharedPtr<FJsonObject>& Job);
-    void RecordProgress(const FString& RequestId, float Percent, const FString& Stage);
+    void RecordProgress(const FString& RequestId, float Percent, const FString& Stage, bool bShowInEditor);
     TUniquePtr<FAssetHiveTCPServer> TCPServer;
     TSharedPtr<TAtomic<bool>> LifetimeToken;
     bool bEditorIntegrationStarted = false;

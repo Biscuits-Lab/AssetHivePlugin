@@ -3,6 +3,7 @@
 #include "AssetHiveEditorToolbar.h"
 #include "AssetHiveImportCommandlet.h"
 #include "AssetHiveTCPServer.h"
+#include "AssetHiveThumbnailRefresh.h"
 #include "ContentBrowserModule.h"
 #include "IContentBrowserSingleton.h"
 #include "Dom/JsonObject.h"
@@ -50,6 +51,7 @@ bool FAssetHiveModule::TickConnection(float DeltaTime)
 
 void FAssetHiveModule::ShutdownModule()
 {
+    AssetHiveThumbnailRefresh::Shutdown();
     if (LifetimeToken.IsValid()) LifetimeToken->Store(false);
     if (TickHandle.IsValid()) FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
     if (bEditorIntegrationStarted) AssetHiveEditorToolbar::Unregister();
@@ -149,7 +151,7 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
     });
 }
 
-void FAssetHiveModule::RecordProgress(const FString& RequestId, float Percent, const FString& Stage)
+void FAssetHiveModule::RecordProgress(const FString& RequestId, float Percent, const FString& Stage, bool bShowInEditor)
 {
     auto Progress = MakeShared<FJsonObject>();
     Progress->SetStringField(TEXT("type"), TEXT("progress"));
@@ -158,6 +160,19 @@ void FAssetHiveModule::RecordProgress(const FString& RequestId, float Percent, c
     Progress->SetStringField(TEXT("stage"), Stage);
     RequestStates.Add(RequestId, Progress);
     SendJson(Progress);
+    // Preparation/compositing still reports to AssetHive, but never opens or
+    // retains an editor progress notification. Real import stages opt in.
+    if (!bShowInEditor) {
+        if (ImportProgressHandle.IsValid()) {
+            FSlateNotificationManager::Get().CancelProgressNotification(*ImportProgressHandle);
+            ImportProgressHandle.Reset();
+        }
+        return;
+    }
+    if (!ImportProgressHandle.IsValid()) {
+        ImportProgressHandle = MakeShared<FProgressNotificationHandle>(FSlateNotificationManager::Get().StartProgressNotification(
+            FText::FromString(TEXT("AssetHive 导入中")), 100));
+    }
     if (ImportProgressHandle.IsValid())
         FSlateNotificationManager::Get().UpdateProgressNotification(*ImportProgressHandle,
             FMath::Clamp(FMath::RoundToInt(Percent), 0, 99), 0, FText::FromString(Stage));
@@ -166,15 +181,14 @@ void FAssetHiveModule::RecordProgress(const FString& RequestId, float Percent, c
 void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJsonObject>& Job)
 {
     check(IsInGameThread());
-    ImportProgressHandle = MakeShared<FProgressNotificationHandle>(FSlateNotificationManager::Get().StartProgressNotification(
-        FText::FromString(TEXT("AssetHive 导入中")), 100));
+
     TStrongObjectPtr<UAssetHiveImportCommandlet> Importer(NewObject<UAssetHiveImportCommandlet>(GetTransientPackage()));
     // Read the project setting for each NEW import. Desktop payloads cannot override it.
     const FString Root = UAssetHiveSettings::GetImportRootPath();
     TArray<FString> ImportedFolders;
-    const int32 ExitCode = Importer->ImportJob(Job, Root, [this, RequestId](int32 Percent, const FString& Stage)
+    const int32 ExitCode = Importer->ImportJob(Job, Root, [this, RequestId](int32 Percent, const FString& Stage, bool bShowInEditor)
     {
-        RecordProgress(RequestId, Percent, Stage);
+        RecordProgress(RequestId, Percent, Stage, bShowInEditor);
     }, &ImportedFolders);
     auto Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("type"), ExitCode == 0 ? TEXT("complete") : TEXT("error"));
@@ -191,7 +205,8 @@ void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJso
     }
     ActiveRequestId.Empty();
     SendJson(Result);
-    FSlateNotificationManager::Get().CancelProgressNotification(*ImportProgressHandle);
+    if (ImportProgressHandle.IsValid())
+        FSlateNotificationManager::Get().CancelProgressNotification(*ImportProgressHandle);
     ImportProgressHandle.Reset();
     if (ExitCode == 0 && !ImportedFolders.IsEmpty() && !IsRunningCommandlet())
     {

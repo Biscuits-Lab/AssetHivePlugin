@@ -1,5 +1,5 @@
 #include "AssetHiveTCPServer.h"
-#include "Async/Async.h"
+#include "Containers/Ticker.h"
 #include "Sockets.h"
 #include "SocketSubsystem.h"
 #include "Containers/StringConv.h"
@@ -79,7 +79,11 @@ void FAssetHiveTCPServer::ProcessMessage(const FString& Message)
     if (OnMessageReceived)
     {
         const auto Callback = OnMessageReceived;
-        AsyncTask(ENamedThreads::GameThread, [Callback, Message]() { Callback(Message); });
+        // The socket worker has no inherited FAppTime. A TaskGraph dispatch from
+        // this thread would carry that empty context onto the game thread and
+        // into render commands created by an import. Run from the normal core
+        // ticker instead so downstream tasks inherit the game thread's frame.
+        ExecuteOnGameThread(TEXT("AssetHiveTCPMessage"), [Callback, Message]() { Callback(Message); });
     }
 }
 

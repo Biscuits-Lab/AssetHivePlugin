@@ -19,6 +19,8 @@ public class AssetHive : ModuleRules
 
         PrivateDependencyModuleNames.AddRange(new[]
         {
+            "RenderCore",
+            "RHI",
             "AssetTools",
             "AssetRegistry",
             "ContentBrowser",

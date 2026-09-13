@@ -1,5 +1,6 @@
 #include "AssetHiveImportCommandlet.h"
 #include "AssetHiveSettings.h"
+#include "AssetHiveThumbnailRefresh.h"
 
 #include "AssetImportTask.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -25,40 +26,30 @@
 #include "Misc/PackageName.h"
 #include "ObjectTools.h"
 #include "PixelFormat.h"
-#include "UObject/SavePackage.h"
+#include "TextureCompiler.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "UObject/Package.h"
 
 
-// Force a texture's resource to be recreated so the live viewport shows valid
-// pixels right after import. Paired with SaveAssetPackage (which synchronously
-// builds and caches the texture's platform data during serialization), this
-// eliminates the first-import race where the async DDC build had not finished
-// yet, causing the material to render the default "missing" texture.
-static void ForceTextureDataReady(UTexture2D *Texture) {
+// Wait only for the referenced texture, including a possible VT rebuild.
+// Resource readiness must not depend on saving its package.
+static void ForceTextureDataReady(UTexture *Texture) {
   if (!Texture) {
     return;
   }
+  UTexture *Textures[] = {Texture};
+  FTextureCompilingManager::Get().FinishCompilation(Textures);
   Texture->UpdateResource();
+  FTextureCompilingManager::Get().FinishCompilation(Textures);
 }
 
 // Imports run on the game thread; keep per-call failure state separate from nested operations.
-static thread_local bool GAssetHiveSaveFailed = false;
-static void SaveAssetPackage(UObject* Object) {
+static thread_local bool GAssetHiveImportFailed = false;
+static void FinalizeImportedAsset(UObject* Object) {
   if (!Object) return;
-  UPackage* Package = Object->GetOutermost();
-  const FString Filename = FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension());
-  IFileManager::Get().MakeDirectory(*FPaths::GetPath(Filename), true);
-  FSavePackageArgs Args;
-  Args.TopLevelFlags = RF_Public | RF_Standalone;
-  Args.SaveFlags = SAVE_NoError;
-  // Save the requested package directly. The editor checkout/prompt helper can skip
-  // newly imported packages while dirty marking is suppressed during load/automation.
-  if (!UPackage::SavePackage(Package, Object, *Filename, Args)) {
-    GAssetHiveSaveFailed = true;
-    UE_LOG(LogTemp, Error, TEXT("AssetHive: failed to save package %s"), *Package->GetName());
-  }
+  // Explicit imports remain unsaved even when ordinary dirty marking is suppressed.
+  Object->GetOutermost()->SetDirtyFlag(true);
 }
 
 UAssetHiveImportCommandlet::UAssetHiveImportCommandlet() {
@@ -178,7 +169,11 @@ static UFbxImportUI *MakeStaticMeshImportOptions() {
   if (ImportOptions->StaticMeshImportData) {
     ImportOptions->StaticMeshImportData->bGenerateLightmapUVs = false;
     ImportOptions->StaticMeshImportData->bAutoGenerateCollision = false;
-    ImportOptions->StaticMeshImportData->NormalImportMethod = FBXNIM_ComputeNormals;
+    // These meshes are always finalized as Nanite. Set it before the initial
+    // FBX build instead of first constructing a full conventional render mesh.
+    ImportOptions->StaticMeshImportData->bBuildNanite = true;
+    // Preserve authored normals; UE still generates missing normals/tangents.
+    ImportOptions->StaticMeshImportData->NormalImportMethod = FBXNIM_ImportNormals;
   }
   return ImportOptions;
 }
@@ -279,6 +274,7 @@ CreateFoliageTypeAsset(const FString &AssetFolder, const FString &AssetName,
   FoliageType->SetStaticMesh(StaticMesh);
   FoliageType->PostEditChange();
   FoliageType->MarkPackageDirty();
+  FinalizeImportedAsset(FoliageType);
   if (bIsNew) {
     FAssetRegistryModule::AssetCreated(FoliageType);
   }
@@ -523,7 +519,7 @@ static UTexture2D *CreatePackedMaskTexture(
   PackedTexture->PostEditChange();
   PackedTexture->MarkPackageDirty();
   ForceTextureDataReady(PackedTexture);
-  SaveAssetPackage(PackedTexture);
+  FinalizeImportedAsset(PackedTexture);
   FAssetRegistryModule::AssetCreated(PackedTexture);
   return PackedTexture;
 }
@@ -613,7 +609,7 @@ CreatePackedDROTexture(const FString &AssetFolder, const FString &AssetName,
   PackedTexture->PostEditChange();
   PackedTexture->MarkPackageDirty();
   ForceTextureDataReady(PackedTexture);
-  SaveAssetPackage(PackedTexture);
+  FinalizeImportedAsset(PackedTexture);
   FAssetRegistryModule::AssetCreated(PackedTexture);
   return PackedTexture;
 }
@@ -681,7 +677,7 @@ static UTexture2D *CreatePackedPlantAlbedoTexture(
   PackedTexture->PostEditChange();
   PackedTexture->MarkPackageDirty();
   ForceTextureDataReady(PackedTexture);
-  SaveAssetPackage(PackedTexture);
+  FinalizeImportedAsset(PackedTexture);
   FAssetRegistryModule::AssetCreated(PackedTexture);
   return PackedTexture;
 }
@@ -771,7 +767,7 @@ CreatePackedNRSTexture(const FString &AssetFolder, const FString &AssetName,
   PackedTexture->PostEditChange();
   PackedTexture->MarkPackageDirty();
   ForceTextureDataReady(PackedTexture);
-  SaveAssetPackage(PackedTexture);
+  FinalizeImportedAsset(PackedTexture);
   FAssetRegistryModule::AssetCreated(PackedTexture);
   return PackedTexture;
 }
@@ -795,7 +791,7 @@ static UMaterialInterface *LoadAssetMaterialParent(
       TEXT("/Game/Common/MaterialInstance/%s.%s"), *ParentName, *ParentName);
   UMaterialInterface *ParentMaterial = LoadObject<UMaterialInterface>(nullptr, *ParentPath);
   if (!ParentMaterial) {
-    GAssetHiveSaveFailed = true;
+    GAssetHiveImportFailed = true;
     UE_LOG(LogTemp, Error, TEXT("AssetHive: missing parent material: %s"), *ParentPath);
     return nullptr;
   }
@@ -806,9 +802,12 @@ static UMaterialInterface *LoadAssetMaterialParent(
         Texture->VirtualTextureStreaming = true;
         Texture->PostEditChange();
         Texture->MarkPackageDirty();
-        SaveAssetPackage(Texture);
+        FinalizeImportedAsset(Texture);
       }
     }
+  }
+  for (UTexture *Texture : Textures) {
+    ForceTextureDataReady(Texture);
   }
   return ParentMaterial;
 }
@@ -843,28 +842,30 @@ CreateAssetMaterialInstance(const FString &AssetFolder,
   MaterialInstance->SetParentEditorOnly(ParentMaterial);
 
   if (AlbedoTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("Albedo")), AlbedoTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("Albedo"))), AlbedoTexture);
   }
   if (MaskTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("Mask")), MaskTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("Mask"))), MaskTexture);
   }
   if (NormalTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("Normal")), NormalTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("Normal"))), NormalTexture);
   }
   if (FuzzTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("fuzzmap")), FuzzTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("fuzzmap"))), FuzzTexture);
   }
 
-  MaterialInstance->PostEditChange();
+  // Publish the complete parameter set once, after texture compilation.
+  UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
   MaterialInstance->MarkPackageDirty();
-  SaveAssetPackage(MaterialInstance);
+  FinalizeImportedAsset(MaterialInstance);
   if (bIsNew) {
     FAssetRegistryModule::AssetCreated(MaterialInstance);
   }
+  AssetHiveThumbnailRefresh::Queue(MaterialInstance);
   return MaterialInstance;
 }
 
@@ -895,20 +896,22 @@ CreateGrassMaterialInstance(const FString &AssetFolder,
   MaterialInstance->SetParentEditorOnly(ParentMaterial);
 
   if (AlbedoTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("Albedo")), AlbedoTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("Albedo"))), AlbedoTexture);
   }
   if (NRSTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("NRS")), NRSTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("NRS"))), NRSTexture);
   }
 
-  MaterialInstance->PostEditChange();
+  // Publish the complete parameter set once, after texture compilation.
+  UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
   MaterialInstance->MarkPackageDirty();
-  SaveAssetPackage(MaterialInstance);
+  FinalizeImportedAsset(MaterialInstance);
   if (bIsNew) {
     FAssetRegistryModule::AssetCreated(MaterialInstance);
   }
+  AssetHiveThumbnailRefresh::Queue(MaterialInstance);
   return MaterialInstance;
 }
 
@@ -940,24 +943,26 @@ CreateDecalMaterialInstance(const FString &AssetFolder,
   MaterialInstance->SetParentEditorOnly(ParentMaterial);
 
   if (AlbedoTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("Albedo")), AlbedoTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("Albedo"))), AlbedoTexture);
   }
   if (DROTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("DRO")), DROTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("DRO"))), DROTexture);
   }
   if (NormalTexture) {
-    UMaterialEditingLibrary::SetMaterialInstanceTextureParameterValue(
-        MaterialInstance, FName(TEXT("Normal")), NormalTexture);
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(TEXT("Normal"))), NormalTexture);
   }
 
-  MaterialInstance->PostEditChange();
+  // Publish the complete parameter set once, after texture compilation.
+  UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
   MaterialInstance->MarkPackageDirty();
-  SaveAssetPackage(MaterialInstance);
+  FinalizeImportedAsset(MaterialInstance);
   if (bIsNew) {
     FAssetRegistryModule::AssetCreated(MaterialInstance);
   }
+  AssetHiveThumbnailRefresh::Queue(MaterialInstance);
   return MaterialInstance;
 }
 
@@ -975,20 +980,20 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params) {
 }
 
 int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
-    const FString& DestinationPath, TFunction<void(int32, const FString&)> OnProgress,
+    const FString& DestinationPath, TFunction<void(int32, const FString&, bool)> OnProgress,
     TArray<FString>* OutImportedFolders) {
-  TGuardValue<bool> SaveFailureGuard(GAssetHiveSaveFailed, false);
+  TGuardValue<bool> ImportFailureGuard(GAssetHiveImportFailed, false);
   if (OutImportedFolders) OutImportedFolders->Reset();
   if (!Root.IsValid() || !UAssetHiveSettings::IsValidImportRootPath(DestinationPath)) {
     UE_LOG(LogTemp, Error, TEXT("Invalid import job or import root path: %s"), *DestinationPath);
     return 1;
   }
-  const auto SetStageProgress = [&OnProgress](float Target, const FString& Stage) {
+  const auto SetStageProgress = [&OnProgress](float Target, const FString& Stage, bool bShowInEditor = true) {
     const int32 Percent = FMath::Clamp(FMath::RoundToInt(Target), 0, 100);
     UE_LOG(LogTemp, Display, TEXT("[AssetHiveProgress]%d|%s"), Percent, *Stage);
-    if (OnProgress) OnProgress(Percent, Stage);
+    if (OnProgress) OnProgress(Percent, Stage, bShowInEditor);
   };
-  SetStageProgress(2.0f, TEXT("读取导入任务"));
+  SetStageProgress(2.0f, TEXT("读取导入任务"), false);
   bool bCreateFoliageDefault = false;
   Root->TryGetBoolField(TEXT("createFoliage"), bCreateFoliageDefault);
 
@@ -1026,7 +1031,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         10 + ((AssetIndex + 1) * 80) / FMath::Max(1, AssetCount);
     SetStageProgress(
         static_cast<float>(AssetBaseProgress),
-        FString::Printf(TEXT("处理资产 %d/%d"), AssetIndex + 1, AssetCount));
+        FString::Printf(TEXT("处理资产 %d/%d"), AssetIndex + 1, AssetCount), false);
 
     TSharedPtr<FJsonObject> AssetObject = AssetValue->AsObject();
     FString AssetName = TEXT("AssetHiveAsset");
@@ -1207,9 +1212,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             continue;
           }
 
-          BaseMesh->NaniteSettings.bEnabled = true;
-          BaseMesh->PostEditChange();
-          BaseMesh->MarkPackageDirty();
+          // Nanite and materials are configured together after texture import.
           ImportedMeshes.Add(BaseMesh);
 
           if (bCreateFoliageForAsset) {
@@ -1409,12 +1412,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             }
             Texture->PostEditChange();
             Texture->MarkPackageDirty();
-            // Root-cause fix: the texture's platform data is built
-            // asynchronously by the DDC. Force it synchronously and persist the
-            // package so the material samples valid pixels on the first import
-            // instead of showing the default "missing" texture.
-            ForceTextureDataReady(Cast<UTexture2D>(Texture));
-            SaveAssetPackage(Texture);
+            // Complete texture resources without serializing the package.
+            ForceTextureDataReady(Texture);
+            FinalizeImportedAsset(Texture);
             FAssetRegistryModule::AssetCreated(Texture);
             if (!SlotName.IsEmpty() &&
                 !TextureBySlotByGroup.FindOrAdd(GroupId).Contains(SlotName)) {
@@ -1460,7 +1460,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       } else if (bIsDecal) {
         SetStageProgress(
             static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
-            FString::Printf(TEXT("合成 DRO 贴图: %s"), *AssetName));
+            FString::Printf(TEXT("合成 DRO 贴图: %s"), *AssetName), false);
         UTexture2D *DisplacementSourceTexture =
             SourceTextureBySlot.Contains(TEXT("displacement"))
                 ? FImageUtils::ImportFileAsTexture2D(
@@ -1489,7 +1489,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 22, 0, 99)),
               FString::Printf(TEXT("合成 Albedo+Opacity 贴图: %s"),
-                              *AssetName));
+                              *AssetName), false);
           UTexture2D *AlbedoSourceTexture =
               SourceTextureBySlot.Contains(TEXT("albedo"))
                   ? FImageUtils::ImportFileAsTexture2D(
@@ -1506,7 +1506,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
-              FString::Printf(TEXT("合成 NRS 贴图: %s"), *AssetName));
+              FString::Printf(TEXT("合成 NRS 贴图: %s"), *AssetName), false);
           UTexture2D *NormalSourceTexture =
               SourceTextureBySlot.Contains(TEXT("normal"))
                   ? FImageUtils::ImportFileAsTexture2D(
@@ -1531,15 +1531,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         } else {
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
-              FString::Printf(TEXT("Composite Textures: %s"), *AssetName));
+              FString::Printf(TEXT("Composite Textures: %s"), *AssetName), false);
           UTexture2D *MaskTexture =
               Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("mask")));
           if (MaskTexture) {
-            MaskTexture->CompressionSettings = TC_Masks;
-            MaskTexture->CompressionNoAlpha = true;
-            MaskTexture->SRGB = false;
-            MaskTexture->PostEditChange();
-            MaskTexture->MarkPackageDirty();
+            // The import loop already applies these mask settings. Do not
+            // restart its build immediately before creating the material.
+            FinalizeImportedAsset(MaskTexture);
           } else {
             UTexture2D *AOSourceTexture =
                 SourceTextureBySlot.Contains(TEXT("ao"))
@@ -1595,29 +1593,51 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       if (!StaticMesh) {
         continue;
       }
+      SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 30, 0, 99)),
+          FString::Printf(TEXT("配置 Nanite 和材质: %s"), *StaticMesh->GetName()));
+      // SetMaterial calls Pre/PostEditChange and rebuilds the mesh for EVERY slot.
+      // Perform one balanced edit so a high-poly mesh is only rebuilt once here.
+      StaticMesh->PreEditChange(nullptr);
       StaticMesh->NaniteSettings.bEnabled = true;
-      if (MaterialInstances.Num() > 0) {
-        const int32 SlotCount =
-            FMath::Max(1, StaticMesh->GetStaticMaterials().Num());
-        for (int32 Index = 0; Index < SlotCount; Index++) {
-          const int32 MaterialIndex =
-              FMath::Min(Index, MaterialInstances.Num() - 1);
-          StaticMesh->SetMaterial(Index, MaterialInstances[MaterialIndex]);
+      TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
+      for (int32 Index = 0; Index < Slots.Num() && MaterialInstances.Num() > 0; ++Index) {
+        UMaterialInstanceConstant *Material = MaterialInstances[FMath::Min(Index, MaterialInstances.Num() - 1)];
+        Slots[Index].MaterialInterface = Material;
+        if (Slots[Index].MaterialSlotName.IsNone()) {
+          Slots[Index].MaterialSlotName = Material->GetFName();
+        }
+        // Preserve imported slot names used by FBX reimport/section matching.
+        if (Slots[Index].ImportedMaterialSlotName.IsNone()) {
+          FName Candidate = Material->GetFName();
+          int32 Suffix = 0;
+          auto IsUsed = [&Slots, Index](FName Name) {
+            for (int32 Other = 0; Other < Slots.Num(); ++Other) {
+              if (Other != Index && Slots[Other].ImportedMaterialSlotName == Name) return true;
+            }
+            return false;
+          };
+          while (IsUsed(Candidate)) {
+            Candidate = FName(*(Material->GetName() + TEXT("_") + FString::FromInt(++Suffix)));
+          }
+          Slots[Index].ImportedMaterialSlotName = Candidate;
         }
       }
       StaticMesh->PostEditChange();
       StaticMesh->MarkPackageDirty();
-      SaveAssetPackage(StaticMesh);
+      FinalizeImportedAsset(StaticMesh);
     }
 
-    if (OutImportedFolders && FAssetRegistryModule::GetRegistry().HasAssets(FName(*AssetFolder), true)) {
+    // The import target is authoritative here. AssetRegistry visibility can lag
+    // behind synchronous imports until later in the frame, so gating this on
+    // HasAssets may suppress the post-import Content Browser navigation.
+    if (OutImportedFolders) {
       OutImportedFolders->AddUnique(AssetFolder);
     }
     SetStageProgress(static_cast<float>(AssetEndProgress),
-                     FString::Printf(TEXT("资产完成: %s"), *AssetName));
+                     FString::Printf(TEXT("资产完成: %s"), *AssetName), false);
     AssetIndex++;
   }
-  SetStageProgress(100.0f, TEXT("导入完成"));
+  SetStageProgress(100.0f, TEXT("导入完成"), false);
 #if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 4)
   if (bNeedRestoreInterchange) {
     if (IConsoleVariable *InterchangeEnable =
@@ -1632,5 +1652,122 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 #endif
   UE_LOG(LogTemp, Display, TEXT("AssetHive import completed: %s"),
          *DestinationPath);
-  return GAssetHiveSaveFailed ? 1 : 0;
+  return GAssetHiveImportFailed ? 1 : 0;
 }
+
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Misc/AutomationTest.h"
+#include "Misc/CommandLine.h"
+#include "StaticMeshCompiler.h"
+#include "UObject/GCObjectScopeGuard.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveMeshImportPerfTest,
+    "AssetHive.Import.HighPolyTiming",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveMeshImportPerfTest::RunTest(const FString &Parameters) {
+  FString Source;
+  if (!FParse::Value(FCommandLine::Get(), TEXT("AssetHivePerfSource="), Source)) {
+    AddInfo(TEXT("Skipped: supply -AssetHivePerfSource=<fbx> for an isolated high-poly measurement."));
+    return true;
+  }
+  if (!TestTrue(TEXT("Source exists"), FPaths::FileExists(Source))) return false;
+  const bool bBaseline = FParse::Param(FCommandLine::Get(), TEXT("AssetHivePerfBaseline"));
+  UAssetImportTask *Task = NewObject<UAssetImportTask>();
+  FGCObjectScopeGuard TaskGuard(Task);
+  Task->Filename = Source;
+  Task->DestinationPath = TEXT("/Game/__AssetHivePerf_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+  Task->DestinationName = TEXT("HighPolyProbe");
+  Task->bAutomated = true;
+  Task->bAsync = false;
+  Task->bSave = false;
+  UFbxImportUI *Options = MakeStaticMeshImportOptions();
+  if (bBaseline) {
+    Options->StaticMeshImportData->bBuildNanite = false;
+    Options->StaticMeshImportData->NormalImportMethod = FBXNIM_ComputeNormals;
+  }
+  Task->Options = Options;
+  // Use the same legacy FBX path as ImportJob without changing a project setting.
+  IConsoleVariable *Interchange = IConsoleManager::Get().FindConsoleVariable(TEXT("Interchange.FeatureFlags.Import.Enable"));
+  const bool bInterchange = Interchange && Interchange->GetBool();
+  if (Interchange) Interchange->Set(false);
+  const double Start = FPlatformTime::Seconds();
+  FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools").Get().ImportAssetTasks({Task});
+  if (Interchange) Interchange->Set(bInterchange);
+  UStaticMesh *Mesh = nullptr;
+  for (UObject *Object : Task->GetObjects()) {
+    if (UStaticMesh *Imported = Cast<UStaticMesh>(Object)) { Mesh = Imported; break; }
+  }
+  if (!TestNotNull(TEXT("Mesh imported"), Mesh)) return false;
+  const double ImportedAt = FPlatformTime::Seconds();
+  FStaticMeshCompilingManager::Get().FinishCompilation({Mesh});
+  if (!Mesh->NaniteSettings.bEnabled) {
+    Mesh->PreEditChange(nullptr);
+    Mesh->NaniteSettings.bEnabled = true;
+    Mesh->PostEditChange();
+    FStaticMeshCompilingManager::Get().FinishCompilation({Mesh});
+  }
+  FinalizeImportedAsset(Mesh);
+  TestTrue(TEXT("Nanite retained"), Mesh->NaniteSettings.bEnabled);
+  TestTrue(TEXT("Mesh stays dirty"), Mesh->GetOutermost()->IsDirty());
+  TestNotNull(TEXT("Source geometry retained"), Mesh->GetMeshDescription(0));
+  if (!bBaseline) TestFalse(TEXT("Authored normals retained"), Mesh->GetSourceModel(0).BuildSettings.bRecomputeNormals);
+  UE_LOG(LogTemp, Display, TEXT("AssetHivePerf: baseline=%d import=%.3fs ready=%.3fs"),
+      bBaseline, ImportedAt - Start, FPlatformTime::Seconds() - Start);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveDirtyImportTest,
+    "AssetHive.Import.UnsavedPackages",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveDirtyImportTest::RunTest(const FString &Parameters) {
+  const FString Root = TEXT("/Game/__AssetHiveDirty_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+  // All asset kinds share the explicit dirty finalization contract, including
+  // packages that started clean (the reimport case).
+  UClass *Classes[] = {UStaticMesh::StaticClass(), UTexture2D::StaticClass(),
+      UMaterialInstanceConstant::StaticClass(), UFoliageType_InstancedStaticMesh::StaticClass()};
+  for (UClass *Class : Classes) {
+    UPackage *Package = CreatePackage(*(Root / Class->GetName()));
+    UObject *Object = NewObject<UObject>(Package, Class, FName(TEXT("Probe")), RF_Public | RF_Standalone);
+    Package->SetDirtyFlag(false);
+    FinalizeImportedAsset(Object);
+    TestTrue(TEXT("Imported package is dirty"), Package->IsDirty());
+    TestFalse(TEXT("Finalization does not write uasset"), FPaths::FileExists(
+        FPackageName::LongPackageNameToFilename(Package->GetName(), FPackageName::GetAssetPackageExtension())));
+  }
+  const FString Source = FPaths::ProjectSavedDir() / TEXT("AssetHiveDirtyProbe.png");
+  TArray<FColor> Pixels;
+  Pixels.Init(FColor(128, 64, 255, 255), 16);
+  TArray64<uint8> Png;
+  FImageUtils::PNGCompressImageArray(4, 4, Pixels, Png);
+  if (!TestTrue(TEXT("Write source fixture"), FFileHelper::SaveArrayToFile(Png, *Source))) return false;
+  auto Asset = MakeShared<FJsonObject>();
+  Asset->SetStringField(TEXT("name"), TEXT("DirtyProbe"));
+  Asset->SetStringField(TEXT("id"), TEXT("test"));
+  Asset->SetStringField(TEXT("assetType"), TEXT("hdri"));
+  Asset->SetArrayField(TEXT("textureFiles"), {MakeShared<FJsonValueString>(Source)});
+  auto Slot = MakeShared<FJsonObject>();
+  Slot->SetStringField(TEXT("file"), Source);
+  Slot->SetStringField(TEXT("slot"), TEXT("HDR"));
+  Asset->SetArrayField(TEXT("textureSlots"), {MakeShared<FJsonValueObject>(Slot)});
+  auto Job = MakeShared<FJsonObject>();
+  Job->SetArrayField(TEXT("assets"), {MakeShared<FJsonValueObject>(Asset)});
+  UAssetHiveImportCommandlet *Importer = NewObject<UAssetHiveImportCommandlet>();
+  FGCObjectScopeGuard ImporterGuard(Importer);
+  for (int32 Pass = 0; Pass < 2; ++Pass) {
+    TArray<FString> Folders;
+    TestEqual(TEXT("Import job completes"), Importer->ImportJob(Job, Root, {}, &Folders), 0);
+    if (!TestEqual(TEXT("Imported folder returned"), Folders.Num(), 1)) break;
+    const FString PackageName = Folders[0] / TEXT("T_DirtyProbe_test_HDR");
+    UTexture2D *Texture = FindObject<UTexture2D>(nullptr, *(PackageName + TEXT(".T_DirtyProbe_test_HDR")));
+    if (!TestNotNull(TEXT("Texture available before saving"), Texture)) break;
+    TestTrue(TEXT("Imported texture source ready"), Texture->Source.IsValid());
+    TestTrue(TEXT("Imported texture stays dirty"), Texture->GetOutermost()->IsDirty());
+    TestFalse(TEXT("Import job never writes uasset"), FPaths::FileExists(
+        FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension())));
+    Texture->GetOutermost()->SetDirtyFlag(false);
+  }
+  IFileManager::Get().Delete(*Source);
+  return true;
+}
+#endif
