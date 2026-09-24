@@ -92,6 +92,9 @@ static FString DetectTextureSlot(const FString &SourceFile) {
   if (Name.Contains(TEXT("metalness")) || Name.Contains(TEXT("metallic")) ||
       Name.Contains(TEXT("metal")))
     return TEXT("metalness");
+  if (Name.Contains(TEXT("emissive")) || Name.Contains(TEXT("emission")) ||
+      Name.Contains(TEXT("emit")))
+    return TEXT("emissive");
   if (Name.Contains(TEXT("displacement")) || Name.Contains(TEXT("height")))
     return TEXT("displacement");
   if (Name.Contains(TEXT("fuzz")))
@@ -1014,6 +1017,97 @@ CreateAssetMaterialInstance(const FString &AssetFolder,
   return MaterialInstance;
 }
 
+static UMaterialInterface *LoadSurfaceMaterialParent(
+    const TArray<UTexture *> &Textures) {
+  UMaterialInterface *ParentMaterial =
+      UAssetHiveSettings::GetSurfaceParentMaterial();
+  if (!ParentMaterial) {
+    GAssetHiveImportFailed = true;
+    UE_LOG(LogTemp, Error, TEXT("AssetHive: missing Surface parent material: %s"),
+           *UAssetHiveSettings::GetSurfaceParentMaterialPath());
+    return nullptr;
+  }
+  for (UTexture *Texture : Textures) {
+    ForceTextureDataReady(Texture);
+  }
+  return ParentMaterial;
+}
+
+static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
+    const FString &MaterialFolder, const FString &AssetName, int32 GroupId,
+    UTexture *BCRTexture, UTexture *NormalTexture, UTexture *MetallicTexture,
+    UTexture *EmissiveTexture, double BaseTiling) {
+  UMaterialInterface *ParentMaterial = LoadSurfaceMaterialParent(
+      {BCRTexture, NormalTexture, MetallicTexture, EmissiveTexture});
+  if (!ParentMaterial) {
+    return nullptr;
+  }
+  const UAssetHiveSettings *Settings = GetDefault<UAssetHiveSettings>();
+  const FString MaterialAssetName =
+      UAssetHiveSettings::GetSurfaceMaterialName(AssetName, GroupId);
+  const FString MaterialPackagePath = MaterialFolder / MaterialAssetName;
+  UPackage *MaterialPackage = CreatePackage(*MaterialPackagePath);
+  UMaterialInstanceConstant *MaterialInstance =
+      FindObject<UMaterialInstanceConstant>(MaterialPackage, *MaterialAssetName);
+  const bool bIsNew = MaterialInstance == nullptr;
+  if (!MaterialInstance) {
+    MaterialInstance = NewObject<UMaterialInstanceConstant>(
+        MaterialPackage, *MaterialAssetName, RF_Public | RF_Standalone);
+  }
+  if (!MaterialInstance) {
+    return nullptr;
+  }
+  MaterialInstance->SetParentEditorOnly(ParentMaterial);
+
+  const FString BCRParameter = Settings->SurfaceBCRParameter.TrimStartAndEnd();
+  const FString NormalParameter = Settings->SurfaceNormalParameter.TrimStartAndEnd();
+  const FString MetallicParameter = Settings->SurfaceMetallicParameter.TrimStartAndEnd();
+  const FString EmissiveParameter = Settings->SurfaceEmissiveParameter.TrimStartAndEnd();
+  const FString MetallicSwitch = Settings->SurfaceUseMetallicSwitch.TrimStartAndEnd();
+  const FString EmissiveSwitch = Settings->SurfaceUseEmissiveSwitch.TrimStartAndEnd();
+  const FString TilingParameter = Settings->SurfaceTilingParameter.TrimStartAndEnd();
+
+  if (BCRTexture && !BCRParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*BCRParameter)), BCRTexture);
+  }
+  if (NormalTexture && !NormalParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*NormalParameter)), NormalTexture);
+  }
+  if (MetallicTexture && !MetallicParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*MetallicParameter)), MetallicTexture);
+  }
+  if (!MetallicSwitch.IsEmpty()) {
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*MetallicSwitch)), MetallicTexture != nullptr);
+  }
+  if (EmissiveTexture && !EmissiveParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*EmissiveParameter)), EmissiveTexture);
+  }
+  if (!EmissiveSwitch.IsEmpty()) {
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*EmissiveSwitch)), EmissiveTexture != nullptr);
+  }
+  if (!TilingParameter.IsEmpty()) {
+    const float Tiling = FMath::Max(0.0001f, static_cast<float>(BaseTiling));
+    MaterialInstance->SetVectorParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*TilingParameter)),
+        FLinearColor(Tiling, Tiling, 0.0f, 0.0f));
+  }
+
+  UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
+  MaterialInstance->MarkPackageDirty();
+  FinalizeImportedAsset(MaterialInstance);
+  if (bIsNew) {
+    FAssetRegistryModule::AssetCreated(MaterialInstance);
+  }
+  AssetHiveThumbnailRefresh::Queue(MaterialInstance);
+  return MaterialInstance;
+}
+
 static UMaterialInstanceConstant *
 CreateGrassMaterialInstance(const FString &AssetFolder,
                             const FString &AssetName, UTexture *AlbedoTexture,
@@ -1199,6 +1293,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     if (!bHasCreateFoliageOverride) {
       bCreateFoliageForAsset = bCreateFoliageDefault;
     }
+    const bool bIsSurface = AssetType == TEXT("surface");
     const bool bIsDecal = AssetType == TEXT("decal");
     const bool bIsHdri = AssetType == TEXT("hdri");
     const bool bIsModelAsset =
@@ -1206,6 +1301,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const bool bIsCustomAsset = AssetSource == TEXT("custom");
     if (AssetId.IsEmpty()) {
       AssetId = TEXT("UnknownId");
+    }
+    FString AssetDestinationPath = DestinationPath;
+    FString SurfaceExportRootPath;
+    if (bIsSurface && AssetObject->TryGetStringField(TEXT("exportRootPath"),
+                                                     SurfaceExportRootPath) &&
+        UAssetHiveSettings::IsValidImportRootPath(SurfaceExportRootPath)) {
+      AssetDestinationPath = SurfaceExportRootPath;
     }
     const FString SafeAssetName = MakeSafeObjectName(AssetName);
     const FString SafeAssetId = MakeSafeObjectName(AssetId);
@@ -1215,11 +1317,26 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const FString AssetStem =
         FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
     const FString AssetFolder =
-        DestinationPath / SafeCategoryFolder / SafeAssetFolderName;
+        AssetDestinationPath / SafeCategoryFolder / SafeAssetFolderName;
+    const FString TextureFolder = bIsSurface ? AssetFolder / TEXT("Tex") : AssetFolder;
+    const FString MaterialFolder = bIsSurface ? AssetFolder / TEXT("MI") : AssetFolder;
+    const bool bUseVT = IsAssetVirtualTextureImportEnabled();
+    double SurfaceBaseTiling = 1.0;
+    const TSharedPtr<FJsonObject> *MaterialParams = nullptr;
+    if (AssetObject->TryGetObjectField(TEXT("materialParams"), MaterialParams) &&
+        MaterialParams && MaterialParams->IsValid()) {
+      double ParsedBaseTiling = 1.0;
+      if ((*MaterialParams)->TryGetNumberField(TEXT("baseTiling"), ParsedBaseTiling) &&
+          FMath::IsFinite(ParsedBaseTiling) && ParsedBaseTiling > 0.0) {
+        SurfaceBaseTiling = ParsedBaseTiling;
+      }
+    }
 
     TMap<int32, TMap<FString, FString>> SourceTextureSlotMapByGroup;
     TMap<int32, TMap<FString, FString>> SourceTextureNormalFormatMapByGroup;
     TMap<FString, int32> SourceTextureGroupByPath;
+    TMap<FString, FString> SourceTextureObjectNameByPath;
+    TMap<FString, FString> SourceTextureResolutionByPath;
     const TArray<TSharedPtr<FJsonValue>> *TextureSlots = nullptr;
     if (AssetObject->TryGetArrayField(TEXT("textureSlots"), TextureSlots) &&
         TextureSlots != nullptr) {
@@ -1234,10 +1351,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         FString SourceFile;
         FString SlotName;
         FString NormalMapFormat;
+        FString ObjectName;
+        FString Resolution;
         int32 GroupId = 1;
         double GroupIdValue = 1.0;
         SlotObject->TryGetStringField(TEXT("file"), SourceFile);
         SlotObject->TryGetStringField(TEXT("slot"), SlotName);
+        SlotObject->TryGetStringField(TEXT("objectName"), ObjectName);
+        SlotObject->TryGetStringField(TEXT("resolution"), Resolution);
         if (SlotObject->TryGetNumberField(TEXT("groupId"), GroupIdValue)) {
           GroupId = FMath::Max(1, static_cast<int32>(GroupIdValue));
         }
@@ -1245,7 +1366,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           GroupId = FMath::Max(1, GroupId);
           const FString SourceKey = NormalizePathLower(SourceFile);
           FString NormalizedSlotName = SlotName.ToLower();
-          if (NormalizedSlotName == TEXT("m") || NormalizedSlotName == TEXT("ordp")) {
+          if (bIsSurface && NormalizedSlotName == TEXT("bcr")) {
+            NormalizedSlotName = TEXT("bcr");
+          } else if (bIsSurface && (NormalizedSlotName == TEXT("n") || NormalizedSlotName == TEXT("normal"))) {
+            NormalizedSlotName = TEXT("normal");
+          } else if (bIsSurface && (NormalizedSlotName == TEXT("m") || NormalizedSlotName == TEXT("metalness") || NormalizedSlotName == TEXT("metallic"))) {
+            NormalizedSlotName = TEXT("metalness");
+          } else if (bIsSurface && (NormalizedSlotName == TEXT("e") || NormalizedSlotName == TEXT("emissive") || NormalizedSlotName == TEXT("emission"))) {
+            NormalizedSlotName = TEXT("emissive");
+          } else if (NormalizedSlotName == TEXT("m") || NormalizedSlotName == TEXT("ordp")) {
             NormalizedSlotName = TEXT("mask");
           } else if (NormalizedSlotName == TEXT("mask")) {
             NormalizedSlotName = TEXT("mask");
@@ -1253,6 +1382,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           SourceTextureSlotMapByGroup.FindOrAdd(GroupId).Add(
               SourceKey, NormalizedSlotName);
           SourceTextureGroupByPath.Add(SourceKey, GroupId);
+          if (!ObjectName.IsEmpty()) {
+            SourceTextureObjectNameByPath.Add(SourceKey, ObjectName);
+          }
+          if (!Resolution.IsEmpty()) {
+            SourceTextureResolutionByPath.Add(SourceKey, Resolution.ToUpper());
+          }
           if (SlotObject->TryGetStringField(TEXT("normalMapFormat"),
                                             NormalMapFormat) &&
               !NormalMapFormat.IsEmpty()) {
@@ -1526,8 +1661,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         const bool bAllowDecalSlots =
             SlotName == TEXT("albedo") || SlotName == TEXT("normal");
         const bool bAllowHdriSlots = SlotName == TEXT("hdr");
-        if ((bIsHdri && !bAllowHdriSlots) || (bIsDecal && !bAllowDecalSlots) ||
-            (!bIsHdri && !bIsDecal && !bAllow3DSlots)) {
+        const bool bAllowSurfaceSlots =
+            bIsSurface && (SlotName == TEXT("bcr") || SlotName == TEXT("normal") ||
+                           SlotName == TEXT("metalness") ||
+                           SlotName == TEXT("emissive"));
+        if ((bIsSurface && !bAllowSurfaceSlots) ||
+            (!bIsSurface &&
+             ((bIsHdri && !bAllowHdriSlots) ||
+              (bIsDecal && !bAllowDecalSlots) ||
+              (!bIsHdri && !bIsDecal && !bAllow3DSlots)))) {
           continue;
         }
         const bool bPlantTextureAssetOnly =
@@ -1545,19 +1687,37 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                             *FPaths::GetCleanFilename(SourceFile)));
         UAssetImportTask *Task = NewObject<UAssetImportTask>();
         Task->Filename = SourceFile;
-        Task->DestinationPath = AssetFolder;
+        Task->DestinationPath = TextureFolder;
+        FString ConfiguredObjectName;
+        if (bIsSurface && SourceTextureObjectNameByPath.Contains(SourceKey)) {
+          ConfiguredObjectName = MakeSafeObjectName(SourceTextureObjectNameByPath[SourceKey]);
+        }
         Task->DestinationName =
-            bMultipleTextureGroups
-                ? FString::Printf(TEXT("T_%s_%03d_%s"), *AssetStem, GroupId,
-                                  *ToSlotSuffix(SlotName))
-                : FString::Printf(TEXT("T_%s_%s"), *AssetStem,
-                                  *ToSlotSuffix(SlotName));
+            !ConfiguredObjectName.IsEmpty()
+                ? ConfiguredObjectName
+                : (bMultipleTextureGroups
+                       ? FString::Printf(TEXT("T_%s_%03d_%s"), *AssetStem, GroupId,
+                                         *ToSlotSuffix(SlotName))
+                       : FString::Printf(TEXT("T_%s_%s"), *AssetStem,
+                                         *ToSlotSuffix(SlotName)));
         Task->bReplaceExisting = true;
         Task->bAutomated = true;
         Task->bAsync = false;
         Task->bSave = false;
 
-        if (SlotName == TEXT("displacement")) {
+        if (bIsSurface) {
+          UTextureFactory *Factory = NewObject<UTextureFactory>();
+          if (SlotName == TEXT("normal")) {
+            Factory->CompressionSettings = TC_Normalmap;
+            Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
+          } else if (SlotName == TEXT("metalness")) {
+            Factory->CompressionSettings = TC_Masks;
+            Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
+          } else {
+            Factory->CompressionSettings = TC_Default;
+          }
+          Task->Factory = Factory;
+        } else if (SlotName == TEXT("displacement")) {
           UTextureFactory *Factory = NewObject<UTextureFactory>();
           Factory->CompressionSettings = TC_Displacementmap;
           Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
@@ -1576,7 +1736,43 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         UE_LOG(LogTemp, Log, TEXT("AssetHive: imported %d texture object(s), %d paths"), ImportedObjects.Num(), Task->ImportedObjectPaths.Num());
         for (UObject *ImportedObject : ImportedObjects) {
           if (UTexture *Texture = Cast<UTexture>(ImportedObject)) {
-            if (SlotName == TEXT("albedo")) {
+            if (bIsSurface) {
+              const FString Resolution = SourceTextureResolutionByPath.Contains(SourceKey)
+                                             ? SourceTextureResolutionByPath[SourceKey]
+                                             : TEXT("");
+              Texture->VirtualTextureStreaming = bUseVT;
+              if (SlotName == TEXT("bcr")) {
+                Texture->CompressionSettings = TC_Default;
+                Texture->SRGB = true;
+                Texture->CompressionNoAlpha = false;
+                Texture->MipGenSettings = TMGS_Sharpen7;
+                Texture->LODGroup = TEXTUREGROUP_World;
+                Texture->LossyCompressionAmount = TLCA_Low;
+                Texture->MaxTextureSize = Resolution == TEXT("2K") ? 2048 : 4096;
+              } else if (SlotName == TEXT("normal")) {
+                Texture->CompressionSettings = TC_Normalmap;
+                Texture->SRGB = false;
+                Texture->CompressionNoAlpha = true;
+                Texture->MipGenSettings = TMGS_Sharpen4;
+                Texture->LODGroup = TEXTUREGROUP_WorldNormalMap;
+                Texture->LossyCompressionAmount = TLCA_Low;
+                Texture->MaxTextureSize = Resolution == TEXT("2K") ? 2048 : 4096;
+              } else if (SlotName == TEXT("metalness")) {
+                Texture->CompressionSettings = TC_Masks;
+                Texture->SRGB = false;
+                Texture->CompressionNoAlpha = true;
+                Texture->LODGroup = TEXTUREGROUP_World;
+                Texture->LossyCompressionAmount = TLCA_Medium;
+                Texture->MaxTextureSize = 2048;
+              } else if (SlotName == TEXT("emissive")) {
+                Texture->CompressionSettings = TC_Default;
+                Texture->SRGB = true;
+                Texture->CompressionNoAlpha = true;
+                Texture->LODGroup = TEXTUREGROUP_World;
+                Texture->LossyCompressionAmount = TLCA_Medium;
+                Texture->MaxTextureSize = 2048;
+              }
+            } else if (SlotName == TEXT("albedo")) {
               Texture->CompressionSettings = TC_Default;
               Texture->SRGB = true;
               Texture->MipGenSettings = TMGS_Sharpen7;
@@ -1629,7 +1825,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       GroupIds.Add(1);
     }
     GroupIds.Sort();
-    const bool bUseVT = IsAssetVirtualTextureImportEnabled();
     TArray<UMaterialInstanceConstant *> MaterialInstances;
     for (const int32 GroupId : GroupIds) {
       const TMap<FString, UTexture *> &TextureBySlot =
@@ -1670,6 +1865,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         MaterialInstance = CreateDecalMaterialInstance(
             AssetFolder, GroupStem, TextureBySlot.FindRef(TEXT("albedo")),
             TextureBySlot.FindRef(TEXT("normal")), DROTexture, bUseVT);
+      } else if (bIsSurface) {
+        MaterialInstance = CreateSurfaceMaterialInstance(
+            MaterialFolder, AssetName, GroupId,
+            TextureBySlot.FindRef(TEXT("bcr")),
+            TextureBySlot.FindRef(TEXT("normal")),
+            TextureBySlot.FindRef(TEXT("metalness")),
+            TextureBySlot.FindRef(TEXT("emissive")), SurfaceBaseTiling);
       } else {
         if (AssetType == TEXT("3dplant")) {
           SetStageProgress(
