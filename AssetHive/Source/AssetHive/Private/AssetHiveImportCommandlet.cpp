@@ -203,11 +203,98 @@ static UStaticMesh *ImportStaticMeshAsset(FAssetToolsModule &AssetToolsModule,
   return nullptr;
 }
 
+static FString NormalizeModelVariantKey(const FString &RawValue) {
+  FString Value = RawValue;
+  Value.TrimStartAndEndInline();
+  if (Value.IsEmpty()) {
+    return TEXT("01");
+  }
+
+  const FRegexPattern PrefixPattern(
+      TEXT("^(?:var(?:iant)?|variation)[\\s._-]*(.+)$"));
+  FRegexMatcher PrefixMatcher(PrefixPattern, Value);
+  if (PrefixMatcher.FindNext()) {
+    Value = PrefixMatcher.GetCaptureGroup(1);
+  }
+
+  FString CleanValue;
+  CleanValue.Reserve(Value.Len());
+  for (const TCHAR Character : Value) {
+    if (FChar::IsAlnum(Character) || Character == TEXT('_') ||
+        Character == TEXT('-')) {
+      CleanValue.AppendChar(Character);
+    }
+  }
+  CleanValue.TrimStartAndEndInline();
+  CleanValue.ReplaceInline(TEXT("_"), TEXT(""));
+  CleanValue.ReplaceInline(TEXT("-"), TEXT(""));
+  if (CleanValue.IsEmpty()) {
+    return TEXT("01");
+  }
+
+  if (CleanValue.IsNumeric()) {
+    const int32 NumericValue = FCString::Atoi(*CleanValue);
+    if (NumericValue > 0) {
+      return FString::Printf(TEXT("%02d"), NumericValue);
+    }
+    return TEXT("01");
+  }
+
+  CleanValue.ToUpperInline();
+  return CleanValue.Left(32);
+}
+
+static bool IsAcceptedModelVariantToken(const FString &Token) {
+  const FString LowerToken = Token.ToLower();
+  if (LowerToken.IsEmpty() || LowerToken == TEXT("base") ||
+      LowerToken == TEXT("default") || LowerToken == TEXT("high") ||
+      LowerToken == TEXT("highpoly") || LowerToken == TEXT("low") ||
+      LowerToken == TEXT("mid") || LowerToken == TEXT("preview") ||
+      LowerToken == TEXT("render") || LowerToken == TEXT("thumb") ||
+      LowerToken == TEXT("thumbnail")) {
+    return false;
+  }
+  if (LowerToken.StartsWith(TEXT("lod"))) {
+    return false;
+  }
+  if (LowerToken == TEXT("1k") || LowerToken == TEXT("2k") ||
+      LowerToken == TEXT("4k") || LowerToken == TEXT("8k") ||
+      LowerToken == TEXT("16k") || LowerToken == TEXT("32k")) {
+    return false;
+  }
+  if (Token.Len() > 6) {
+    return false;
+  }
+  for (const TCHAR Character : Token) {
+    if (!FChar::IsAlnum(Character)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool IsBarePlantVariantToken(const FString &Token) {
+  if (!IsAcceptedModelVariantToken(Token)) {
+    return false;
+  }
+  if (Token.IsNumeric()) {
+    return true;
+  }
+  if (Token.Len() == 1 && FChar::IsAlpha(Token[0])) {
+    return true;
+  }
+  const FRegexPattern BarePattern(
+      TEXT("^(?:[A-Za-z]\\d{1,2}|\\d{1,3}[A-Za-z])$"));
+  FRegexMatcher BareMatcher(BarePattern, Token);
+  return BareMatcher.FindNext();
+}
+
 static bool ExtractPlantVariantAndLod(const FString &SourceFile,
-                                      int32 &OutVariantId, int32 &OutLodIndex) {
+                                      FString &OutVariantKey,
+                                      int32 &OutLodIndex) {
   const FString Base = FPaths::GetBaseFilename(SourceFile).ToLower();
   const FString FullPath = SourceFile.Replace(TEXT("\\"), TEXT("/")).ToLower();
-  OutVariantId = 1;
+  OutVariantKey = TEXT("01");
   OutLodIndex = 0;
 
   {
@@ -221,32 +308,90 @@ static bool ExtractPlantVariantAndLod(const FString &SourceFile,
 
   {
     const FRegexPattern VariantNamedPattern(
-        TEXT("(?:^|[/_\\-.])var(?:iant)?_?(\\d+)(?=$|[/_\\-.])"));
+        TEXT("(?:^|[/_\\-.])(?:var(?:iant)?|variation)_?([A-Za-z0-9]{1,6})(?=$|[/_\\-.])"));
     FRegexMatcher VariantNamedMatcher(VariantNamedPattern, FullPath);
-    if (VariantNamedMatcher.FindNext()) {
-      const FString Token = VariantNamedMatcher.GetCaptureGroup(1);
-      const int32 Parsed = FCString::Atoi(*Token);
-      if (Parsed > 0) {
-        OutVariantId = Parsed;
-        return true;
-      }
+    FString Token;
+    while (VariantNamedMatcher.FindNext()) {
+      Token = VariantNamedMatcher.GetCaptureGroup(1);
+    }
+    if (!Token.IsEmpty() && IsAcceptedModelVariantToken(Token)) {
+      OutVariantKey = NormalizeModelVariantKey(Token);
+      return true;
     }
   }
 
   {
     const FRegexPattern VariantPattern(
-        TEXT("(^|[_\\-.])(\\d{1,3})(?=($|[_\\-.]))"));
+        TEXT("(^|[_\\-.])([A-Za-z0-9]{1,6})(?:$|[_\\-.])"));
     FRegexMatcher VariantMatcher(VariantPattern, Base);
-    if (VariantMatcher.FindNext()) {
-      const FString Token = VariantMatcher.GetCaptureGroup(2);
-      const int32 Parsed = FCString::Atoi(*Token);
-      if (Parsed > 0) {
-        OutVariantId = Parsed;
+    FString Token;
+    while (VariantMatcher.FindNext()) {
+      const FString Candidate = VariantMatcher.GetCaptureGroup(2);
+      if (IsBarePlantVariantToken(Candidate)) {
+        Token = Candidate;
       }
+    }
+    if (!Token.IsEmpty()) {
+      OutVariantKey = NormalizeModelVariantKey(Token);
     }
   }
 
   return true;
+}
+
+static FString NormalizeModelSourceKey(const FString &SourceFile) {
+  return FPaths::ConvertRelativePathToFull(SourceFile)
+      .Replace(TEXT("\\"), TEXT("/"))
+      .ToLower();
+}
+
+static bool ReadModelVariantKey(const TSharedPtr<FJsonObject> &Object,
+                                FString &OutVariantKey) {
+  if (!Object.IsValid()) {
+    return false;
+  }
+
+  const TCHAR *StringFields[] = {TEXT("variantKey"), TEXT("variation"),
+                                 TEXT("variant"), TEXT("variantName"),
+                                 TEXT("variationName"), TEXT("variantNumber")};
+  for (const TCHAR *FieldName : StringFields) {
+    FString TextValue;
+    if (Object->TryGetStringField(FieldName, TextValue) &&
+        !TextValue.TrimStartAndEnd().IsEmpty()) {
+      OutVariantKey = NormalizeModelVariantKey(TextValue);
+      return true;
+    }
+  }
+
+  double NumericValue = 0.0;
+  if (Object->TryGetNumberField(TEXT("variantNumber"), NumericValue) &&
+      NumericValue > 0.0) {
+    OutVariantKey = NormalizeModelVariantKey(
+        FString::FromInt(FMath::Max(1, FMath::RoundToInt(NumericValue))));
+    return true;
+  }
+
+  return false;
+}
+
+static FString ResolveModelVariantKey(
+    const FString &SourceFile,
+    const TMap<FString, FString> &ExplicitVariantByFile,
+    int32 FallbackVariantNumber) {
+  const FString SourceKey = NormalizeModelSourceKey(SourceFile);
+  if (const FString *ExplicitVariant = ExplicitVariantByFile.Find(SourceKey)) {
+    if (!ExplicitVariant->IsEmpty()) {
+      return NormalizeModelVariantKey(*ExplicitVariant);
+    }
+  }
+
+  FString ParsedVariant = TEXT("01");
+  int32 LodIndex = 0;
+  ExtractPlantVariantAndLod(SourceFile, ParsedVariant, LodIndex);
+  if (!ParsedVariant.IsEmpty()) {
+    return ParsedVariant;
+  }
+  return NormalizeModelVariantKey(FString::FromInt(FMath::Max(1, FallbackVariantNumber)));
 }
 
 static UFoliageType_InstancedStaticMesh *
@@ -1126,11 +1271,40 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const TArray<TSharedPtr<FJsonValue>> *ModelFiles = nullptr;
     if (AssetObject->TryGetArrayField(TEXT("modelFiles"), ModelFiles) &&
         ModelFiles != nullptr) {
+      TMap<FString, FString> ExplicitVariantByFile;
+      bool bHasExplicitModelVariants = false;
+      const TArray<TSharedPtr<FJsonValue>> *ModelVariants = nullptr;
+      if (AssetObject->TryGetArrayField(TEXT("modelVariants"), ModelVariants) &&
+          ModelVariants != nullptr) {
+        for (const TSharedPtr<FJsonValue> &VariantValue : *ModelVariants) {
+          if (!VariantValue.IsValid() || VariantValue->Type != EJson::Object) {
+            continue;
+          }
+          const TSharedPtr<FJsonObject> VariantObject = VariantValue->AsObject();
+          if (!VariantObject.IsValid()) {
+            continue;
+          }
+          FString SourceFile;
+          if (!VariantObject->TryGetStringField(TEXT("file"), SourceFile) &&
+              !VariantObject->TryGetStringField(TEXT("path"), SourceFile) &&
+              !VariantObject->TryGetStringField(TEXT("uri"), SourceFile)) {
+            continue;
+          }
+          FString VariantKey;
+          if (SourceFile.IsEmpty() ||
+              !ReadModelVariantKey(VariantObject, VariantKey)) {
+            continue;
+          }
+          ExplicitVariantByFile.Add(NormalizeModelSourceKey(SourceFile), VariantKey);
+          bHasExplicitModelVariants = true;
+        }
+      }
+
       bool bHandledModelImport = false;
       if (AssetType == TEXT("3dplant") && bIsModelAsset) {
         struct FPlantModelEntry {
           FString SourceFile;
-          int32 VariantId = 1;
+          FString VariantKey = TEXT("01");
           int32 LodIndex = 0;
         };
 
@@ -1148,29 +1322,36 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (FPaths::GetExtension(SourceFile).ToLower() == TEXT("abc")) {
             continue;
           }
-          int32 VariantId = 1;
+          const FString VariantKey = ResolveModelVariantKey(
+              SourceFile, ExplicitVariantByFile, PlantModels.Num() + 1);
+          FString ParsedVariantKey = VariantKey;
           int32 LodIndex = 0;
-          ExtractPlantVariantAndLod(SourceFile, VariantId, LodIndex);
+          ExtractPlantVariantAndLod(SourceFile, ParsedVariantKey, LodIndex);
           FPlantModelEntry Entry;
           Entry.SourceFile = SourceFile;
-          Entry.VariantId = VariantId;
+          Entry.VariantKey = VariantKey;
           Entry.LodIndex = LodIndex;
           PlantModels.Add(Entry);
         }
 
-        TMap<int32, TArray<FPlantModelEntry>> ByVariant;
+        TMap<FString, TArray<FPlantModelEntry>> ByVariant;
         for (const FPlantModelEntry &Entry : PlantModels) {
-          ByVariant.FindOrAdd(Entry.VariantId).Add(Entry);
+          ByVariant.FindOrAdd(Entry.VariantKey).Add(Entry);
         }
 
-        TArray<int32> VariantIds;
-        ByVariant.GetKeys(VariantIds);
-        VariantIds.Sort();
+        TArray<FString> VariantKeys;
+        ByVariant.GetKeys(VariantKeys);
+        VariantKeys.Sort([](const FString &A, const FString &B) {
+          const bool bANumeric = A.IsNumeric();
+          const bool bBNumeric = B.IsNumeric();
+          if (bANumeric && bBNumeric) {
+            return FCString::Atoi(*A) < FCString::Atoi(*B);
+          }
+          return A.Compare(B) < 0;
+        });
 
-        int32 VariantCounter = 0;
-        for (const int32 VariantId : VariantIds) {
-          VariantCounter += 1;
-          TArray<FPlantModelEntry> &Entries = ByVariant.FindChecked(VariantId);
+        for (const FString &VariantKey : VariantKeys) {
+          TArray<FPlantModelEntry> &Entries = ByVariant.FindChecked(VariantKey);
           Entries.Sort(
               [](const FPlantModelEntry &A, const FPlantModelEntry &B) {
                 if (A.LodIndex != B.LodIndex)
@@ -1195,10 +1376,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             continue;
           }
 
+          const bool bNeedsVariantSuffix =
+              bHasExplicitModelVariants || VariantKeys.Num() > 1;
           const FString VariantStem =
-              VariantIds.Num() > 1 ? FString::Printf(TEXT("%s_Var%02d"),
-                                                     *AssetStem, VariantCounter)
-                                   : AssetStem;
+              bNeedsVariantSuffix
+                  ? FString::Printf(TEXT("%s_%s"), *AssetStem, *VariantKey)
+                  : AssetStem;
           const FString BaseMeshName =
               FString::Printf(TEXT("SM_%s"), *VariantStem);
 
@@ -1256,12 +1439,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           Task->DestinationPath = AssetFolder;
           FString ModelAssetName;
           if (bIsCustomAsset && bIsModelAsset) {
-            if (ValidModelCount <= 1) {
-              ModelAssetName = FString::Printf(TEXT("SM_%s"), *AssetStem);
-            } else {
-              ModelAssetName = FString::Printf(
-                  TEXT("SM_%s_Var%02d"), *AssetStem, ImportedModelIndex + 1);
-            }
+            const FString VariantKey = ResolveModelVariantKey(
+                SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
+            const bool bNeedsVariantSuffix =
+                bHasExplicitModelVariants || ValidModelCount > 1;
+            ModelAssetName =
+                bNeedsVariantSuffix
+                    ? FString::Printf(TEXT("SM_%s_%s"), *AssetStem,
+                                      *VariantKey)
+                    : FString::Printf(TEXT("SM_%s"), *AssetStem);
           } else {
             ModelAssetName = FString::Printf(TEXT("SM_%s_%s"), *AssetStem,
                                              *DetectModelSuffix(SourceFile));
