@@ -15,6 +15,12 @@ UAssetHiveSettings::UAssetHiveSettings()
     SurfaceUseMetallicSwitch = TEXT("UseMetallicTex");
     SurfaceUseEmissiveSwitch = TEXT("UseEmissive");
     SurfaceTilingParameter = TEXT("Tiling_Offset");
+    PlantAtlasParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/Common/MaterialInstance/MMI_Grass.MMI_Grass")));
+    PlantBillboardParentMaterial = PlantAtlasParentMaterial;
+    PlantAtlasMaterialNamePrefix = TEXT("MI_");
+    PlantBillboardMaterialNamePrefix = TEXT("MI_Billboard_");
+    PlantAlbedoParameter = TEXT("Albedo");
+    PlantNRSParameter = TEXT("NRS");
 }
 FString UAssetHiveSettings::GetDefaultImportRootPath() { return TEXT("/Game/AssetHive"); }
 FString UAssetHiveSettings::GetImportRootPath()
@@ -80,4 +86,73 @@ FString UAssetHiveSettings::GetSurfaceMaterialName(const FString& AssetName, int
     const FString Prefix = GetDefault<UAssetHiveSettings>()->SurfaceMaterialNamePrefix.TrimStartAndEnd().IsEmpty()
         ? TEXT("MI_Env_Tile_") : GetDefault<UAssetHiveSettings>()->SurfaceMaterialNamePrefix.TrimStartAndEnd();
     return GroupId > 1 ? FString::Printf(TEXT("%s%s_%03d"), *Prefix, *SafeAssetName, GroupId) : Prefix + SafeAssetName;
+}
+
+FString UAssetHiveSettings::GetDefaultPlantAtlasParentMaterialPath()
+{
+    return TEXT("/Game/Common/MaterialInstance/MMI_Grass.MMI_Grass");
+}
+
+FString UAssetHiveSettings::GetDefaultPlantBillboardParentMaterialPath()
+{
+    return GetDefaultPlantAtlasParentMaterialPath();
+}
+
+FString UAssetHiveSettings::GetPlantParentMaterialPath(bool bBillboard)
+{
+    const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
+    const TSoftObjectPtr<UMaterialInterface>& Configured = bBillboard
+        ? Settings->PlantBillboardParentMaterial
+        : Settings->PlantAtlasParentMaterial;
+    const FString Path = Configured.ToSoftObjectPath().ToString().TrimStartAndEnd();
+    if (!Path.IsEmpty()) return Path;
+    return bBillboard ? GetDefaultPlantBillboardParentMaterialPath() : GetDefaultPlantAtlasParentMaterialPath();
+}
+
+bool UAssetHiveSettings::IsValidPlantParentMaterialPath(const FString& Path)
+{
+    return IsValidSurfaceParentMaterialPath(Path);
+}
+
+UMaterialInterface* UAssetHiveSettings::GetPlantParentMaterial(bool bBillboard, bool bUseVT)
+{
+    FString Path = GetPlantParentMaterialPath(bBillboard);
+    if (bUseVT) {
+        FString PackageName;
+        FString ObjectName;
+        if (Path.Split(TEXT("."), &PackageName, &ObjectName, ESearchCase::CaseSensitive, ESearchDir::FromEnd)
+            && !ObjectName.EndsWith(TEXT("_VT"), ESearchCase::CaseSensitive)) {
+            Path = FString::Printf(TEXT("%s_VT.%s_VT"), *PackageName, *ObjectName);
+        }
+    }
+    return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
+}
+
+FString UAssetHiveSettings::GetPlantMaterialName(const FString& AssetName, bool bBillboard)
+{
+    FString SafeAssetName = AssetName.TrimStartAndEnd();
+    SafeAssetName.ReplaceInline(TEXT(" "), TEXT("_"));
+    SafeAssetName.ReplaceInline(TEXT("-"), TEXT("_"));
+    SafeAssetName.ReplaceInline(TEXT("."), TEXT("_"));
+    if (SafeAssetName.IsEmpty()) SafeAssetName = TEXT("Plant");
+    const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
+    const FString ConfiguredPrefix = bBillboard
+        ? Settings->PlantBillboardMaterialNamePrefix
+        : Settings->PlantAtlasMaterialNamePrefix;
+    const FString Prefix = ConfiguredPrefix.TrimStartAndEnd().IsEmpty()
+        ? (bBillboard ? TEXT("MI_Billboard_") : TEXT("MI_"))
+        : ConfiguredPrefix.TrimStartAndEnd();
+    return Prefix + SafeAssetName;
+}
+
+FString UAssetHiveSettings::GetPlantAlbedoParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->PlantAlbedoParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Albedo") : Value;
+}
+
+FString UAssetHiveSettings::GetPlantNRSParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->PlantNRSParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("NRS") : Value;
 }

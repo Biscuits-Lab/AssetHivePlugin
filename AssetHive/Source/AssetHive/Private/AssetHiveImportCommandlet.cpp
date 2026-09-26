@@ -99,6 +99,10 @@ static FString DetectTextureSlot(const FString &SourceFile) {
     return TEXT("displacement");
   if (Name.Contains(TEXT("fuzz")))
     return TEXT("fuzz");
+  if (Name.Contains(TEXT("opacitymasked")) ||
+      Name.Contains(TEXT("opacity_mask")) ||
+      Name.Contains(TEXT("opacitymask")))
+    return TEXT("opacity");
   if (Name.Contains(TEXT("mask")) || Name.Contains(TEXT("ordp")))
     return TEXT("mask");
   if (Name.Contains(TEXT("specular")) || Name.Contains(TEXT("spec")))
@@ -1109,16 +1113,26 @@ static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
 }
 
 static UMaterialInstanceConstant *
-CreateGrassMaterialInstance(const FString &AssetFolder,
+CreatePlantMaterialInstance(const FString &AssetFolder,
                             const FString &AssetName, UTexture *AlbedoTexture,
-                            UTexture *NRSTexture, bool bUseVT) {
-  UMaterialInterface *ParentMaterial = LoadAssetMaterialParent(
-      TEXT("MMI_Grass"), bUseVT, {AlbedoTexture, NRSTexture});
+                            UTexture *NRSTexture, const FString &MaterialRole,
+                            bool bUseVT) {
+  const bool bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
+  UMaterialInterface *ParentMaterial =
+      UAssetHiveSettings::GetPlantParentMaterial(bBillboard, bUseVT);
   if (!ParentMaterial) {
+    GAssetHiveImportFailed = true;
+    UE_LOG(LogTemp, Error, TEXT("AssetHive: missing Plant %s parent material: %s"),
+           bBillboard ? TEXT("Billboard") : TEXT("Atlas"),
+           *UAssetHiveSettings::GetPlantParentMaterialPath(bBillboard));
     return nullptr;
   }
+  for (UTexture *Texture : {AlbedoTexture, NRSTexture}) {
+    ForceTextureDataReady(Texture);
+  }
 
-  const FString MaterialAssetName = FString::Printf(TEXT("MI_%s"), *AssetName);
+  const FString MaterialAssetName =
+      UAssetHiveSettings::GetPlantMaterialName(AssetName, bBillboard);
   const FString MaterialPackagePath = AssetFolder / MaterialAssetName;
   UPackage *MaterialPackage = CreatePackage(*MaterialPackagePath);
   UMaterialInstanceConstant *MaterialInstance =
@@ -1136,11 +1150,11 @@ CreateGrassMaterialInstance(const FString &AssetFolder,
 
   if (AlbedoTexture) {
     MaterialInstance->SetTextureParameterValueEditorOnly(
-        FMaterialParameterInfo(FName(TEXT("Albedo"))), AlbedoTexture);
+        FMaterialParameterInfo(FName(*UAssetHiveSettings::GetPlantAlbedoParameter())), AlbedoTexture);
   }
   if (NRSTexture) {
     MaterialInstance->SetTextureParameterValueEditorOnly(
-        FMaterialParameterInfo(FName(TEXT("NRS"))), NRSTexture);
+        FMaterialParameterInfo(FName(*UAssetHiveSettings::GetPlantNRSParameter())), NRSTexture);
   }
 
   // Publish the complete parameter set once, after texture compilation.
@@ -1334,6 +1348,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 
     TMap<int32, TMap<FString, FString>> SourceTextureSlotMapByGroup;
     TMap<int32, TMap<FString, FString>> SourceTextureNormalFormatMapByGroup;
+    TMap<int32, FString> SourceTextureMaterialRoleByGroup;
     TMap<FString, int32> SourceTextureGroupByPath;
     TMap<FString, FString> SourceTextureObjectNameByPath;
     TMap<FString, FString> SourceTextureResolutionByPath;
@@ -1353,12 +1368,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         FString NormalMapFormat;
         FString ObjectName;
         FString Resolution;
+        FString MaterialRole;
         int32 GroupId = 1;
         double GroupIdValue = 1.0;
         SlotObject->TryGetStringField(TEXT("file"), SourceFile);
         SlotObject->TryGetStringField(TEXT("slot"), SlotName);
         SlotObject->TryGetStringField(TEXT("objectName"), ObjectName);
         SlotObject->TryGetStringField(TEXT("resolution"), Resolution);
+        SlotObject->TryGetStringField(TEXT("materialRole"), MaterialRole);
         if (SlotObject->TryGetNumberField(TEXT("groupId"), GroupIdValue)) {
           GroupId = FMath::Max(1, static_cast<int32>(GroupIdValue));
         }
@@ -1388,12 +1405,31 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (!Resolution.IsEmpty()) {
             SourceTextureResolutionByPath.Add(SourceKey, Resolution.ToUpper());
           }
+          if (!MaterialRole.IsEmpty()) {
+            SourceTextureMaterialRoleByGroup.Add(GroupId, MaterialRole.ToLower());
+          }
           if (SlotObject->TryGetStringField(TEXT("normalMapFormat"),
                                             NormalMapFormat) &&
               !NormalMapFormat.IsEmpty()) {
             SourceTextureNormalFormatMapByGroup.FindOrAdd(GroupId).Add(
                 SourceKey, NormalMapFormat.ToLower());
           }
+        }
+      }
+    }
+
+    const TArray<TSharedPtr<FJsonValue>> *MaterialGroups = nullptr;
+    if (AssetObject->TryGetArrayField(TEXT("materialGroups"), MaterialGroups) && MaterialGroups != nullptr) {
+      for (const TSharedPtr<FJsonValue> &GroupValue : *MaterialGroups) {
+        if (!GroupValue.IsValid() || GroupValue->Type != EJson::Object) continue;
+        const TSharedPtr<FJsonObject> GroupObject = GroupValue->AsObject();
+        if (!GroupObject.IsValid()) continue;
+        FString MaterialRole;
+        double GroupIdValue = 1.0;
+        GroupObject->TryGetStringField(TEXT("materialRole"), MaterialRole);
+        GroupObject->TryGetNumberField(TEXT("groupId"), GroupIdValue);
+        if (!MaterialRole.IsEmpty()) {
+          SourceTextureMaterialRoleByGroup.Add(FMath::Max(1, static_cast<int32>(GroupIdValue)), MaterialRole.ToLower());
         }
       }
     }
@@ -1827,6 +1863,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     GroupIds.Sort();
     TArray<UMaterialInstanceConstant *> MaterialInstances;
     for (const int32 GroupId : GroupIds) {
+      const FString MaterialRole = SourceTextureMaterialRoleByGroup.FindRef(GroupId).ToLower();
       const TMap<FString, UTexture *> &TextureBySlot =
           TextureBySlotByGroup.FindOrAdd(GroupId);
       const TMap<FString, FString> &SourceTextureBySlot =
@@ -1914,8 +1951,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               AssetFolder, GroupStem, NormalSourceTexture,
               RoughnessSourceTexture, TranslucencySourceTexture,
               PlantAlbedoTexture, NormalSourceTexture);
-          MaterialInstance = CreateGrassMaterialInstance(
-              AssetFolder, GroupStem, PlantAlbedoTexture, NRSTexture, bUseVT);
+          MaterialInstance = CreatePlantMaterialInstance(
+              AssetFolder, GroupStem, PlantAlbedoTexture, NRSTexture,
+              MaterialRole, bUseVT);
         } else {
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),

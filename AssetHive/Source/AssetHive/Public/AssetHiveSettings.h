@@ -46,6 +46,24 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Tiling Parameter", ToolTip="Vector parameter receiving Base Tiling in XY and zero offset in ZW."))
     FString SurfaceTilingParameter;
 
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Atlas Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Atlas texture groups. Default: /Game/Common/MaterialInstance/MMI_Grass.MMI_Grass"))
+    TSoftObjectPtr<UMaterialInterface> PlantAtlasParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Billboard Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Billboard texture groups. Defaults to the Atlas parent so the two texture sets still produce separate material instances."))
+    TSoftObjectPtr<UMaterialInterface> PlantBillboardParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Atlas Material Name Prefix", ToolTip="Prefix for 3D Plant Atlas material instances. Default: MI_"))
+    FString PlantAtlasMaterialNamePrefix;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Billboard Material Name Prefix", ToolTip="Prefix for 3D Plant Billboard material instances. Default: MI_Billboard_"))
+    FString PlantBillboardMaterialNamePrefix;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Albedo Texture Parameter", ToolTip="Texture parameter receiving the packed Plant albedo/opacity texture."))
+    FString PlantAlbedoParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="NRS Texture Parameter", ToolTip="Texture parameter receiving the packed Plant NRS texture."))
+    FString PlantNRSParameter;
+
     static bool IsValidImportRootPath(const FString& Path);
     static FString GetDefaultImportRootPath();
     static FString GetImportRootPath();
@@ -56,4 +74,12 @@ public:
     static UMaterialInterface* GetSurfaceParentMaterial();
     static bool IsValidSurfaceParentMaterialPath(const FString& Path);
     static FString GetSurfaceMaterialName(const FString& AssetName, int32 GroupId = 1);
+    static FString GetDefaultPlantAtlasParentMaterialPath();
+    static FString GetDefaultPlantBillboardParentMaterialPath();
+    static FString GetPlantParentMaterialPath(bool bBillboard);
+    static UMaterialInterface* GetPlantParentMaterial(bool bBillboard, bool bUseVT);
+    static bool IsValidPlantParentMaterialPath(const FString& Path);
+    static FString GetPlantMaterialName(const FString& AssetName, bool bBillboard);
+    static FString GetPlantAlbedoParameter();
+    static FString GetPlantNRSParameter();
 };

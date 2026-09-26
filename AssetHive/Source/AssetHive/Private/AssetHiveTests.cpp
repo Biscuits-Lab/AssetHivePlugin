@@ -22,6 +22,14 @@ bool FAssetHiveSettingsTest::RunTest(const FString& Parameters)
     TestFalse(TEXT("Surface parent rejects invalid path"), UAssetHiveSettings::IsValidSurfaceParentMaterialPath(TEXT("Content/Material/MI_Test")));
     TestEqual(TEXT("Surface MI name"), UAssetHiveSettings::GetSurfaceMaterialName(TEXT("Moss_Rock"), 1), FString(TEXT("MI_Env_Tile_Moss_Rock")));
     TestEqual(TEXT("Surface MI group name"), UAssetHiveSettings::GetSurfaceMaterialName(TEXT("Moss_Rock"), 2), FString(TEXT("MI_Env_Tile_Moss_Rock_002")));
+    TestEqual(TEXT("Plant atlas parent default"), UAssetHiveSettings::GetDefaultPlantAtlasParentMaterialPath(), FString(TEXT("/Game/Common/MaterialInstance/MMI_Grass.MMI_Grass")));
+    TestEqual(TEXT("Plant billboard parent default"), UAssetHiveSettings::GetDefaultPlantBillboardParentMaterialPath(), UAssetHiveSettings::GetDefaultPlantAtlasParentMaterialPath());
+    TestTrue(TEXT("Plant atlas parent valid"), UAssetHiveSettings::IsValidPlantParentMaterialPath(UAssetHiveSettings::GetPlantParentMaterialPath(false)));
+    TestTrue(TEXT("Plant billboard parent valid"), UAssetHiveSettings::IsValidPlantParentMaterialPath(UAssetHiveSettings::GetPlantParentMaterialPath(true)));
+    TestEqual(TEXT("Plant atlas MI name"), UAssetHiveSettings::GetPlantMaterialName(TEXT("Fern_001"), false), FString(TEXT("MI_Fern_001")));
+    TestEqual(TEXT("Plant billboard MI name"), UAssetHiveSettings::GetPlantMaterialName(TEXT("Fern_001"), true), FString(TEXT("MI_Billboard_Fern_001")));
+    TestEqual(TEXT("Plant albedo parameter"), UAssetHiveSettings::GetPlantAlbedoParameter(), FString(TEXT("Albedo")));
+    TestEqual(TEXT("Plant NRS parameter"), UAssetHiveSettings::GetPlantNRSParameter(), FString(TEXT("NRS")));
 
     UAssetHiveSettings* Defaults = GetMutableDefault<UAssetHiveSettings>();
     const FString Original = Defaults->ImportRootPath;
