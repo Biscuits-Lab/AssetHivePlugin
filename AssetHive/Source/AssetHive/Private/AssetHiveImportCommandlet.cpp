@@ -74,6 +74,13 @@ static FString NormalizePathLower(const FString &Value) {
 
 static FString DetectTextureSlot(const FString &SourceFile) {
   const FString Name = FPaths::GetBaseFilename(SourceFile).ToLower();
+  // SubsurfaceColor (SSC) slot: the library exports the Translucency (T)
+  // texture here, so it must win over the generic "color" rule below.
+  if (Name.Contains(TEXT("subsurface")) ||
+      Name.Contains(TEXT("translucency")) ||
+      Name.Contains(TEXT("translucent")) ||
+      Name.Contains(TEXT("transmission")) || Name.Contains(TEXT("sss")))
+    return TEXT("subsurfacecolor");
   if (Name.Contains(TEXT("albedo")) || Name.Contains(TEXT("basecolor")) ||
       Name.Contains(TEXT("base_color")) || Name.Contains(TEXT("diffuse")) ||
       Name.Contains(TEXT("color")))
@@ -110,10 +117,6 @@ static FString DetectTextureSlot(const FString &SourceFile) {
   if (Name.Contains(TEXT("opacity")) || Name.Contains(TEXT("alpha")) ||
       Name.Contains(TEXT("transparency")))
     return TEXT("opacity");
-  if (Name.Contains(TEXT("translucency")) ||
-      Name.Contains(TEXT("translucent")) ||
-      Name.Contains(TEXT("transmission")) || Name.Contains(TEXT("sss")))
-    return TEXT("translucency");
   return TEXT("");
 }
 
@@ -144,6 +147,9 @@ static FString ToSlotSuffix(const FString &SlotName) {
   }
   if (SlotName.Equals(TEXT("hdr"), ESearchCase::IgnoreCase)) {
     return TEXT("HDR");
+  }
+  if (SlotName.Equals(TEXT("subsurfacecolor"), ESearchCase::IgnoreCase)) {
+    return TEXT("SSC");
   }
   FString Result = SlotName.ToLower();
   Result[0] = FChar::ToUpper(Result[0]);
@@ -1688,10 +1694,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         const bool bIsPlant = AssetType == TEXT("3dplant");
         const bool bAllowPlantExtras =
             bIsPlant &&
-            (SlotName == TEXT("roughness") || SlotName == TEXT("translucency"));
+            (SlotName == TEXT("roughness") || SlotName == TEXT("subsurfacecolor"));
         const bool bAllow3DSlots =
             SlotName == TEXT("albedo") || SlotName == TEXT("normal") ||
             SlotName == TEXT("fuzz") || SlotName == TEXT("mask") ||
+            SlotName == TEXT("subsurfacecolor") ||
             (SlotName == TEXT("displacement") && bAllowDisplacementSlot) ||
             bAllowPlantExtras;
         const bool bAllowDecalSlots =
@@ -1817,7 +1824,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               Texture->SRGB = false;
               Texture->MipGenSettings = TMGS_Sharpen4;
             } else if (SlotName == TEXT("roughness") ||
-                       SlotName == TEXT("translucency")) {
+                       SlotName == TEXT("subsurfacecolor")) {
               Texture->CompressionSettings = TC_Masks;
               Texture->SRGB = false;
             } else if (SlotName == TEXT("fuzz") || SlotName == TEXT("mask")) {
@@ -1942,11 +1949,20 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                   ? FImageUtils::ImportFileAsTexture2D(
                         SourceTextureBySlot[TEXT("roughness")])
                   : nullptr;
+          // The library exports the Megascans Translucency (T) map as the
+          // SubsurfaceColor slot; its luminance still feeds the NRS alpha.
+          // Legacy jobs may still deliver the same map as "translucency".
+          FString SubsurfaceSourceSlot;
+          if (SourceTextureBySlot.Contains(TEXT("subsurfacecolor"))) {
+            SubsurfaceSourceSlot = TEXT("subsurfacecolor");
+          } else if (SourceTextureBySlot.Contains(TEXT("translucency"))) {
+            SubsurfaceSourceSlot = TEXT("translucency");
+          }
           UTexture2D *TranslucencySourceTexture =
-              SourceTextureBySlot.Contains(TEXT("translucency"))
-                  ? FImageUtils::ImportFileAsTexture2D(
-                        SourceTextureBySlot[TEXT("translucency")])
-                  : nullptr;
+              SubsurfaceSourceSlot.IsEmpty()
+                  ? nullptr
+                  : FImageUtils::ImportFileAsTexture2D(
+                        SourceTextureBySlot.FindRef(SubsurfaceSourceSlot));
           UTexture2D *NRSTexture = CreatePackedNRSTexture(
               AssetFolder, GroupStem, NormalSourceTexture,
               RoughnessSourceTexture, TranslucencySourceTexture,
