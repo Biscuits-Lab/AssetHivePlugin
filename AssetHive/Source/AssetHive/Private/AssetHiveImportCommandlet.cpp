@@ -1788,7 +1788,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 Texture->CompressionSettings = TC_Default;
                 Texture->SRGB = true;
                 Texture->CompressionNoAlpha = false;
-                Texture->MipGenSettings = TMGS_Sharpen7;
+                // Surface 纹理不自动锐化：Mip 生成设置交给 Texture Group。
+                Texture->MipGenSettings = TMGS_FromTextureGroup;
                 Texture->LODGroup = TEXTUREGROUP_World;
                 Texture->LossyCompressionAmount = TLCA_Low;
                 Texture->MaxTextureSize = Resolution == TEXT("2K") ? 2048 : 4096;
@@ -1796,7 +1797,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 Texture->CompressionSettings = TC_Normalmap;
                 Texture->SRGB = false;
                 Texture->CompressionNoAlpha = true;
-                Texture->MipGenSettings = TMGS_Sharpen4;
+                Texture->MipGenSettings = TMGS_FromTextureGroup;
                 Texture->LODGroup = TEXTUREGROUP_WorldNormalMap;
                 Texture->LossyCompressionAmount = TLCA_Low;
                 Texture->MaxTextureSize = Resolution == TEXT("2K") ? 2048 : 4096;
@@ -1911,7 +1912,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             TextureBySlot.FindRef(TEXT("normal")), DROTexture, bUseVT);
       } else if (bIsSurface) {
         MaterialInstance = CreateSurfaceMaterialInstance(
-            MaterialFolder, AssetName, GroupId,
+            MaterialFolder, AssetStem, GroupId,
             TextureBySlot.FindRef(TEXT("bcr")),
             TextureBySlot.FindRef(TEXT("normal")),
             TextureBySlot.FindRef(TEXT("metalness")),
