@@ -1210,96 +1210,6 @@ static UTexture2D *CreatePackedORMTexture(
   return PackedTexture;
 }
 
-static UTexture2D *
-CreatePackedDROTexture(const FString &AssetFolder, const FString &AssetName,
-                       UTexture2D *DisplacementTexture,
-                       int32 DisplacementChannel, UTexture2D *RoughnessTexture,
-                       int32 RoughnessChannel, UTexture2D *OpacityTexture,
-                       int32 OpacityChannel, UTexture2D *SizeRefA,
-                       UTexture2D *SizeRefB) {
-  FTexturePixels DisplacementPixels;
-  FTexturePixels RoughnessPixels;
-  FTexturePixels OpacityPixels;
-  const bool HasDisplacement =
-      ReadTexturePixels(DisplacementTexture, DisplacementPixels);
-  const bool HasRoughness =
-      ReadTexturePixels(RoughnessTexture, RoughnessPixels);
-  const bool HasOpacity = ReadTexturePixels(OpacityTexture, OpacityPixels);
-  int32 Width = 0;
-  int32 Height = 0;
-  if (HasDisplacement) {
-    Width = DisplacementPixels.Width;
-    Height = DisplacementPixels.Height;
-  } else if (HasRoughness) {
-    Width = RoughnessPixels.Width;
-    Height = RoughnessPixels.Height;
-  } else if (HasOpacity) {
-    Width = OpacityPixels.Width;
-    Height = OpacityPixels.Height;
-  } else {
-    FTexturePixels RefPixels;
-    if (ReadTexturePixels(SizeRefA, RefPixels) ||
-        ReadTexturePixels(SizeRefB, RefPixels)) {
-      Width = RefPixels.Width;
-      Height = RefPixels.Height;
-    } else {
-      Width = 1024;
-      Height = 1024;
-    }
-  }
-
-  const FString TextureAssetName =
-      FString::Printf(TEXT("T_%s_DRO"), *AssetName);
-  const FString PackagePath = AssetFolder / TextureAssetName;
-  UPackage *Package = CreatePackage(*PackagePath);
-  if (!Package) {
-    return nullptr;
-  }
-
-  UTexture2D *PackedTexture = NewObject<UTexture2D>(Package, *TextureAssetName,
-                                                    RF_Public | RF_Standalone);
-  if (!PackedTexture) {
-    return nullptr;
-  }
-
-  PackedTexture->Source.Init(Width, Height, 1, 1, TSF_BGRA8);
-  uint8 *DestData = PackedTexture->Source.LockMip(0);
-  for (int32 Y = 0; Y < Height; Y++) {
-    for (int32 X = 0; X < Width; X++) {
-      const float U =
-          Width > 1 ? static_cast<float>(X) / static_cast<float>(Width - 1)
-                    : 0.0f;
-      const float V =
-          Height > 1 ? static_cast<float>(Y) / static_cast<float>(Height - 1)
-                     : 0.0f;
-      const uint8 DisplacementValue =
-          SampleChannel(HasDisplacement ? &DisplacementPixels : nullptr, U, V,
-                        DisplacementChannel, static_cast<uint8>(128));
-      const uint8 RoughnessValue =
-          SampleChannel(HasRoughness ? &RoughnessPixels : nullptr, U, V,
-                        RoughnessChannel, static_cast<uint8>(204));
-      const uint8 OpacityValue =
-          SampleChannel(HasOpacity ? &OpacityPixels : nullptr, U, V,
-                        OpacityChannel, static_cast<uint8>(255));
-      const int32 DestIndex = (Y * Width + X) * 4;
-      DestData[DestIndex + 0] = OpacityValue;
-      DestData[DestIndex + 1] = RoughnessValue;
-      DestData[DestIndex + 2] = DisplacementValue;
-      DestData[DestIndex + 3] = 255;
-    }
-  }
-  PackedTexture->Source.UnlockMip(0);
-  PackedTexture->CompressionSettings = TC_Masks;
-  PackedTexture->CompressionNoAlpha = false;
-  PackedTexture->SRGB = false;
-  PackedTexture->PostEditChange();
-  PackedTexture->MarkPackageDirty();
-  ForceTextureDataReady(PackedTexture);
-  FinalizeImportedAsset(PackedTexture);
-  FAssetRegistryModule::AssetCreated(PackedTexture);
-  return PackedTexture;
-}
-
 static UTexture2D *CreatePackedPlantAlbedoTexture(
     const FString &AssetFolder, const FString &AssetName,
     UTexture2D *AlbedoSourceTexture, UTexture2D *OpacitySourceTexture) {
@@ -1717,6 +1627,22 @@ static UMaterialInterface *LoadSurfaceMaterialParent(
   return ParentMaterial;
 }
 
+static UMaterialInterface *LoadDecalMaterialParent(
+    const TArray<UTexture *> &Textures, const FString &DecalParentMode) {
+  UMaterialInterface *ParentMaterial =
+      UAssetHiveSettings::GetDecalParentMaterial(DecalParentMode);
+  if (!ParentMaterial) {
+    GAssetHiveImportFailed = true;
+    UE_LOG(LogTemp, Error, TEXT("AssetHive: missing Decal parent material: %s"),
+           *UAssetHiveSettings::GetDecalParentMaterialPath(DecalParentMode));
+    return nullptr;
+  }
+  for (UTexture *Texture : Textures) {
+    ForceTextureDataReady(Texture);
+  }
+  return ParentMaterial;
+}
+
 static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
     const FString &MaterialFolder, const FString &AssetName, int32 GroupId,
     UTexture *BCRTexture, UTexture *NormalTexture, UTexture *MetallicTexture,
@@ -1849,18 +1775,23 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
 }
 
 static UMaterialInstanceConstant *
-CreateDecalMaterialInstance(const FString &AssetFolder,
-                            const FString &AssetName, UTexture *AlbedoTexture,
-                            UTexture *NormalTexture, UTexture *DROTexture,
-                            bool bUseVT) {
-  UMaterialInterface *ParentMaterial = LoadAssetMaterialParent(
-      TEXT("MMI_GeneralDecal"), bUseVT, {AlbedoTexture, NormalTexture, DROTexture});
+CreateDecalMaterialInstance(const FString &MaterialFolder,
+                            const FString &AssetStem,
+                            UTexture *DiffuseTexture, UTexture *NormalTexture,
+                            UTexture *OpacityTexture, UTexture *ORMTexture,
+                            UTexture *DisplacementTexture,
+                            const FString &DecalParentMode) {
+  UMaterialInterface *ParentMaterial = LoadDecalMaterialParent(
+      {DiffuseTexture, NormalTexture, OpacityTexture, ORMTexture,
+       DisplacementTexture},
+      DecalParentMode);
   if (!ParentMaterial) {
     return nullptr;
   }
 
-  const FString MaterialAssetName = FString::Printf(TEXT("MI_%s"), *AssetName);
-  const FString MaterialPackagePath = AssetFolder / MaterialAssetName;
+  const FString MaterialAssetName =
+      UAssetHiveSettings::GetDecalMaterialName(AssetStem);
+  const FString MaterialPackagePath = MaterialFolder / MaterialAssetName;
   UPackage *MaterialPackage = CreatePackage(*MaterialPackagePath);
   UMaterialInstanceConstant *MaterialInstance =
       FindObject<UMaterialInstanceConstant>(MaterialPackage,
@@ -1875,20 +1806,45 @@ CreateDecalMaterialInstance(const FString &AssetFolder,
   }
   MaterialInstance->SetParentEditorOnly(ParentMaterial);
 
-  if (AlbedoTexture) {
-    MaterialInstance->SetTextureParameterValueEditorOnly(
-        FMaterialParameterInfo(FName(TEXT("Albedo"))), AlbedoTexture);
-  }
-  if (DROTexture) {
-    MaterialInstance->SetTextureParameterValueEditorOnly(
-        FMaterialParameterInfo(FName(TEXT("DRO"))), DROTexture);
-  }
-  if (NormalTexture) {
-    MaterialInstance->SetTextureParameterValueEditorOnly(
-        FMaterialParameterInfo(FName(TEXT("Normal"))), NormalTexture);
+  const FString OpacitySwitch =
+      UAssetHiveSettings::GetDecalUseOpacityTextureSwitch();
+  if (!OpacitySwitch.IsEmpty()) {
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*OpacitySwitch)), true);
+    UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
   }
 
-  // Publish the complete parameter set once, after texture compilation.
+  const FString DiffuseParameter =
+      UAssetHiveSettings::GetDecalDiffuseParameter();
+  const FString NormalParameter =
+      UAssetHiveSettings::GetDecalNormalParameter();
+  const FString OpacityParameter =
+      UAssetHiveSettings::GetDecalOpacityParameter();
+  const FString ORMParameter =
+      UAssetHiveSettings::GetDecalORMTextureParameter();
+  const FString DisplacementParameter =
+      UAssetHiveSettings::GetDecalDisplacementParameter();
+  if (DiffuseTexture && !DiffuseParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*DiffuseParameter)), DiffuseTexture);
+  }
+  if (NormalTexture && !NormalParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*NormalParameter)), NormalTexture);
+  }
+  if (OpacityTexture && !OpacityParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*OpacityParameter)), OpacityTexture);
+  }
+  if (ORMTexture && !ORMParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*ORMParameter)), ORMTexture);
+  }
+  if (DisplacementTexture && !DisplacementParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*DisplacementParameter)),
+        DisplacementTexture);
+  }
   UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
   MaterialInstance->MarkPackageDirty();
   FinalizeImportedAsset(MaterialInstance);
@@ -2015,7 +1971,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     FString AssetDestinationPath =
         bIs3DAsset ? TEXT("/Game/Environment/Asset") : DestinationPath;
     FString SurfaceExportRootPath;
-    if (bIsSurface && AssetObject->TryGetStringField(TEXT("exportRootPath"),
+    if ((bIsSurface || bIsDecal) && AssetObject->TryGetStringField(TEXT("exportRootPath"),
                                                      SurfaceExportRootPath) &&
         UAssetHiveSettings::IsValidImportRootPath(SurfaceExportRootPath)) {
       AssetDestinationPath = SurfaceExportRootPath;
@@ -2041,10 +1997,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                    : FString();
     const FString AssetFolder =
         AssetDestinationPath / SafeCategoryFolder / SafeAssetFolderName;
-    const FString TextureFolder = bIsSurface ? AssetFolder / TEXT("Tex") : AssetFolder;
-    const FString MaterialFolder = bIsSurface ? AssetFolder / TEXT("MI") : AssetFolder;
+    const bool bUsesMaterialFolders = bIsSurface || bIsDecal;
+    const FString TextureFolder = bUsesMaterialFolders ? AssetFolder / TEXT("Tex") : AssetFolder;
+    const FString MaterialFolder = bUsesMaterialFolders ? AssetFolder / TEXT("MI") : AssetFolder;
     const bool bUseVT = IsAssetVirtualTextureImportEnabled();
     double SurfaceBaseTiling = 1.0;
+    FString DecalParentMode = TEXT("decal");
     const TSharedPtr<FJsonObject> *MaterialParams = nullptr;
     if (AssetObject->TryGetObjectField(TEXT("materialParams"), MaterialParams) &&
         MaterialParams && MaterialParams->IsValid()) {
@@ -2052,6 +2010,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       if ((*MaterialParams)->TryGetNumberField(TEXT("baseTiling"), ParsedBaseTiling) &&
           FMath::IsFinite(ParsedBaseTiling) && ParsedBaseTiling > 0.0) {
         SurfaceBaseTiling = ParsedBaseTiling;
+      }
+      FString ParsedDecalParentMode;
+      if ((*MaterialParams)->TryGetStringField(TEXT("decalParentType"),
+                                               ParsedDecalParentMode)) {
+        DecalParentMode =
+            UAssetHiveSettings::NormalizeDecalParentMode(ParsedDecalParentMode);
       }
     }
 
@@ -2092,6 +2056,23 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           GroupId = FMath::Max(1, GroupId);
           const FString SourceKey = NormalizePathLower(SourceFile);
           FString NormalizedSlotName = SlotName.ToLower();
+          if (bIsDecal && (NormalizedSlotName == TEXT("d") ||
+                           NormalizedSlotName == TEXT("diffuse") ||
+                           NormalizedSlotName == TEXT("albedo") ||
+                           NormalizedSlotName == TEXT("basecolor"))) {
+            NormalizedSlotName = TEXT("albedo");
+          } else if (bIsDecal && (NormalizedSlotName == TEXT("n") ||
+                                  NormalizedSlotName == TEXT("normal"))) {
+            NormalizedSlotName = TEXT("normal");
+          } else if (bIsDecal && (NormalizedSlotName == TEXT("o") ||
+                                  NormalizedSlotName == TEXT("opacity") ||
+                                  NormalizedSlotName == TEXT("opacitymasked") ||
+                                  NormalizedSlotName == TEXT("opacitymask"))) {
+            NormalizedSlotName = TEXT("opacity");
+          } else if (bIsDecal && (NormalizedSlotName == TEXT("orm") ||
+                                  NormalizedSlotName == TEXT("ormh"))) {
+            NormalizedSlotName = TEXT("orm");
+          }
           if (bIsSurface && NormalizedSlotName == TEXT("bcr")) {
             NormalizedSlotName = TEXT("bcr");
           } else if (bIsSurface && (NormalizedSlotName == TEXT("n") || NormalizedSlotName == TEXT("normal"))) {
@@ -2448,7 +2429,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               bAllowDisplacementSlot));
         const bool bAllow3DSlots = bAllowAsset3DSlots || bAllowPlantSlots;
         const bool bAllowDecalSlots =
-            SlotName == TEXT("albedo") || SlotName == TEXT("normal");
+            SlotName == TEXT("albedo") || SlotName == TEXT("normal") ||
+            SlotName == TEXT("opacity") || SlotName == TEXT("orm") ||
+            SlotName == TEXT("displacement");
         const bool bAllowHdriSlots = SlotName == TEXT("hdr");
         const bool bAllowSurfaceSlots =
             bIsSurface && (SlotName == TEXT("bcr") || SlotName == TEXT("normal") ||
@@ -2478,7 +2461,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         Task->Filename = SourceFile;
         Task->DestinationPath = TextureFolder;
         FString ConfiguredObjectName;
-        if (bIsSurface && SourceTextureObjectNameByPath.Contains(SourceKey)) {
+        if ((bIsSurface || bIsDecal) && SourceTextureObjectNameByPath.Contains(SourceKey)) {
           ConfiguredObjectName = MakeSafeObjectName(SourceTextureObjectNameByPath[SourceKey]);
         }
         FString ImportedTextureName = ConfiguredObjectName;
@@ -2507,22 +2490,25 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         Task->bAsync = false;
         Task->bSave = false;
 
-        if (bIsSurface) {
+        if (SlotName == TEXT("displacement")) {
+          UTextureFactory *Factory = NewObject<UTextureFactory>();
+          Factory->CompressionSettings = TC_Masks;
+          Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
+          Task->Factory = Factory;
+        } else if (bIsSurface || bIsDecal) {
           UTextureFactory *Factory = NewObject<UTextureFactory>();
           if (SlotName == TEXT("normal")) {
             Factory->CompressionSettings = TC_Normalmap;
             Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
-          } else if (SlotName == TEXT("metalness")) {
+          } else if (bIsSurface && SlotName == TEXT("metalness")) {
+            Factory->CompressionSettings = TC_Masks;
+            Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
+          } else if (bIsDecal && (SlotName == TEXT("opacity") || SlotName == TEXT("orm"))) {
             Factory->CompressionSettings = TC_Masks;
             Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
           } else {
             Factory->CompressionSettings = TC_Default;
           }
-          Task->Factory = Factory;
-        } else if (SlotName == TEXT("displacement")) {
-          UTextureFactory *Factory = NewObject<UTextureFactory>();
-          Factory->CompressionSettings = TC_Displacementmap;
-          Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
           Task->Factory = Factory;
         } else if (SlotName == TEXT("mask")) {
           UTextureFactory *Factory = NewObject<UTextureFactory>();
@@ -2547,12 +2533,22 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             if (bIs3DAsset) {
               Apply3DAssetTexturePreset(Texture, SlotName, EnvironmentProfile,
                                         bUseVT);
-            } else if (bIsSurface) {
+            } else if (bIsSurface || bIsDecal) {
               const FString Resolution = SourceTextureResolutionByPath.Contains(SourceKey)
                                              ? SourceTextureResolutionByPath[SourceKey]
                                              : TEXT("");
-              Texture->VirtualTextureStreaming = bUseVT;
-              if (SlotName == TEXT("bcr")) {
+              const bool bDisplacement = SlotName == TEXT("displacement");
+              Texture->VirtualTextureStreaming = bUseVT && !bDisplacement;
+              if (bDisplacement) {
+                Texture->CompressionSettings = TC_Masks;
+                Texture->SRGB = false;
+                Texture->CompressionNoAlpha = true;
+                Texture->MipGenSettings = TMGS_FromTextureGroup;
+                Texture->LODGroup = TEXTUREGROUP_World;
+                Texture->LossyCompressionAmount = TLCA_Medium;
+                Texture->MaxTextureSize =
+                    bIsDecal ? 1024 : (Resolution == TEXT("2K") ? 2048 : 4096);
+              } else if (SlotName == TEXT("bcr") || (bIsDecal && SlotName == TEXT("albedo"))) {
                 Texture->CompressionSettings = TC_Default;
                 Texture->SRGB = true;
                 Texture->CompressionNoAlpha = false;
@@ -2569,14 +2565,22 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 Texture->LODGroup = TEXTUREGROUP_WorldNormalMap;
                 Texture->LossyCompressionAmount = TLCA_Low;
                 Texture->MaxTextureSize = Resolution == TEXT("2K") ? 2048 : 4096;
-              } else if (SlotName == TEXT("metalness")) {
+              } else if (bIsDecal && (SlotName == TEXT("opacity") || SlotName == TEXT("orm"))) {
+                Texture->CompressionSettings = TC_Masks;
+                Texture->SRGB = false;
+                Texture->CompressionNoAlpha = true;
+                Texture->MipGenSettings = TMGS_FromTextureGroup;
+                Texture->LODGroup = TEXTUREGROUP_World;
+                Texture->LossyCompressionAmount = TLCA_Medium;
+                Texture->MaxTextureSize = 2048;
+              } else if (bIsSurface && SlotName == TEXT("metalness")) {
                 Texture->CompressionSettings = TC_Masks;
                 Texture->SRGB = false;
                 Texture->CompressionNoAlpha = true;
                 Texture->LODGroup = TEXTUREGROUP_World;
                 Texture->LossyCompressionAmount = TLCA_Medium;
                 Texture->MaxTextureSize = 2048;
-              } else if (SlotName == TEXT("emissive")) {
+              } else if (bIsSurface && SlotName == TEXT("emissive")) {
                 Texture->CompressionSettings = TC_Default;
                 Texture->SRGB = true;
                 Texture->CompressionNoAlpha = true;
@@ -2654,30 +2658,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       } else if (bIsDecal) {
         SetStageProgress(
             static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
-            FString::Printf(TEXT("合成 DRO 贴图: %s"), *AssetName), false);
-        UTexture2D *DisplacementSourceTexture =
-            SourceTextureBySlot.Contains(TEXT("displacement"))
-                ? FImageUtils::ImportFileAsTexture2D(
-                      SourceTextureBySlot[TEXT("displacement")])
-                : nullptr;
-        UTexture2D *RoughnessSourceTexture =
-            SourceTextureBySlot.Contains(TEXT("roughness"))
-                ? FImageUtils::ImportFileAsTexture2D(
-                      SourceTextureBySlot[TEXT("roughness")])
-                : nullptr;
-        UTexture2D *OpacitySourceTexture =
-            SourceTextureBySlot.Contains(TEXT("opacity"))
-                ? FImageUtils::ImportFileAsTexture2D(
-                      SourceTextureBySlot[TEXT("opacity")])
-                : nullptr;
-        UTexture2D *DROTexture = CreatePackedDROTexture(
-            AssetFolder, GroupStem, DisplacementSourceTexture, 0,
-            RoughnessSourceTexture, 0, OpacitySourceTexture, 0,
-            Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("albedo"))),
-            Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("normal"))));
+            FString::Printf(TEXT("创建 Decal 材质实例: %s"), *AssetName), false);
         MaterialInstance = CreateDecalMaterialInstance(
-            AssetFolder, GroupStem, TextureBySlot.FindRef(TEXT("albedo")),
-            TextureBySlot.FindRef(TEXT("normal")), DROTexture, bUseVT);
+            MaterialFolder, AssetStem,
+            TextureBySlot.FindRef(TEXT("albedo")),
+            TextureBySlot.FindRef(TEXT("normal")),
+            TextureBySlot.FindRef(TEXT("opacity")),
+            TextureBySlot.FindRef(TEXT("orm")),
+            TextureBySlot.FindRef(TEXT("displacement")),
+            DecalParentMode);
       } else if (bIsSurface) {
         MaterialInstance = CreateSurfaceMaterialInstance(
             MaterialFolder, AssetStem, GroupId,

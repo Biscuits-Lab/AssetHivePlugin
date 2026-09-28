@@ -461,7 +461,7 @@ void Register() {
             &RegisterToolbarMenu));
   }
 
-  FCoreDelegates::OnPostEngineInit.AddStatic(&RegisterToolbarMenu);
+  FCoreDelegates::GetOnPostEngineInit().AddStatic(&RegisterToolbarMenu);
 }
 
 void Unregister() {

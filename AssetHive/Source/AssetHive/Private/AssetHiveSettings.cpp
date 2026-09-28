@@ -15,6 +15,17 @@ UAssetHiveSettings::UAssetHiveSettings()
     SurfaceUseMetallicSwitch = TEXT("UseMetallicTex");
     SurfaceUseEmissiveSwitch = TEXT("UseEmissive");
     SurfaceTilingParameter = TEXT("Tiling_Offset");
+    DecalParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_VT.MI_Env_Decal_VT")));
+    DecalPOMParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_VT.MI_Env_POMDecal_VT")));
+    DecalTriPlanarParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_Tri_VT.MI_Env_Decal_Tri_VT")));
+    DecalTriPlanarPOMParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_Tri_VT.MI_Env_POMDecal_Tri_VT")));
+    DecalMaterialNamePrefix = TEXT("MI_Env_Decal_");
+    DecalDiffuseParameter = TEXT("Diffuse_VT");
+    DecalNormalParameter = TEXT("Normal_VT");
+    DecalOpacityParameter = TEXT("OpacityMasked_VT");
+    DecalORMTextureParameter = TEXT("ORM_VT");
+    DecalDisplacementParameter = TEXT("Displacement");
+    DecalUseOpacityTextureSwitch = TEXT("Opacity_UseOpacityTex");
     AssetBaseParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_VT_Simple.MI_Env_Base_VT_Simple")));
     AssetBaseMaskedParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_Masked_VT_Simple.MI_Env_Base_Masked_VT_Simple")));
     AssetDestructibleParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Destructible/MI_Env_Destructible_VT_UV.MI_Env_Destructible_VT_UV")));
@@ -102,6 +113,132 @@ FString UAssetHiveSettings::GetSurfaceMaterialName(const FString& AssetName, int
     const FString Prefix = GetDefault<UAssetHiveSettings>()->SurfaceMaterialNamePrefix.TrimStartAndEnd().IsEmpty()
         ? TEXT("MI_Env_Tile_") : GetDefault<UAssetHiveSettings>()->SurfaceMaterialNamePrefix.TrimStartAndEnd();
     return GroupId > 1 ? FString::Printf(TEXT("%s%s_%03d"), *Prefix, *SafeAssetName, GroupId) : Prefix + SafeAssetName;
+}
+
+FString UAssetHiveSettings::NormalizeDecalParentMode(const FString& Mode)
+{
+    FString Value = Mode.TrimStartAndEnd().ToLower();
+    Value.ReplaceInline(TEXT("-"), TEXT(""));
+    Value.ReplaceInline(TEXT("_"), TEXT(""));
+    Value.ReplaceInline(TEXT(" "), TEXT(""));
+    if (Value.IsEmpty() || Value == TEXT("decal") || Value == TEXT("normal") || Value == TEXT("normaldecal") || Value == TEXT("普通贴花"))
+    {
+        return TEXT("decal");
+    }
+    if (Value == TEXT("pom") || Value == TEXT("parallax") || Value == TEXT("pomdecal") || Value == TEXT("视差贴花"))
+    {
+        return TEXT("pomDecal");
+    }
+    if (Value == TEXT("tri") || Value == TEXT("triplanar") || Value == TEXT("triplanardecal") || Value == TEXT("decaltri") || Value == TEXT("三平面投射贴花"))
+    {
+        return TEXT("decalTri");
+    }
+    if (Value == TEXT("pomtri") || Value == TEXT("triplanarpom") || Value == TEXT("pomdecaltri") || Value == TEXT("三平面视差贴花"))
+    {
+        return TEXT("pomDecalTri");
+    }
+    return TEXT("decal");
+}
+
+FString UAssetHiveSettings::GetDefaultDecalParentMaterialPath(const FString& Mode)
+{
+    const FString Normalized = NormalizeDecalParentMode(Mode);
+    if (Normalized == TEXT("pomDecal"))
+    {
+        return TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_VT.MI_Env_POMDecal_VT");
+    }
+    if (Normalized == TEXT("decalTri"))
+    {
+        return TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_Tri_VT.MI_Env_Decal_Tri_VT");
+    }
+    if (Normalized == TEXT("pomDecalTri"))
+    {
+        return TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_Tri_VT.MI_Env_POMDecal_Tri_VT");
+    }
+    return TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_VT.MI_Env_Decal_VT");
+}
+
+FString UAssetHiveSettings::GetDecalParentMaterialPath(const FString& Mode)
+{
+    const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
+    const FString Normalized = NormalizeDecalParentMode(Mode);
+    FString Configured;
+    if (Normalized == TEXT("pomDecal"))
+    {
+        Configured = Settings->DecalPOMParentMaterial.ToSoftObjectPath().ToString().TrimStartAndEnd();
+    }
+    else if (Normalized == TEXT("decalTri"))
+    {
+        Configured = Settings->DecalTriPlanarParentMaterial.ToSoftObjectPath().ToString().TrimStartAndEnd();
+    }
+    else if (Normalized == TEXT("pomDecalTri"))
+    {
+        Configured = Settings->DecalTriPlanarPOMParentMaterial.ToSoftObjectPath().ToString().TrimStartAndEnd();
+    }
+    else
+    {
+        Configured = Settings->DecalParentMaterial.ToSoftObjectPath().ToString().TrimStartAndEnd();
+    }
+    return Configured.IsEmpty() ? GetDefaultDecalParentMaterialPath(Normalized) : Configured;
+}
+
+UMaterialInterface* UAssetHiveSettings::GetDecalParentMaterial(const FString& Mode)
+{
+    const FString Path = GetDecalParentMaterialPath(Mode);
+    return IsValidDecalParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
+}
+
+bool UAssetHiveSettings::IsValidDecalParentMaterialPath(const FString& Path)
+{
+    return IsValidSurfaceParentMaterialPath(Path);
+}
+
+FString UAssetHiveSettings::GetDecalMaterialName(const FString& AssetStem)
+{
+    FString SafeAssetStem = AssetStem.TrimStartAndEnd();
+    SafeAssetStem.ReplaceInline(TEXT(" "), TEXT("_"));
+    SafeAssetStem.ReplaceInline(TEXT("-"), TEXT("_"));
+    SafeAssetStem.ReplaceInline(TEXT("."), TEXT("_"));
+    if (SafeAssetStem.IsEmpty()) SafeAssetStem = TEXT("Decal");
+    const FString Prefix = GetDefault<UAssetHiveSettings>()->DecalMaterialNamePrefix.TrimStartAndEnd().IsEmpty()
+        ? TEXT("MI_Env_Decal_") : GetDefault<UAssetHiveSettings>()->DecalMaterialNamePrefix.TrimStartAndEnd();
+    return Prefix + SafeAssetStem;
+}
+
+FString UAssetHiveSettings::GetDecalDiffuseParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->DecalDiffuseParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Diffuse_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetDecalNormalParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->DecalNormalParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Normal_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetDecalOpacityParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->DecalOpacityParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("OpacityMasked_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetDecalORMTextureParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->DecalORMTextureParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("ORM_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetDecalDisplacementParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->DecalDisplacementParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Displacement") : Value;
+}
+
+FString UAssetHiveSettings::GetDecalUseOpacityTextureSwitch()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->DecalUseOpacityTextureSwitch.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Opacity_UseOpacityTex") : Value;
 }
 
 FString UAssetHiveSettings::GetAssetParentMaterialPath(const FString& AssetType, bool bMasked)

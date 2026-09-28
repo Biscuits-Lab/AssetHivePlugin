@@ -46,6 +46,39 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Tiling Parameter", ToolTip="Vector parameter receiving Base Tiling in XY and zero offset in ZW."))
     FString SurfaceTilingParameter;
 
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Normal Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for normal Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_VT.MI_Env_Decal_VT"))
+    TSoftObjectPtr<UMaterialInterface> DecalParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Parallax Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for parallax (POM) Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_VT.MI_Env_POMDecal_VT"))
+    TSoftObjectPtr<UMaterialInterface> DecalPOMParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Triplanar Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for triplanar Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_Tri_VT.MI_Env_Decal_Tri_VT"))
+    TSoftObjectPtr<UMaterialInterface> DecalTriPlanarParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Triplanar Parallax Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for triplanar parallax Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_Tri_VT.MI_Env_POMDecal_Tri_VT"))
+    TSoftObjectPtr<UMaterialInterface> DecalTriPlanarPOMParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Material Name Prefix", ToolTip="Prefix for generated Decal material instances. Default: MI_Env_Decal_"))
+    FString DecalMaterialNamePrefix;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the Decal diffuse texture. Default: Diffuse_VT"))
+    FString DecalDiffuseParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Decal normal texture. Default: Normal_VT"))
+    FString DecalNormalParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="OpacityMasked Texture Parameter", ToolTip="Texture parameter receiving the Decal opacity mask texture. Default: OpacityMasked_VT"))
+    FString DecalOpacityParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="ORM Texture Parameter", ToolTip="Texture parameter receiving AO/Roughness/Metallic packed in RGB. Default: ORM_VT"))
+    FString DecalORMTextureParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Displacement Texture Parameter", ToolTip="Texture parameter receiving the 1K non-virtual Displacement texture for POM Decals. Default: Displacement"))
+    FString DecalDisplacementParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Use Opacity Texture Switch", ToolTip="Static switch enabled when an OpacityMasked texture is present. Default: Opacity_UseOpacityTex"))
+    FString DecalUseOpacityTextureSwitch;
+
     UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Base Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Props, Kits and default Objects 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_VT_Simple.MI_Env_Base_VT_Simple"))
     TSoftObjectPtr<UMaterialInterface> AssetBaseParentMaterial;
 
@@ -123,6 +156,18 @@ public:
     static UMaterialInterface* GetSurfaceParentMaterial();
     static bool IsValidSurfaceParentMaterialPath(const FString& Path);
     static FString GetSurfaceMaterialName(const FString& AssetName, int32 GroupId = 1);
+    static FString NormalizeDecalParentMode(const FString& Mode);
+    static FString GetDefaultDecalParentMaterialPath(const FString& Mode = FString());
+    static FString GetDecalParentMaterialPath(const FString& Mode = FString());
+    static UMaterialInterface* GetDecalParentMaterial(const FString& Mode = FString());
+    static bool IsValidDecalParentMaterialPath(const FString& Path);
+    static FString GetDecalMaterialName(const FString& AssetStem);
+    static FString GetDecalDiffuseParameter();
+    static FString GetDecalNormalParameter();
+    static FString GetDecalOpacityParameter();
+    static FString GetDecalORMTextureParameter();
+    static FString GetDecalDisplacementParameter();
+    static FString GetDecalUseOpacityTextureSwitch();
     static FString GetAssetParentMaterialPath(const FString& AssetType, bool bMasked);
     static UMaterialInterface* GetAssetParentMaterial(const FString& AssetType, bool bMasked);
     static bool IsValidAssetParentMaterialPath(const FString& Path);
