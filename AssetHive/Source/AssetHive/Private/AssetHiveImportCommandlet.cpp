@@ -9,6 +9,10 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
+#include "Engine/CollisionProfile.h"
+#include "Editor.h"
+#include "PhysicsEngine/BodySetup.h"
+#include "StaticMeshEditorSubsystem.h"
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxStaticMeshImportData.h"
 #include "Factories/TextureFactory.h"
@@ -18,6 +22,9 @@
 #include "ImageUtils.h"
 #include "Internationalization/Regex.h"
 #include "MaterialEditingLibrary.h"
+#include "MeshDescription.h"
+#include "StaticMeshAttributes.h"
+#include "Modules/ModuleManager.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/FileHelper.h"
@@ -66,6 +73,325 @@ static FString MakeSafeObjectName(const FString &Name) {
   SafeName.ReplaceInline(TEXT("."), TEXT("_"));
   return SafeName;
 }
+static FString NormalizeAssetTagToken(const FString &Value) {
+  FString Token = Value;
+  Token.TrimStartAndEndInline();
+  Token.ReplaceInline(TEXT(" "), TEXT(""));
+  Token.ReplaceInline(TEXT("_"), TEXT(""));
+  Token.ReplaceInline(TEXT("-"), TEXT(""));
+  return Token.ToLower();
+}
+
+static bool HasAssetTag(const TArray<FString> &Tags, const TCHAR *Expected) {
+  const FString ExpectedToken = NormalizeAssetTagToken(Expected);
+  return Tags.ContainsByPredicate([&ExpectedToken](const FString &Tag) {
+    return NormalizeAssetTagToken(Tag) == ExpectedToken;
+  });
+}
+
+static void CollectAssetTags(const TSharedPtr<FJsonObject> &AssetObject,
+                             TArray<FString> &OutTags) {
+  const TCHAR *FieldNames[] = {TEXT("standardAssetTags"), TEXT("tags")};
+  for (const TCHAR *FieldName : FieldNames) {
+    const TArray<TSharedPtr<FJsonValue>> *Values = nullptr;
+    if (!AssetObject->TryGetArrayField(FieldName, Values) || !Values) {
+      continue;
+    }
+    for (const TSharedPtr<FJsonValue> &Value : *Values) {
+      if (Value.IsValid() && Value->Type == EJson::String) {
+        const FString Tag = Value->AsString().TrimStartAndEnd();
+        if (!Tag.IsEmpty()) {
+          OutTags.AddUnique(Tag);
+        }
+      }
+    }
+  }
+}
+
+struct FEnvironmentAssetProfile {
+  FString TypeKey = TEXT("Objects");
+  FString TypePrefix;
+  bool bUseAssetIdOnly = false;
+  FString FolderName = TEXT("Objects");
+  bool bBaseFamily = true;
+  bool bHighResPreset = true;
+  bool bMega = false;
+};
+
+static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
+    const TArray<FString> &Tags) {
+  FEnvironmentAssetProfile Profile;
+  if (HasAssetTag(Tags, TEXT("MEGA"))) {
+    Profile.TypeKey = TEXT("MEGA");
+    Profile.TypePrefix = TEXT("MEGA");
+    Profile.FolderName = TEXT("MEGA");
+    Profile.bBaseFamily = false;
+    Profile.bHighResPreset = true;
+    Profile.bMega = true;
+    return Profile;
+  }
+  if (HasAssetTag(Tags, TEXT("Kits")) || HasAssetTag(Tags, TEXT("Kit"))) {
+    Profile.TypeKey = TEXT("Kits");
+    Profile.TypePrefix = TEXT("Kit");
+    Profile.FolderName = TEXT("Kits");
+    Profile.bBaseFamily = true;
+    Profile.bHighResPreset = false;
+    return Profile;
+  }
+  if (HasAssetTag(Tags, TEXT("Destructible"))) {
+    Profile.TypeKey = TEXT("Destructible");
+    Profile.TypePrefix = TEXT("Dest");
+    Profile.FolderName = TEXT("Destructible");
+    Profile.bBaseFamily = false;
+    Profile.bHighResPreset = true;
+    return Profile;
+  }
+  if (HasAssetTag(Tags, TEXT("Props"))) {
+    Profile.TypeKey = TEXT("Props");
+    Profile.TypePrefix = TEXT("Prop");
+    Profile.FolderName = TEXT("Props");
+    Profile.bBaseFamily = true;
+    Profile.bHighResPreset = false;
+    return Profile;
+  }
+  if (HasAssetTag(Tags, TEXT("Dressing"))) {
+    Profile.TypeKey = TEXT("Dressing");
+  } else if (HasAssetTag(Tags, TEXT("Megascans"))) {
+    Profile.TypeKey = TEXT("Megascans");
+    Profile.TypePrefix = TEXT("Megascans");
+    Profile.bUseAssetIdOnly = true;
+  } else if (HasAssetTag(Tags, TEXT("PBRMAX"))) {
+    Profile.TypeKey = TEXT("PBRMAX");
+  }
+  Profile.FolderName = TEXT("Objects");
+  Profile.bBaseFamily = true;
+  Profile.bHighResPreset = true;
+  return Profile;
+}
+
+static FString BuildEnvironmentObjectStem(const FEnvironmentAssetProfile &Profile,
+                                          const FString &AssetName,
+                                          const FString &AssetId) {
+  const FString Name = MakeSafeObjectName(AssetName).TrimStartAndEnd();
+  const FString Id = MakeSafeObjectName(AssetId).TrimStartAndEnd();
+  FString Stem;
+  if (Profile.bUseAssetIdOnly && !Id.IsEmpty()) {
+    Stem = Id;
+  } else if (!Id.IsEmpty()) {
+    Stem = Name.IsEmpty() ? Id
+                          : FString::Printf(TEXT("%s_%s"), *Name, *Id);
+  } else {
+    Stem = Name.IsEmpty() ? FString(TEXT("AssetHiveAsset")) : Name;
+  }
+  return Profile.TypePrefix.IsEmpty()
+             ? FString::Printf(TEXT("Env_%s"), *Stem)
+             : FString::Printf(TEXT("Env_%s_%s"), *Profile.TypePrefix, *Stem);
+}
+
+static FString BuildEnvironmentAssetMaterialName(
+    const FString &EnvironmentStem, int32 GroupId,
+    const FString &VariantKey) {
+  return FString::Printf(TEXT("MI_%s_%03d_%s"), *EnvironmentStem, GroupId,
+                         *VariantKey);
+}
+
+static FString DetectResolutionTokenFromName(const FString &SourceFile) {
+  const FString BaseName = FPaths::GetBaseFilename(SourceFile);
+  const FRegexPattern Pattern(
+      TEXT("(?:^|[_\\-. ])(1K|2K|4K|8K|16K)(?=$|[_\\-. ])"));
+  FRegexMatcher Matcher(Pattern, BaseName);
+  return Matcher.FindNext() ? Matcher.GetCaptureGroup(1).ToUpper() : FString();
+}
+
+static int32 ResolutionTokenRank(const FString &Resolution) {
+  if (Resolution == TEXT("16K")) return 5;
+  if (Resolution == TEXT("8K")) return 4;
+  if (Resolution == TEXT("4K")) return 3;
+  if (Resolution == TEXT("2K")) return 2;
+  if (Resolution == TEXT("1K")) return 1;
+  return 0;
+}
+
+static FString Resolve3DTextureResolution(
+    const FString &SourceFile, const FString &SlotName,
+    const FString &ConfiguredResolution,
+    const FEnvironmentAssetProfile &Profile) {
+  const bool bPrimary = SlotName == TEXT("albedo") || SlotName == TEXT("normal");
+  const FString Limit =
+      Profile.bHighResPreset
+          ? (bPrimary ? TEXT("4K") : TEXT("2K"))
+          : (bPrimary ? TEXT("2K") : TEXT("1K"));
+  FString Resolution = ConfiguredResolution.TrimStartAndEnd().ToUpper();
+  if (Resolution.IsEmpty()) {
+    Resolution = DetectResolutionTokenFromName(SourceFile);
+  }
+  if (Resolution.IsEmpty() ||
+      ResolutionTokenRank(Resolution) > ResolutionTokenRank(Limit)) {
+    return Limit;
+  }
+  return Resolution;
+}
+
+static FString ToSlotSuffix(const FString &SlotName);
+
+static FString To3DTextureSlotSuffix(const FString &SlotName) {
+  if (SlotName == TEXT("albedo")) return TEXT("AL");
+  if (SlotName == TEXT("normal")) return TEXT("N");
+  if (SlotName == TEXT("orm")) return TEXT("ORM");
+  if (SlotName == TEXT("mask")) return TEXT("Mask");
+  if (SlotName == TEXT("opacity")) return TEXT("O");
+  if (SlotName == TEXT("emissive")) return TEXT("E");
+  if (SlotName == TEXT("metalness")) return TEXT("M");
+  if (SlotName == TEXT("roughness")) return TEXT("R");
+  if (SlotName == TEXT("displacement")) return TEXT("Dis");
+  if (SlotName == TEXT("subsurfacecolor")) return TEXT("SSC");
+  if (SlotName == TEXT("translucency")) return TEXT("T");
+  if (SlotName == TEXT("fuzz")) return TEXT("Fuzz");
+  return ToSlotSuffix(SlotName).ToUpper();
+}
+
+static void Apply3DAssetTexturePreset(UTexture *Texture,
+                                      const FString &SlotName,
+                                      const FEnvironmentAssetProfile &Profile,
+                                      bool bUseVT) {
+  if (!Texture) {
+    return;
+  }
+  const UTexture2D *Texture2D = Cast<UTexture2D>(Texture);
+  const int32 ActualMax = Texture2D
+                              ? FMath::Max(Texture2D->GetSizeX(), Texture2D->GetSizeY())
+                              : 0;
+  const int32 PrimaryLimit = Profile.bHighResPreset ? 4096 : 2048;
+  const int32 SecondaryLimit = Profile.bHighResPreset ? 2048 : 1024;
+  const bool bPrimary = SlotName == TEXT("albedo") || SlotName == TEXT("normal");
+  int32 DesiredLimit = bPrimary ? PrimaryLimit : SecondaryLimit;
+  if (ActualMax > 0) {
+    DesiredLimit = FMath::Min(DesiredLimit, ActualMax);
+  }
+  Texture->MaxTextureSize = FMath::Clamp(DesiredLimit, 256, 8192);
+  Texture->MipGenSettings = TMGS_FromTextureGroup;
+  Texture->VirtualTextureStreaming = bUseVT && Texture->MaxTextureSize >= 2048;
+
+  if (SlotName == TEXT("albedo")) {
+    Texture->CompressionSettings = TC_Default;
+    Texture->SRGB = true;
+    Texture->CompressionNoAlpha = true;
+    Texture->LODGroup = TEXTUREGROUP_World;
+    Texture->LossyCompressionAmount = TLCA_Low;
+  } else if (SlotName == TEXT("normal")) {
+    Texture->CompressionSettings = TC_Normalmap;
+    Texture->SRGB = false;
+    Texture->CompressionNoAlpha = true;
+    Texture->LODGroup = TEXTUREGROUP_WorldNormalMap;
+    Texture->LossyCompressionAmount = TLCA_Low;
+  } else if (SlotName == TEXT("emissive") ||
+             SlotName == TEXT("subsurfacecolor") ||
+             SlotName == TEXT("translucency")) {
+    Texture->CompressionSettings = TC_Default;
+    Texture->SRGB = true;
+    Texture->CompressionNoAlpha = true;
+    Texture->LODGroup = TEXTUREGROUP_World;
+    Texture->LossyCompressionAmount = TLCA_Medium;
+  } else if (SlotName == TEXT("orm")) {
+    Texture->CompressionSettings = TC_Masks;
+    Texture->SRGB = false;
+    Texture->CompressionNoAlpha = true;
+    Texture->LODGroup = TEXTUREGROUP_World;
+    Texture->LossyCompressionAmount = TLCA_Medium;
+  } else if (SlotName == TEXT("mask") || SlotName == TEXT("opacity")) {
+    Texture->CompressionSettings = TC_Masks;
+    Texture->SRGB = false;
+    Texture->CompressionNoAlpha = false;
+    Texture->LODGroup = TEXTUREGROUP_World;
+    Texture->LossyCompressionAmount = TLCA_Medium;
+  } else if (SlotName == TEXT("fuzz") || SlotName == TEXT("metalness") ||
+             SlotName == TEXT("roughness") || SlotName == TEXT("ao") ||
+             SlotName == TEXT("displacement")) {
+    Texture->CompressionSettings = TC_Masks;
+    Texture->SRGB = false;
+    Texture->CompressionNoAlpha = true;
+    Texture->LODGroup = TEXTUREGROUP_World;
+    Texture->LossyCompressionAmount = TLCA_Medium;
+  }
+}
+
+// Megascans and PBRMAX 3D assets arrive as dense scan meshes. Instead of
+// decimating the source mesh the Nanite build keeps only a fraction of the
+// source triangles so the asset stays inside the scene Dressing mesh spec:
+// 300k triangles, or 550k once the asset is bigger than 10 m on any axis.
+static float GetSourceMeshMaxDimensionCm(const FMeshDescription &Mesh) {
+  const FBox Bounds = Mesh.ComputeBoundingBox();
+  const FVector Size = Bounds.GetSize();
+  return static_cast<float>(FMath::Max3(Size.X, Size.Y, Size.Z));
+}
+
+static int32 ResolveScanSourceTriangleBudget(float MaxDimensionCm) {
+  return MaxDimensionCm > UAssetHiveSettings::GetAsset3DLargeSizeThresholdCm()
+             ? UAssetHiveSettings::GetAsset3DLargeMaxLOD0Triangles()
+             : UAssetHiveSettings::GetAsset3DMaxLOD0Triangles();
+}
+
+// Returns true when the Nanite keep percentage was written for this mesh.
+static bool ApplyNaniteTriangleBudget(UStaticMesh *StaticMesh,
+                                      FString &OutSummary) {
+  OutSummary.Reset();
+  if (!StaticMesh) {
+    return false;
+  }
+  const FMeshDescription *SourceMesh = StaticMesh->GetMeshDescription(0);
+  if (!SourceMesh) {
+    return false;
+  }
+  const int32 SourceTriangles = SourceMesh->Triangles().Num();
+  if (SourceTriangles <= 0) {
+    return false;
+  }
+  const float MaxDimensionCm = GetSourceMeshMaxDimensionCm(*SourceMesh);
+  const int32 TriangleBudget = ResolveScanSourceTriangleBudget(MaxDimensionCm);
+  if (TriangleBudget <= 0) {
+    return false;
+  }
+  // Keeping 100% of the source triangles leaves Nanite untouched.
+  const float KeepPercent =
+      SourceTriangles <= TriangleBudget
+          ? 1.0f
+          : FMath::Clamp(static_cast<float>(TriangleBudget) /
+                             static_cast<float>(SourceTriangles),
+                         0.0f, 1.0f);
+  if (FMath::IsNearlyEqual(StaticMesh->NaniteSettings.KeepPercentTriangles,
+                           KeepPercent, 0.0001f)) {
+    return false;
+  }
+  StaticMesh->NaniteSettings.KeepPercentTriangles = KeepPercent;
+  OutSummary = FString::Printf(
+      TEXT("%s %.2f m source, %d triangles, budget %d, Nanite keep %.4f"),
+      *StaticMesh->GetName(), MaxDimensionCm / 100.0f, SourceTriangles,
+      TriangleBudget, KeepPercent);
+  UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
+  return true;
+}
+
+static void Configure3DAssetCollision(UStaticMesh *StaticMesh) {
+  if (!StaticMesh) {
+    return;
+  }
+  UBodySetup *BodySetup = StaticMesh->GetBodySetup();
+  const bool bHasCollision =
+      BodySetup && BodySetup->AggGeom.GetElementCount() > 0;
+  if (!bHasCollision && GEditor) {
+    if (UStaticMeshEditorSubsystem *Subsystem =
+            GEditor->GetEditorSubsystem<UStaticMeshEditorSubsystem>()) {
+      Subsystem->SetConvexDecompositionCollisions(StaticMesh, 1, 16, 16);
+      BodySetup = StaticMesh->GetBodySetup();
+    }
+  }
+  if (BodySetup) {
+    BodySetup->DefaultInstance.SetCollisionProfileName(
+        UCollisionProfile::BlockAll_ProfileName);
+    BodySetup->MarkPackageDirty();
+  }
+  FinalizeImportedAsset(StaticMesh);
+}
 
 static FString NormalizePathLower(const FString &Value) {
   FString Result = Value.Replace(TEXT("\\"), TEXT("/"));
@@ -88,6 +414,12 @@ static FString DetectTextureSlot(const FString &SourceFile) {
   if (Name.Contains(TEXT("hdr")) || Name.Contains(TEXT("hdri")) ||
       Name.EndsWith(TEXT(".hdr")) || Name.EndsWith(TEXT(".exr")))
     return TEXT("hdr");
+  if (Name == TEXT("orm") || Name == TEXT("ormh") ||
+      Name.EndsWith(TEXT("_orm")) || Name.EndsWith(TEXT("-orm")) ||
+      Name.EndsWith(TEXT("_ormh")) || Name.EndsWith(TEXT("-ormh")) ||
+      Name.Contains(TEXT("_orm_")) || Name.Contains(TEXT("-orm-")) ||
+      Name.Contains(TEXT("_ormh_")) || Name.Contains(TEXT("-ormh-")))
+    return TEXT("orm");
   if (Name.Contains(TEXT("ao")) || Name.Contains(TEXT("ambientocclusion")) ||
       Name.Contains(TEXT("ambient_occlusion")))
     return TEXT("ao");
@@ -587,9 +919,10 @@ static uint8 SampleLuminance(const FTexturePixels *Pixels, float U, float V,
 }
 
 static UTexture2D *CreatePackedMaskTexture(
-    const FString &AssetFolder, const FString &AssetName, UTexture2D *AOTexture,
-    int32 AOChannel, UTexture2D *RoughnessTexture, int32 RoughnessChannel,
-    UTexture2D *DisplacementTexture, int32 DisplacementChannel,
+    const FString &AssetFolder, const FString &TextureAssetName,
+    UTexture2D *AOTexture, int32 AOChannel, UTexture2D *RoughnessTexture,
+    int32 RoughnessChannel, UTexture2D *DisplacementTexture,
+    int32 DisplacementChannel, UTexture2D *OpacityTexture, int32 OpacityChannel,
     UTexture2D *SizeRefA, UTexture2D *SizeRefB) {
   const bool HasAOInput = AOTexture != nullptr;
   const bool HasRoughnessInput = RoughnessTexture != nullptr;
@@ -597,11 +930,13 @@ static UTexture2D *CreatePackedMaskTexture(
   FTexturePixels AOPixels;
   FTexturePixels RoughnessPixels;
   FTexturePixels DisplacementPixels;
+  FTexturePixels OpacityPixels;
   const bool HasAO = ReadTexturePixels(AOTexture, AOPixels);
   const bool HasRoughness =
       ReadTexturePixels(RoughnessTexture, RoughnessPixels);
   const bool HasDisplacement =
       ReadTexturePixels(DisplacementTexture, DisplacementPixels);
+  const bool HasOpacity = ReadTexturePixels(OpacityTexture, OpacityPixels);
   int32 Width = 0;
   int32 Height = 0;
   if (HasAO) {
@@ -613,6 +948,9 @@ static UTexture2D *CreatePackedMaskTexture(
   } else if (HasDisplacement) {
     Width = DisplacementPixels.Width;
     Height = DisplacementPixels.Height;
+  } else if (HasOpacity) {
+    Width = OpacityPixels.Width;
+    Height = OpacityPixels.Height;
   } else {
     FTexturePixels RefPixels;
     if (ReadTexturePixels(SizeRefA, RefPixels) ||
@@ -625,7 +963,6 @@ static UTexture2D *CreatePackedMaskTexture(
     }
   }
 
-  const FString TextureAssetName = FString::Printf(TEXT("T_%s_M"), *AssetName);
   const FString PackagePath = AssetFolder / TextureAssetName;
   UPackage *Package = CreatePackage(*PackagePath);
   if (!Package) {
@@ -663,8 +1000,91 @@ static UTexture2D *CreatePackedMaskTexture(
       const uint8 DisplacementValue =
           SampleChannel(HasDisplacement ? &DisplacementPixels : nullptr, U, V,
                         DisplacementChannel, DisplacementFallback);
+      const uint8 OpacityValue =
+          SampleChannel(HasOpacity ? &OpacityPixels : nullptr, U, V,
+                        OpacityChannel, 255);
       const int32 DestIndex = (Y * Width + X) * 4;
       DestData[DestIndex + 0] = DisplacementValue;
+      DestData[DestIndex + 1] = RoughnessValue;
+      DestData[DestIndex + 2] = AOValue;
+      DestData[DestIndex + 3] = OpacityValue;
+    }
+  }
+  PackedTexture->Source.UnlockMip(0);
+  PackedTexture->CompressionSettings = TC_Masks;
+  PackedTexture->CompressionNoAlpha = false;
+  PackedTexture->SRGB = false;
+  PackedTexture->PostEditChange();
+  PackedTexture->MarkPackageDirty();
+  ForceTextureDataReady(PackedTexture);
+  FinalizeImportedAsset(PackedTexture);
+  FAssetRegistryModule::AssetCreated(PackedTexture);
+  return PackedTexture;
+}
+
+static UTexture2D *CreatePackedORMTexture(
+    const FString &AssetFolder, const FString &TextureAssetName,
+    UTexture2D *AOTexture, UTexture2D *RoughnessTexture,
+    UTexture2D *MetallicTexture, UTexture2D *SizeRefA, UTexture2D *SizeRefB) {
+  FTexturePixels AOPixels;
+  FTexturePixels RoughnessPixels;
+  FTexturePixels MetallicPixels;
+  const bool HasAO = ReadTexturePixels(AOTexture, AOPixels);
+  const bool HasRoughness = ReadTexturePixels(RoughnessTexture, RoughnessPixels);
+  const bool HasMetallic = ReadTexturePixels(MetallicTexture, MetallicPixels);
+  int32 Width = 0;
+  int32 Height = 0;
+  if (HasAO) {
+    Width = AOPixels.Width;
+    Height = AOPixels.Height;
+  } else if (HasRoughness) {
+    Width = RoughnessPixels.Width;
+    Height = RoughnessPixels.Height;
+  } else if (HasMetallic) {
+    Width = MetallicPixels.Width;
+    Height = MetallicPixels.Height;
+  } else {
+    FTexturePixels RefPixels;
+    if (ReadTexturePixels(SizeRefA, RefPixels) ||
+        ReadTexturePixels(SizeRefB, RefPixels)) {
+      Width = RefPixels.Width;
+      Height = RefPixels.Height;
+    } else {
+      Width = 1024;
+      Height = 1024;
+    }
+  }
+
+  const FString PackagePath = AssetFolder / TextureAssetName;
+  UPackage *Package = CreatePackage(*PackagePath);
+  if (!Package) {
+    return nullptr;
+  }
+
+  UTexture2D *PackedTexture = NewObject<UTexture2D>(Package, *TextureAssetName,
+                                                    RF_Public | RF_Standalone);
+  if (!PackedTexture) {
+    return nullptr;
+  }
+
+  PackedTexture->Source.Init(Width, Height, 1, 1, TSF_BGRA8);
+  uint8 *DestData = PackedTexture->Source.LockMip(0);
+  for (int32 Y = 0; Y < Height; Y++) {
+    for (int32 X = 0; X < Width; X++) {
+      const float U =
+          Width > 1 ? static_cast<float>(X) / static_cast<float>(Width - 1)
+                    : 0.0f;
+      const float V =
+          Height > 1 ? static_cast<float>(Y) / static_cast<float>(Height - 1)
+                     : 0.0f;
+      const uint8 AOValue =
+          SampleChannel(HasAO ? &AOPixels : nullptr, U, V, 0, 255);
+      const uint8 RoughnessValue =
+          SampleChannel(HasRoughness ? &RoughnessPixels : nullptr, U, V, 0, 204);
+      const uint8 MetallicValue =
+          SampleChannel(HasMetallic ? &MetallicPixels : nullptr, U, V, 0, 0);
+      const int32 DestIndex = (Y * Width + X) * 4;
+      DestData[DestIndex + 0] = MetallicValue;
       DestData[DestIndex + 1] = RoughnessValue;
       DestData[DestIndex + 2] = AOValue;
       DestData[DestIndex + 3] = 255;
@@ -762,7 +1182,7 @@ CreatePackedDROTexture(const FString &AssetFolder, const FString &AssetName,
   }
   PackedTexture->Source.UnlockMip(0);
   PackedTexture->CompressionSettings = TC_Masks;
-  PackedTexture->CompressionNoAlpha = true;
+  PackedTexture->CompressionNoAlpha = false;
   PackedTexture->SRGB = false;
   PackedTexture->PostEditChange();
   PackedTexture->MarkPackageDirty();
@@ -956,7 +1376,10 @@ static UMaterialInterface *LoadAssetMaterialParent(
   if (bUseVT) {
     for (UTexture *Texture : Textures) {
       if (Texture && !Texture->VirtualTextureStreaming) {
+        // Settle any pending import build before toggling VT.
+        ForceTextureDataReady(Texture);
         Texture->Modify();
+        Texture->PreEditChange(nullptr);
         Texture->VirtualTextureStreaming = true;
         Texture->PostEditChange();
         Texture->MarkPackageDirty();
@@ -1027,6 +1450,108 @@ CreateAssetMaterialInstance(const FString &AssetFolder,
   return MaterialInstance;
 }
 
+static bool MaterialHasStaticSwitch(UMaterialInterface *Material,
+                                    const FString &ParameterName) {
+  if (!Material || ParameterName.IsEmpty()) {
+    return false;
+  }
+  bool bDefaultValue = false;
+  FGuid ExpressionGuid;
+  return Material->GetStaticSwitchParameterDefaultValue(
+      FHashedMaterialParameterInfo(FName(*ParameterName)), bDefaultValue,
+      ExpressionGuid);
+}
+
+static UMaterialInstanceConstant *
+CreateEnvironmentAssetMaterialInstance(
+    const FString &MaterialFolder, const FString &MaterialAssetName,
+    const FEnvironmentAssetProfile &Profile, UTexture *AlbedoTexture,
+    UTexture *NormalTexture, UTexture *ORMTexture, UTexture *MegaMaskTexture,
+    UTexture *OpacityTexture, UTexture *EmissiveTexture, bool bMasked) {
+  const bool bUseMaskedParent = bMasked && Profile.bBaseFamily;
+  UMaterialInterface *ParentMaterial = UAssetHiveSettings::GetAssetParentMaterial(
+      Profile.TypeKey, bUseMaskedParent);
+  if (!ParentMaterial) {
+    GAssetHiveImportFailed = true;
+    UE_LOG(LogTemp, Error,
+           TEXT("AssetHive: missing 3D asset parent material: %s"),
+           *UAssetHiveSettings::GetAssetParentMaterialPath(Profile.TypeKey,
+                                                           bUseMaskedParent));
+    return nullptr;
+  }
+  for (UTexture *Texture :
+       {AlbedoTexture, NormalTexture, ORMTexture, MegaMaskTexture,
+        OpacityTexture, EmissiveTexture}) {
+    ForceTextureDataReady(Texture);
+  }
+
+  const FString MaterialPackagePath = MaterialFolder / MaterialAssetName;
+  UPackage *MaterialPackage = CreatePackage(*MaterialPackagePath);
+  UMaterialInstanceConstant *MaterialInstance =
+      FindObject<UMaterialInstanceConstant>(MaterialPackage,
+                                            *MaterialAssetName);
+  const bool bIsNew = MaterialInstance == nullptr;
+  if (!MaterialInstance) {
+    MaterialInstance = NewObject<UMaterialInstanceConstant>(
+        MaterialPackage, *MaterialAssetName, RF_Public | RF_Standalone);
+  }
+  if (!MaterialInstance) {
+    return nullptr;
+  }
+  MaterialInstance->SetParentEditorOnly(ParentMaterial);
+
+  const FString AlbedoParameter = UAssetHiveSettings::GetAssetAlbedoParameter();
+  const FString NormalParameter = UAssetHiveSettings::GetAssetNormalParameter();
+  const FString ORMParameter =
+      UAssetHiveSettings::GetAssetORMTextureParameter();
+  const FString MaskParameter = UAssetHiveSettings::GetAssetMaskParameter();
+  const FString MegaMaskParameter =
+      UAssetHiveSettings::GetAssetMegaMaskParameter();
+  const FString EmissiveParameter =
+      UAssetHiveSettings::GetAssetEmissiveParameter(Profile.TypeKey);
+  const FString EmissiveSwitch =
+      UAssetHiveSettings::GetAssetUseEmissiveSwitch();
+
+  if (AlbedoTexture && !AlbedoParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*AlbedoParameter)), AlbedoTexture);
+  }
+  if (NormalTexture && !NormalParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*NormalParameter)), NormalTexture);
+  }
+  if (ORMTexture && !ORMParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*ORMParameter)), ORMTexture);
+  }
+  if (EmissiveTexture && !EmissiveParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*EmissiveParameter)), EmissiveTexture);
+  }
+  if (Profile.bMega && MegaMaskTexture && !MegaMaskParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*MegaMaskParameter)), MegaMaskTexture);
+  } else if (Profile.bBaseFamily && bMasked && OpacityTexture &&
+             !MaskParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*MaskParameter)), OpacityTexture);
+  }
+  if (!EmissiveSwitch.IsEmpty() &&
+      MaterialHasStaticSwitch(ParentMaterial, EmissiveSwitch)) {
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*EmissiveSwitch)),
+        EmissiveTexture != nullptr);
+  }
+
+  UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
+  MaterialInstance->MarkPackageDirty();
+  FinalizeImportedAsset(MaterialInstance);
+  if (bIsNew) {
+    FAssetRegistryModule::AssetCreated(MaterialInstance);
+  }
+  AssetHiveThumbnailRefresh::Queue(MaterialInstance);
+  return MaterialInstance;
+}
 static UMaterialInterface *LoadSurfaceMaterialParent(
     const TArray<UTexture *> &Textures) {
   UMaterialInterface *ParentMaterial =
@@ -1319,10 +1844,27 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const bool bIsModelAsset =
         AssetType == TEXT("3d") || AssetType == TEXT("3dplant");
     const bool bIsCustomAsset = AssetSource == TEXT("custom");
+    const bool bIs3DAsset = AssetType == TEXT("3d");
     if (AssetId.IsEmpty()) {
       AssetId = TEXT("UnknownId");
     }
-    FString AssetDestinationPath = DestinationPath;
+    FEnvironmentAssetProfile EnvironmentProfile;
+    TArray<FString> AssetStandardTags;
+    if (bIs3DAsset) {
+      CollectAssetTags(AssetObject, AssetStandardTags);
+      EnvironmentProfile = ResolveEnvironmentAssetProfile(AssetStandardTags);
+      CategoryFolder = EnvironmentProfile.FolderName;
+    }
+    // Third party scans follow the Dressing triangle budget even when their
+    // tags route them into another asset folder.
+    const bool bScanSourceAsset =
+        bIs3DAsset &&
+        (HasAssetTag(AssetStandardTags, TEXT("Megascans")) ||
+         HasAssetTag(AssetStandardTags, TEXT("PBRMAX")) ||
+         EnvironmentProfile.TypeKey == TEXT("Megascans") ||
+         EnvironmentProfile.TypeKey == TEXT("PBRMAX"));
+    FString AssetDestinationPath =
+        bIs3DAsset ? TEXT("/Game/Environment/Asset") : DestinationPath;
     FString SurfaceExportRootPath;
     if (bIsSurface && AssetObject->TryGetStringField(TEXT("exportRootPath"),
                                                      SurfaceExportRootPath) &&
@@ -1332,10 +1874,22 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const FString SafeAssetName = MakeSafeObjectName(AssetName);
     const FString SafeAssetId = MakeSafeObjectName(AssetId);
     const FString SafeCategoryFolder = MakeSafeObjectName(CategoryFolder);
-    const FString SafeAssetFolderName = MakeSafeObjectName(
+    FString SafeAssetFolderName = MakeSafeObjectName(
         AssetFolderName.IsEmpty() ? SafeAssetName : AssetFolderName);
+    // Keep the on-disk asset folder aligned with every other exported object:
+    // the internal asset ID is part of the folder name as well.
+    if (!SafeAssetId.IsEmpty() &&
+        !SafeAssetFolderName.EndsWith(
+            FString::Printf(TEXT("_%s"), *SafeAssetId),
+            ESearchCase::IgnoreCase)) {
+      SafeAssetFolderName += TEXT("_") + SafeAssetId;
+    }
     const FString AssetStem =
         FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
+    const FString EnvironmentStem =
+        bIs3DAsset ? BuildEnvironmentObjectStem(EnvironmentProfile, AssetName,
+                                                AssetId)
+                   : FString();
     const FString AssetFolder =
         AssetDestinationPath / SafeCategoryFolder / SafeAssetFolderName;
     const FString TextureFolder = bIsSurface ? AssetFolder / TEXT("Tex") : AssetFolder;
@@ -1397,7 +1951,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             NormalizedSlotName = TEXT("metalness");
           } else if (bIsSurface && (NormalizedSlotName == TEXT("e") || NormalizedSlotName == TEXT("emissive") || NormalizedSlotName == TEXT("emission"))) {
             NormalizedSlotName = TEXT("emissive");
-          } else if (NormalizedSlotName == TEXT("m") || NormalizedSlotName == TEXT("ordp")) {
+          } else if (NormalizedSlotName == TEXT("orm") ||
+                     NormalizedSlotName == TEXT("ormh")) {
+            NormalizedSlotName = TEXT("orm");
+          } else if (NormalizedSlotName == TEXT("m") ||
+                     NormalizedSlotName == TEXT("ordp")) {
             NormalizedSlotName = TEXT("mask");
           } else if (NormalizedSlotName == TEXT("mask")) {
             NormalizedSlotName = TEXT("mask");
@@ -1445,6 +2003,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     TMap<int32, TMap<FString, FString>> SourceTextureBySlotByGroup;
     const bool bMultipleTextureGroups = SourceTextureSlotMapByGroup.Num() > 1;
 
+    FString PrimaryModelVariantKey = TEXT("01");
+    bool bPrimaryModelVariantResolved = false;
     const TArray<TSharedPtr<FJsonValue>> *ModelFiles = nullptr;
     if (AssetObject->TryGetArrayField(TEXT("modelFiles"), ModelFiles) &&
         ModelFiles != nullptr) {
@@ -1474,6 +2034,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           }
           ExplicitVariantByFile.Add(NormalizeModelSourceKey(SourceFile), VariantKey);
           bHasExplicitModelVariants = true;
+          if (!bPrimaryModelVariantResolved) {
+            PrimaryModelVariantKey = NormalizeModelVariantKey(VariantKey);
+            bPrimaryModelVariantResolved = true;
+          }
         }
       }
 
@@ -1615,7 +2179,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           Task->Filename = SourceFile;
           Task->DestinationPath = AssetFolder;
           FString ModelAssetName;
-          if (bIsCustomAsset && bIsModelAsset) {
+          if (bIs3DAsset) {
+            const FString VariantKey = ResolveModelVariantKey(
+                SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
+            ModelAssetName = FString::Printf(TEXT("SM_%s_%s"),
+                                             *EnvironmentStem, *VariantKey);
+          } else if (bIsCustomAsset && bIsModelAsset) {
             const FString VariantKey = ResolveModelVariantKey(
                 SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
             const bool bNeedsVariantSuffix =
@@ -1653,6 +2222,19 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
 
+    if (bIs3DAsset && !bPrimaryModelVariantResolved && ModelFiles) {
+      TMap<FString, FString> EmptyVariantMap;
+      for (const TSharedPtr<FJsonValue> &FileValue : *ModelFiles) {
+        if (!FileValue.IsValid() || FileValue->Type != EJson::String) {
+          continue;
+        }
+        const FString SourceFile = FileValue->AsString();
+        PrimaryModelVariantKey =
+            ResolveModelVariantKey(SourceFile, EmptyVariantMap, 1);
+        bPrimaryModelVariantResolved = true;
+        break;
+      }
+    }
     const TArray<TSharedPtr<FJsonValue>> *TextureFiles = nullptr;
     if (AssetObject->TryGetArrayField(TEXT("textureFiles"), TextureFiles) &&
         TextureFiles != nullptr) {
@@ -1692,15 +2274,25 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                                             AssetType == TEXT("3d") ||
                                             AssetType == TEXT("3dplant");
         const bool bIsPlant = AssetType == TEXT("3dplant");
-        const bool bAllowPlantExtras =
+        const bool bAllowAsset3DSlots =
+            bIs3DAsset &&
+            (SlotName == TEXT("albedo") || SlotName == TEXT("normal") ||
+             SlotName == TEXT("orm") || SlotName == TEXT("mask") ||
+             SlotName == TEXT("opacity") || SlotName == TEXT("emissive") ||
+             SlotName == TEXT("metalness") || SlotName == TEXT("roughness") ||
+             SlotName == TEXT("ao") || SlotName == TEXT("displacement") ||
+             SlotName == TEXT("fuzz") || SlotName == TEXT("subsurfacecolor") ||
+             SlotName == TEXT("translucency"));
+        const bool bAllowPlantSlots =
             bIsPlant &&
-            (SlotName == TEXT("roughness") || SlotName == TEXT("subsurfacecolor"));
-        const bool bAllow3DSlots =
-            SlotName == TEXT("albedo") || SlotName == TEXT("normal") ||
-            SlotName == TEXT("fuzz") || SlotName == TEXT("mask") ||
-            SlotName == TEXT("subsurfacecolor") ||
-            (SlotName == TEXT("displacement") && bAllowDisplacementSlot) ||
-            bAllowPlantExtras;
+            (SlotName == TEXT("albedo") || SlotName == TEXT("normal") ||
+             SlotName == TEXT("fuzz") || SlotName == TEXT("mask") ||
+             SlotName == TEXT("roughness") ||
+             SlotName == TEXT("subsurfacecolor") ||
+             ((SlotName == TEXT("displacement") ||
+               SlotName == TEXT("translucency")) &&
+              bAllowDisplacementSlot));
+        const bool bAllow3DSlots = bAllowAsset3DSlots || bAllowPlantSlots;
         const bool bAllowDecalSlots =
             SlotName == TEXT("albedo") || SlotName == TEXT("normal");
         const bool bAllowHdriSlots = SlotName == TEXT("hdr");
@@ -1735,14 +2327,34 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         if (bIsSurface && SourceTextureObjectNameByPath.Contains(SourceKey)) {
           ConfiguredObjectName = MakeSafeObjectName(SourceTextureObjectNameByPath[SourceKey]);
         }
-        Task->DestinationName =
-            !ConfiguredObjectName.IsEmpty()
-                ? ConfiguredObjectName
-                : (bMultipleTextureGroups
-                       ? FString::Printf(TEXT("T_%s_%03d_%s"), *AssetStem, GroupId,
-                                         *ToSlotSuffix(SlotName))
-                       : FString::Printf(TEXT("T_%s_%s"), *AssetStem,
-                                         *ToSlotSuffix(SlotName)));
+        const FString TextureResolution =
+            bIs3DAsset
+                ? Resolve3DTextureResolution(
+                      SourceFile, SlotName,
+                      SourceTextureResolutionByPath.FindRef(SourceKey),
+                      EnvironmentProfile)
+                : FString();
+        FString ImportedTextureName = ConfiguredObjectName;
+        if (ImportedTextureName.IsEmpty()) {
+          if (bIs3DAsset) {
+            const FString GroupSegment =
+                bMultipleTextureGroups
+                    ? FString::Printf(TEXT("_G%03d"), GroupId)
+                    : FString();
+            ImportedTextureName = FString::Printf(
+                TEXT("T_%s_%s%s_%s_%s"), *EnvironmentStem,
+                *PrimaryModelVariantKey, *GroupSegment, *TextureResolution,
+                *To3DTextureSlotSuffix(SlotName));
+          } else {
+            ImportedTextureName =
+                bMultipleTextureGroups
+                    ? FString::Printf(TEXT("T_%s_%03d_%s"), *AssetStem,
+                                      GroupId, *ToSlotSuffix(SlotName))
+                    : FString::Printf(TEXT("T_%s_%s"), *AssetStem,
+                                      *ToSlotSuffix(SlotName));
+          }
+        }
+        Task->DestinationName = ImportedTextureName;
         Task->bReplaceExisting = true;
         Task->bAutomated = true;
         Task->bAsync = false;
@@ -1779,7 +2391,16 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         UE_LOG(LogTemp, Log, TEXT("AssetHive: imported %d texture object(s), %d paths"), ImportedObjects.Num(), Task->ImportedObjectPaths.Num());
         for (UObject *ImportedObject : ImportedObjects) {
           if (UTexture *Texture = Cast<UTexture>(ImportedObject)) {
-            if (bIsSurface) {
+            // Finish the import build before changing VT/compression settings.
+            // Otherwise the in-flight DerivedData can be cancelled while the
+            // texture's VT flag already has the new value, tripping UE's
+            // (VTData != nullptr) == VirtualTextureStreaming assertion.
+            ForceTextureDataReady(Texture);
+            Texture->PreEditChange(nullptr);
+            if (bIs3DAsset) {
+              Apply3DAssetTexturePreset(Texture, SlotName, EnvironmentProfile,
+                                        bUseVT);
+            } else if (bIsSurface) {
               const FString Resolution = SourceTextureResolutionByPath.Contains(SourceKey)
                                              ? SourceTextureResolutionByPath[SourceKey]
                                              : TEXT("");
@@ -1917,6 +2538,65 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             TextureBySlot.FindRef(TEXT("normal")),
             TextureBySlot.FindRef(TEXT("metalness")),
             TextureBySlot.FindRef(TEXT("emissive")), SurfaceBaseTiling);
+      } else if (bIs3DAsset) {
+        SetStageProgress(
+            static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
+            FString::Printf(TEXT("Composite Textures: %s"), *AssetName), false);
+
+        auto Resolve3DSourceTexture = [&](const TCHAR *SlotName) -> UTexture2D * {
+          const FString SlotKey(SlotName);
+          UTexture2D *ImportedTexture =
+              Cast<UTexture2D>(TextureBySlot.FindRef(SlotKey));
+          if (ImportedTexture) {
+            return ImportedTexture;
+          }
+          if (SourceTextureBySlot.Contains(SlotKey)) {
+            return FImageUtils::ImportFileAsTexture2D(
+                SourceTextureBySlot[SlotKey]);
+          }
+          return nullptr;
+        };
+
+        UTexture2D *ORMTexture =
+            Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("orm")));
+        if (!ORMTexture) {
+          UTexture2D *AOTexture = Resolve3DSourceTexture(TEXT("ao"));
+          UTexture2D *RoughnessTexture =
+              Resolve3DSourceTexture(TEXT("roughness"));
+          UTexture2D *MetallicTexture =
+              Resolve3DSourceTexture(TEXT("metalness"));
+          if (AOTexture || RoughnessTexture || MetallicTexture) {
+            const FString ORMResolution = Resolve3DTextureResolution(
+                FString(), TEXT("orm"), FString(), EnvironmentProfile);
+            const FString ORMGroup =
+                GroupIds.Num() > 1
+                    ? FString::Printf(TEXT("_G%03d"), GroupId)
+                    : FString();
+            const FString ORMAssetName = FString::Printf(
+                TEXT("T_%s_%s%s_%s_ORM"), *EnvironmentStem,
+                *PrimaryModelVariantKey, *ORMGroup, *ORMResolution);
+            ORMTexture = CreatePackedORMTexture(
+                AssetFolder, ORMAssetName, AOTexture, RoughnessTexture,
+                MetallicTexture,
+                Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("albedo"))),
+                Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("normal"))));
+          }
+        }
+        if (ORMTexture) {
+          Apply3DAssetTexturePreset(ORMTexture, TEXT("orm"),
+                                    EnvironmentProfile, bUseVT);
+        }
+
+        UTexture2D *MegaMaskTexture = Resolve3DSourceTexture(TEXT("mask"));
+        UTexture2D *OpacityTexture = Resolve3DSourceTexture(TEXT("opacity"));
+        const bool bMasked = OpacityTexture != nullptr;
+        const FString MaterialName = BuildEnvironmentAssetMaterialName(
+            EnvironmentStem, GroupId, PrimaryModelVariantKey);
+        MaterialInstance = CreateEnvironmentAssetMaterialInstance(
+            AssetFolder, MaterialName, EnvironmentProfile,
+            TextureBySlot.FindRef(TEXT("albedo")),
+            TextureBySlot.FindRef(TEXT("normal")), ORMTexture, MegaMaskTexture,
+            OpacityTexture, TextureBySlot.FindRef(TEXT("emissive")), bMasked);
       } else {
         if (AssetType == TEXT("3dplant")) {
           SetStageProgress(
@@ -2017,8 +2697,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             const int32 DisplacementChannel =
                 DisplacementSourceTexture ? 0 : (MaskSourceTexture ? 2 : 0);
             MaskTexture = CreatePackedMaskTexture(
-                AssetFolder, GroupStem, AOTexture, AOChannel, RoughnessTexture,
+                AssetFolder, FString::Printf(TEXT("T_%s_M"), *GroupStem),
+                AOTexture, AOChannel, RoughnessTexture,
                 RoughnessChannel, DisplacementTexture, DisplacementChannel,
+                nullptr, 0,
                 Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("albedo"))),
                 Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("normal"))));
           }
@@ -2041,6 +2723,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // SetMaterial calls Pre/PostEditChange and rebuilds the mesh for EVERY slot.
       // Perform one balanced edit so a high-poly mesh is only rebuilt once here.
       StaticMesh->PreEditChange(nullptr);
+      if (bScanSourceAsset) {
+        FString TriangleBudgetSummary;
+        ApplyNaniteTriangleBudget(StaticMesh, TriangleBudgetSummary);
+      }
       StaticMesh->NaniteSettings.bEnabled = true;
       TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
       for (int32 Index = 0; Index < Slots.Num() && MaterialInstances.Num() > 0; ++Index) {
@@ -2068,6 +2754,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       StaticMesh->PostEditChange();
       StaticMesh->MarkPackageDirty();
       FinalizeImportedAsset(StaticMesh);
+      if (bIs3DAsset) {
+        Configure3DAssetCollision(StaticMesh);
+      }
     }
 
     // The import target is authoritative here. AssetRegistry visibility can lag
@@ -2103,6 +2792,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 #include "Misc/AutomationTest.h"
 #include "Misc/CommandLine.h"
 #include "StaticMeshCompiler.h"
+#include "MeshDescription.h"
+#include "StaticMeshAttributes.h"
 #include "UObject/GCObjectScopeGuard.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveMeshImportPerfTest,
@@ -2201,6 +2892,8 @@ bool FAssetHiveDirtyImportTest::RunTest(const FString &Parameters) {
     TArray<FString> Folders;
     TestEqual(TEXT("Import job completes"), Importer->ImportJob(Job, Root, {}, &Folders), 0);
     if (!TestEqual(TEXT("Imported folder returned"), Folders.Num(), 1)) break;
+    TestTrue(TEXT("Imported folder carries asset ID"),
+             Folders[0].EndsWith(TEXT("_test"), ESearchCase::IgnoreCase));
     const FString PackageName = Folders[0] / TEXT("T_DirtyProbe_test_HDR");
     UTexture2D *Texture = FindObject<UTexture2D>(nullptr, *(PackageName + TEXT(".T_DirtyProbe_test_HDR")));
     if (!TestNotNull(TEXT("Texture available before saving"), Texture)) break;
@@ -2211,6 +2904,174 @@ bool FAssetHiveDirtyImportTest::RunTest(const FString &Parameters) {
     Texture->GetOutermost()->SetDirtyFlag(false);
   }
   IFileManager::Get().Delete(*Source);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveAssetIdNamingTest,
+    "AssetHive.Import.AssetIdNaming",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
+  auto BuildStemForTag = [](const TCHAR *Tag) {
+    TArray<FString> Tags;
+    if (Tag && *Tag) {
+      Tags.Add(FString(Tag));
+    }
+    return BuildEnvironmentObjectStem(
+        ResolveEnvironmentAssetProfile(Tags), TEXT("WoodenBox"),
+        TEXT("abc123"));
+  };
+
+  TestEqual(TEXT("Props keeps legacy naming"),
+            BuildStemForTag(TEXT("Props")),
+            FString(TEXT("Env_Prop_WoodenBox_abc123")));
+  TestEqual(TEXT("Destructible keeps legacy naming"),
+            BuildStemForTag(TEXT("Destructible")),
+            FString(TEXT("Env_Dest_WoodenBox_abc123")));
+  TestEqual(TEXT("Kits keeps legacy naming"),
+            BuildStemForTag(TEXT("Kits")),
+            FString(TEXT("Env_Kit_WoodenBox_abc123")));
+  TestEqual(TEXT("MEGA keeps legacy naming"),
+            BuildStemForTag(TEXT("MEGA")),
+            FString(TEXT("Env_MEGA_WoodenBox_abc123")));
+  TestEqual(TEXT("PBRMAX keeps legacy naming"),
+            BuildStemForTag(TEXT("PBRMAX")),
+            FString(TEXT("Env_WoodenBox_abc123")));
+  TestEqual(TEXT("Dressing keeps legacy naming"),
+            BuildStemForTag(TEXT("Dressing")),
+            FString(TEXT("Env_WoodenBox_abc123")));
+
+  const FString MegascansStem = BuildStemForTag(TEXT("Megascans"));
+  TestEqual(TEXT("Megascans uses tag and asset ID only"), MegascansStem,
+            FString(TEXT("Env_Megascans_abc123")));
+  TestEqual(TEXT("Megascans mesh drops display name"),
+            FString::Printf(TEXT("SM_%s_%s"), *MegascansStem, TEXT("01")),
+            FString(TEXT("SM_Env_Megascans_abc123_01")));
+  TestEqual(TEXT("Megascans material instance drops display name"),
+            BuildEnvironmentAssetMaterialName(MegascansStem, 1, TEXT("01")),
+            FString(TEXT("MI_Env_Megascans_abc123_001_01")));
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveMeshTriangleBudgetTest,
+    "AssetHive.Import.MeshTriangleBudget",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
+  // A flat quad grid gives a deterministic triangle count to budget against.
+  const int32 Grid = 40; // 2 * 40 * 40 = 3200 source triangles
+  const int32 SourceTriangles = Grid * Grid * 2;
+  const int32 SmallBudget = 320;
+  const int32 LargeBudget = SourceTriangles;
+
+  auto MakeGridMesh = [Grid](float Step, const TCHAR *Name) {
+    UStaticMesh *Mesh =
+        NewObject<UStaticMesh>(GetTransientPackage(), FName(Name), RF_Transient);
+    Mesh->AddSourceModel();
+
+    FMeshDescription Description;
+    FStaticMeshAttributes Attributes(Description);
+    Attributes.Register();
+    TVertexAttributesRef<FVector3f> Positions = Attributes.GetVertexPositions();
+    TVertexInstanceAttributesRef<FVector2f> UVs =
+        Attributes.GetVertexInstanceUVs();
+    TVertexInstanceAttributesRef<FVector3f> Normals =
+        Attributes.GetVertexInstanceNormals();
+    const FPolygonGroupID Group = Description.CreatePolygonGroup();
+    Attributes.GetPolygonGroupMaterialSlotNames()[Group] =
+        FName(TEXT("Material_0"));
+
+    TArray<TArray<FVertexInstanceID>> Instances;
+    Instances.SetNum((Grid + 1) * (Grid + 1));
+    for (int32 Y = 0; Y <= Grid; ++Y) {
+      for (int32 X = 0; X <= Grid; ++X) {
+        const FVertexID Vertex = Description.CreateVertex();
+        Positions[Vertex] = FVector3f(X * Step, Y * Step, 0.0f);
+        TArray<FVertexInstanceID> &Corners = Instances[Y * (Grid + 1) + X];
+        for (int32 Corner = 0; Corner < 2; ++Corner) {
+          const FVertexInstanceID Instance =
+              Description.CreateVertexInstance(Vertex);
+          UVs.Set(Instance, 0,
+                  FVector2f(X / static_cast<float>(Grid),
+                            Y / static_cast<float>(Grid)));
+          Normals[Instance] = FVector3f(0.0f, 0.0f, 1.0f);
+          Corners.Add(Instance);
+        }
+      }
+    }
+    auto Corner = [&Instances, Grid](int32 X, int32 Y, int32 Slot) {
+      return Instances[Y * (Grid + 1) + X][Slot];
+    };
+    for (int32 Y = 0; Y < Grid; ++Y) {
+      for (int32 X = 0; X < Grid; ++X) {
+        Description.CreateTriangle(
+            Group,
+            {Corner(X, Y, 0), Corner(X + 1, Y, 0), Corner(X + 1, Y + 1, 0)});
+        Description.CreateTriangle(
+            Group,
+            {Corner(X, Y, 1), Corner(X + 1, Y + 1, 1), Corner(X, Y + 1, 1)});
+      }
+    }
+    Mesh->CreateMeshDescription(0, MoveTemp(Description));
+    Mesh->CommitMeshDescription(0);
+    return Mesh;
+  };
+
+  UAssetHiveSettings *Settings = GetMutableDefault<UAssetHiveSettings>();
+  const int32 SavedMaxTriangles = Settings->Asset3DMaxLOD0Triangles;
+  const int32 SavedLargeTriangles = Settings->Asset3DLargeMaxLOD0Triangles;
+  const float SavedThreshold = Settings->Asset3DLargeSizeThresholdCm;
+
+  // 4 m asset, well inside the default 300k spec: Nanite stays untouched.
+  UStaticMesh *SmallMesh = MakeGridMesh(10.0f, TEXT("AssetHiveSmallProbe"));
+  FGCObjectScopeGuard SmallMeshGuard(SmallMesh);
+  TestEqual(TEXT("Fixture triangle count"),
+            SmallMesh->GetMeshDescription(0)->Triangles().Num(), SourceTriangles);
+  FString SmallSummary;
+  TestFalse(TEXT("In-budget asset keeps 100% of the source"),
+            ApplyNaniteTriangleBudget(SmallMesh, SmallSummary));
+  TestTrue(TEXT("Keep percentage stays at 1.0"),
+           FMath::IsNearlyEqual(SmallMesh->NaniteSettings.KeepPercentTriangles,
+                                1.0f));
+
+  // Tightening the spec makes the same asset shrink through Nanite.
+  Settings->Asset3DMaxLOD0Triangles = SmallBudget;
+  SmallSummary.Reset();
+  TestTrue(TEXT("Oversized asset receives a Nanite keep percentage"),
+           ApplyNaniteTriangleBudget(SmallMesh, SmallSummary));
+  TestTrue(TEXT("Keep percentage follows the triangle spec"),
+           FMath::IsNearlyEqual(SmallMesh->NaniteSettings.KeepPercentTriangles,
+                                static_cast<float>(SmallBudget) /
+                                    static_cast<float>(SourceTriangles),
+                                0.001f));
+  TestTrue(TEXT("Summary reports the budget"),
+           SmallSummary.Contains(TEXT("keep")));
+
+  // A 40 m asset is routed to the large asset budget instead.
+  UStaticMesh *LargeMesh = MakeGridMesh(100.0f, TEXT("AssetHiveLargeProbe"));
+  FGCObjectScopeGuard LargeMeshGuard(LargeMesh);
+  Settings->Asset3DMaxLOD0Triangles = 100;
+  Settings->Asset3DLargeMaxLOD0Triangles = LargeBudget;
+  FString LargeSummary;
+  TestFalse(TEXT("Large asset ignores the small asset budget"),
+            ApplyNaniteTriangleBudget(LargeMesh, LargeSummary));
+  TestTrue(TEXT("Large asset keeps 100% of the source"),
+           FMath::IsNearlyEqual(LargeMesh->NaniteSettings.KeepPercentTriangles,
+                                1.0f));
+  TestTrue(TEXT("Summary stays empty when nothing changes"),
+           LargeSummary.IsEmpty());
+
+  // The large asset still shrinks when its own budget is exceeded.
+  Settings->Asset3DLargeMaxLOD0Triangles = SmallBudget;
+  TestTrue(TEXT("Large asset uses its own budget"),
+           ApplyNaniteTriangleBudget(LargeMesh, LargeSummary));
+  TestTrue(TEXT("Large asset keep percentage follows the large spec"),
+           FMath::IsNearlyEqual(LargeMesh->NaniteSettings.KeepPercentTriangles,
+                                static_cast<float>(SmallBudget) /
+                                    static_cast<float>(SourceTriangles),
+                                0.001f));
+
+  Settings->Asset3DMaxLOD0Triangles = SavedMaxTriangles;
+  Settings->Asset3DLargeMaxLOD0Triangles = SavedLargeTriangles;
+  Settings->Asset3DLargeSizeThresholdCm = SavedThreshold;
   return true;
 }
 #endif

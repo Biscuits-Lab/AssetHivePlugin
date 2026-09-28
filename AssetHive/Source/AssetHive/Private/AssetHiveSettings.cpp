@@ -15,6 +15,21 @@ UAssetHiveSettings::UAssetHiveSettings()
     SurfaceUseMetallicSwitch = TEXT("UseMetallicTex");
     SurfaceUseEmissiveSwitch = TEXT("UseEmissive");
     SurfaceTilingParameter = TEXT("Tiling_Offset");
+    AssetBaseParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_VT_Simple.MI_Env_Base_VT_Simple")));
+    AssetBaseMaskedParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_Masked_VT_Simple.MI_Env_Base_Masked_VT_Simple")));
+    AssetDestructibleParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Destructible/MI_Env_Destructible_VT_UV.MI_Env_Destructible_VT_UV")));
+    AssetMegaParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Mega/MI_Env_Mega.MI_Env_Mega")));
+    AssetAlbedoParameter = TEXT("Diffuse_VT");
+    AssetNormalParameter = TEXT("Normal_VT");
+    AssetORMTextureParameter = TEXT("ORM_VT");
+    AssetMaskParameter = TEXT("Mask_VT");
+    AssetMegaMaskParameter = TEXT("Mega Mask_UV2");
+    AssetEmissiveParameter = TEXT("Emissive_Tex_VT");
+    AssetDestructibleEmissiveParameter = TEXT("Emissive_Tex");
+    AssetUseEmissiveSwitch = TEXT("UseEmissive");
+    Asset3DMaxLOD0Triangles = 300000;
+    Asset3DLargeMaxLOD0Triangles = 550000;
+    Asset3DLargeSizeThresholdCm = 1000.0f;
     PlantAtlasParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/Common/MaterialInstance/MMI_Grass.MMI_Grass")));
     PlantBillboardParentMaterial = PlantAtlasParentMaterial;
     PlantAtlasMaterialNamePrefix = TEXT("MI_");
@@ -86,6 +101,106 @@ FString UAssetHiveSettings::GetSurfaceMaterialName(const FString& AssetName, int
     const FString Prefix = GetDefault<UAssetHiveSettings>()->SurfaceMaterialNamePrefix.TrimStartAndEnd().IsEmpty()
         ? TEXT("MI_Env_Tile_") : GetDefault<UAssetHiveSettings>()->SurfaceMaterialNamePrefix.TrimStartAndEnd();
     return GroupId > 1 ? FString::Printf(TEXT("%s%s_%03d"), *Prefix, *SafeAssetName, GroupId) : Prefix + SafeAssetName;
+}
+
+FString UAssetHiveSettings::GetAssetParentMaterialPath(const FString& AssetType, bool bMasked)
+{
+    const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
+    const TSoftObjectPtr<UMaterialInterface>* Configured = &Settings->AssetBaseParentMaterial;
+    if (AssetType.Equals(TEXT("MEGA"), ESearchCase::IgnoreCase))
+    {
+        Configured = &Settings->AssetMegaParentMaterial;
+    }
+    else if (AssetType.Equals(TEXT("Destructible"), ESearchCase::IgnoreCase))
+    {
+        Configured = &Settings->AssetDestructibleParentMaterial;
+    }
+    else if (bMasked)
+    {
+        Configured = &Settings->AssetBaseMaskedParentMaterial;
+    }
+    return Configured->ToSoftObjectPath().ToString().TrimStartAndEnd();
+}
+
+UMaterialInterface* UAssetHiveSettings::GetAssetParentMaterial(const FString& AssetType, bool bMasked)
+{
+    const FString Path = GetAssetParentMaterialPath(AssetType, bMasked);
+    return IsValidAssetParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
+}
+
+bool UAssetHiveSettings::IsValidAssetParentMaterialPath(const FString& Path)
+{
+    return IsValidSurfaceParentMaterialPath(Path);
+}
+
+FString UAssetHiveSettings::GetAssetAlbedoParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->AssetAlbedoParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Diffuse_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetAssetNormalParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->AssetNormalParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Normal_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetAssetORMTextureParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->AssetORMTextureParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("ORM_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetAssetMaskParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->AssetMaskParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Mask_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetAssetMegaMaskParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->AssetMegaMaskParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Mega Mask_UV2") : Value;
+}
+
+FString UAssetHiveSettings::GetAssetEmissiveParameter(const FString& AssetType)
+{
+    if (AssetType.Equals(TEXT("Destructible"), ESearchCase::IgnoreCase))
+    {
+        return GetAssetDestructibleEmissiveParameter();
+    }
+    const FString Value = GetDefault<UAssetHiveSettings>()->AssetEmissiveParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Emissive_Tex_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetAssetDestructibleEmissiveParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->AssetDestructibleEmissiveParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Emissive_Tex") : Value;
+}
+
+FString UAssetHiveSettings::GetAssetUseEmissiveSwitch()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->AssetUseEmissiveSwitch.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("UseEmissive") : Value;
+}
+
+int32 UAssetHiveSettings::GetAsset3DMaxLOD0Triangles()
+{
+    const int32 Value = GetDefault<UAssetHiveSettings>()->Asset3DMaxLOD0Triangles;
+    return Value > 0 ? Value : 300000;
+}
+
+int32 UAssetHiveSettings::GetAsset3DLargeMaxLOD0Triangles()
+{
+    const int32 Value = GetDefault<UAssetHiveSettings>()->Asset3DLargeMaxLOD0Triangles;
+    return Value > 0 ? Value : 550000;
+}
+
+float UAssetHiveSettings::GetAsset3DLargeSizeThresholdCm()
+{
+    const float Value = GetDefault<UAssetHiveSettings>()->Asset3DLargeSizeThresholdCm;
+    return Value > 0.0f ? Value : 1000.0f;
 }
 
 FString UAssetHiveSettings::GetDefaultPlantAtlasParentMaterialPath()
