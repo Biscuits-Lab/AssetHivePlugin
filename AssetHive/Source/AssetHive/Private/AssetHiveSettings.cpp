@@ -30,6 +30,7 @@ UAssetHiveSettings::UAssetHiveSettings()
     Asset3DMaxLOD0Triangles = 300000;
     Asset3DLargeMaxLOD0Triangles = 550000;
     Asset3DLargeSizeThresholdCm = 1000.0f;
+    Asset3DMissingSmoothingAngleDegrees = 60.0f;
     PlantAtlasParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/Common/MaterialInstance/MMI_Grass.MMI_Grass")));
     PlantBillboardParentMaterial = PlantAtlasParentMaterial;
     PlantAtlasMaterialNamePrefix = TEXT("MI_");
@@ -201,6 +202,12 @@ float UAssetHiveSettings::GetAsset3DLargeSizeThresholdCm()
 {
     const float Value = GetDefault<UAssetHiveSettings>()->Asset3DLargeSizeThresholdCm;
     return Value > 0.0f ? Value : 1000.0f;
+}
+
+float UAssetHiveSettings::GetAsset3DMissingSmoothingAngle()
+{
+    const float Value = GetDefault<UAssetHiveSettings>()->Asset3DMissingSmoothingAngleDegrees;
+    return FMath::Clamp(Value, 0.0f, 180.0f);
 }
 
 FString UAssetHiveSettings::GetDefaultPlantAtlasParentMaterialPath()

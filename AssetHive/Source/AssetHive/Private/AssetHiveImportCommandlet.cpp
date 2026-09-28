@@ -24,6 +24,7 @@
 #include "MaterialEditingLibrary.h"
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
+#include "StaticMeshOperations.h"
 #include "Modules/ModuleManager.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInterface.h"
@@ -358,6 +359,120 @@ static bool ApplyNaniteTriangleBudget(UStaticMesh *StaticMesh,
       TEXT("%s %.2f m source, %d triangles, budget %d, Nanite keep %.4f"),
       *StaticMesh->GetName(), MaxDimensionCm / 100.0f, SourceTriangles,
       TriangleBudget, KeepPercent);
+  UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
+  return true;
+}
+
+static bool FbxHasSmoothingGroupLayer(const FString &SourceFile) {
+  TArray<uint8> FileData;
+  if (!FFileHelper::LoadFileToArray(FileData, *SourceFile)) {
+    UE_LOG(LogTemp, Warning,
+           TEXT("AssetHive import: failed to read FBX smoothing data: %s"),
+           *SourceFile);
+    // Keep the imported data untouched when the source cannot be inspected.
+    return true;
+  }
+
+  static constexpr ANSICHAR SmoothingToken[] = "LayerElementSmoothing";
+  constexpr int32 SmoothingTokenLength = UE_ARRAY_COUNT(SmoothingToken) - 1;
+  if (FileData.Num() < SmoothingTokenLength) {
+    return false;
+  }
+
+  const uint8 *Data = FileData.GetData();
+  const uint8 FirstTokenByte = static_cast<uint8>(SmoothingToken[0]);
+  for (int32 Offset = 0; Offset <= FileData.Num() - SmoothingTokenLength;
+       ++Offset) {
+    if (Data[Offset] == FirstTokenByte &&
+        FMemory::Memcmp(Data + Offset, SmoothingToken,
+                        SmoothingTokenLength) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// UE keeps Recompute Normals disabled for this import path. When an FBX has
+// no smoothing-group layer, derive explicit hard edges from the polygon angle
+// while leaving the imported vertex normals untouched.
+static bool ApplyGeneratedSmoothingGroups(UStaticMesh *StaticMesh,
+                                          float AngleDegrees,
+                                          FString &OutSummary) {
+  OutSummary.Reset();
+  if (!StaticMesh) {
+    return false;
+  }
+
+  const float ClampedAngle = FMath::Clamp(AngleDegrees, 0.0f, 180.0f);
+  const float CosThreshold =
+      FMath::Cos(FMath::DegreesToRadians(ClampedAngle));
+  int32 GeneratedLodCount = 0;
+  int32 GeneratedHardEdgeCount = 0;
+
+  for (int32 LodIndex = 0; LodIndex < StaticMesh->GetNumSourceModels();
+       ++LodIndex) {
+    FMeshDescription *Mesh = StaticMesh->GetMeshDescription(LodIndex);
+    if (!Mesh || Mesh->Polygons().Num() == 0 || Mesh->Triangles().Num() == 0) {
+      continue;
+    }
+
+    FStaticMeshAttributes Attributes(*Mesh);
+    Attributes.Register(true);
+    FStaticMeshOperations::ComputeTriangleTangentsAndNormals(*Mesh);
+    Mesh->BuildEdgeIndexers();
+    Mesh->BuildPolygonIndexers();
+
+    TTriangleAttributesRef<FVector3f> TriangleNormals =
+        Attributes.GetTriangleNormals();
+    TMap<FPolygonID, FVector3f> PolygonNormals;
+    PolygonNormals.Reserve(Mesh->Polygons().Num());
+    for (const FPolygonID PolygonID : Mesh->Polygons().GetElementIDs()) {
+      FVector3f NormalSum = FVector3f::ZeroVector;
+      int32 TriangleCount = 0;
+      for (const FTriangleID TriangleID :
+           Mesh->GetPolygonTriangles(PolygonID)) {
+        NormalSum += TriangleNormals[TriangleID];
+        ++TriangleCount;
+      }
+      PolygonNormals.Add(PolygonID, TriangleCount > 0
+                                        ? NormalSum.GetSafeNormal()
+                                        : FVector3f::ZeroVector);
+    }
+
+    TEdgeAttributesRef<bool> EdgeHardnesses = Attributes.GetEdgeHardnesses();
+    int32 HardEdgeCount = 0;
+    for (const FEdgeID EdgeID : Mesh->Edges().GetElementIDs()) {
+      const TArray<FPolygonID, TInlineAllocator<2>> ConnectedPolygons =
+          Mesh->GetEdgeConnectedPolygons<TInlineAllocator<2>>(EdgeID);
+      bool bHardEdge = ConnectedPolygons.Num() != 2;
+      if (!bHardEdge) {
+        const FVector3f *FirstNormal =
+            PolygonNormals.Find(ConnectedPolygons[0]);
+        const FVector3f *SecondNormal =
+            PolygonNormals.Find(ConnectedPolygons[1]);
+        bHardEdge =
+            !FirstNormal || !SecondNormal ||
+            FVector3f::DotProduct(*FirstNormal, *SecondNormal) < CosThreshold;
+      }
+      EdgeHardnesses[EdgeID] = bHardEdge;
+      HardEdgeCount += bHardEdge ? 1 : 0;
+    }
+
+    StaticMesh->GetSourceModel(LodIndex)
+        .BuildSettings.bRecomputeNormals = false;
+    StaticMesh->CommitMeshDescription(LodIndex);
+    ++GeneratedLodCount;
+    GeneratedHardEdgeCount += HardEdgeCount;
+  }
+
+  if (GeneratedLodCount == 0) {
+    return false;
+  }
+
+  OutSummary = FString::Printf(
+      TEXT("%s: generated smoothing groups for %d LOD(s), %d hard edge(s), angle %.1f deg; Recompute Normals remains disabled"),
+      *StaticMesh->GetName(), GeneratedLodCount, GeneratedHardEdgeCount,
+      ClampedAngle);
   UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
   return true;
 }
@@ -2033,6 +2148,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
 
     TArray<UStaticMesh *> ImportedMeshes;
+    TMap<UStaticMesh *, FString> SourceFileByMesh;
+    TMap<FString, bool> FbxSmoothingGroupCache;
     TMap<int32, TMap<FString, UTexture *>> TextureBySlotByGroup;
     TMap<int32, TMap<FString, FString>> SourceTextureBySlotByGroup;
     const bool bMultipleTextureGroups = SourceTextureSlotMapByGroup.Num() > 1;
@@ -2249,6 +2366,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           for (UObject *ImportedObject : ImportedObjects) {
             if (UStaticMesh *StaticMesh = Cast<UStaticMesh>(ImportedObject)) {
               ImportedMeshes.Add(StaticMesh);
+              if (bIs3DAsset) {
+                SourceFileByMesh.Add(StaticMesh, SourceFile);
+              }
             }
           }
           ImportedModelIndex += 1;
@@ -2744,6 +2864,25 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       if (!StaticMesh) {
         continue;
       }
+      // Foliage/3D Plants intentionally do not participate in this rule.
+      if (bIs3DAsset && FPaths::GetExtension(SourceFileByMesh.FindRef(StaticMesh))
+                              .Equals(TEXT("fbx"), ESearchCase::IgnoreCase)) {
+        const FString SourceFile = SourceFileByMesh.FindRef(StaticMesh);
+        bool bHasSmoothingGroupLayer = false;
+        if (const bool *Cached =
+                FbxSmoothingGroupCache.Find(SourceFile)) {
+          bHasSmoothingGroupLayer = *Cached;
+        } else {
+          bHasSmoothingGroupLayer = FbxHasSmoothingGroupLayer(SourceFile);
+          FbxSmoothingGroupCache.Add(SourceFile, bHasSmoothingGroupLayer);
+        }
+        if (!bHasSmoothingGroupLayer) {
+          FString SmoothingSummary;
+          ApplyGeneratedSmoothingGroups(
+              StaticMesh, UAssetHiveSettings::GetAsset3DMissingSmoothingAngle(),
+              SmoothingSummary);
+        }
+      }
       SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 30, 0, 99)),
           FString::Printf(TEXT("配置 Nanite 和材质: %s"), *StaticMesh->GetName()));
       // SetMaterial calls Pre/PostEditChange and rebuilds the mesh for EVERY slot.
@@ -3105,4 +3244,73 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
   Settings->Asset3DLargeSizeThresholdCm = SavedThreshold;
   return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveMissingSmoothingGroupsTest,
+    "AssetHive.Import.MissingSmoothingGroups",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveMissingSmoothingGroupsTest::RunTest(const FString &Parameters) {
+  UStaticMesh *Mesh = NewObject<UStaticMesh>(
+      GetTransientPackage(), FName(TEXT("AssetHiveSmoothingProbe")), RF_Transient);
+  FGCObjectScopeGuard MeshGuard(Mesh);
+  Mesh->AddSourceModel();
+
+  FMeshDescription Description;
+  FStaticMeshAttributes Attributes(Description);
+  Attributes.Register();
+  TVertexAttributesRef<FVector3f> Positions = Attributes.GetVertexPositions();
+  TVertexInstanceAttributesRef<FVector3f> Normals =
+      Attributes.GetVertexInstanceNormals();
+  const FPolygonGroupID Group = Description.CreatePolygonGroup();
+  Attributes.GetPolygonGroupMaterialSlotNames()[Group] =
+      FName(TEXT("Material_0"));
+
+  auto AddCorner = [&Description, &Positions, &Normals](
+                       const FVector3f &Position, const FVector3f &Normal) {
+    const FVertexID Vertex = Description.CreateVertex();
+    Positions[Vertex] = Position;
+    const FVertexInstanceID Instance = Description.CreateVertexInstance(Vertex);
+    Normals[Instance] = Normal;
+    return Instance;
+  };
+
+  const FVertexInstanceID A = AddCorner(FVector3f(0.0f, 0.0f, 0.0f),
+                                        FVector3f(0.0f, 0.0f, 1.0f));
+  const FVertexInstanceID B = AddCorner(FVector3f(1.0f, 0.0f, 0.0f),
+                                        FVector3f(0.0f, 0.0f, 1.0f));
+  const FVertexInstanceID C = AddCorner(FVector3f(0.0f, 1.0f, 0.0f),
+                                        FVector3f(0.0f, 0.0f, 1.0f));
+  const FVertexInstanceID D = AddCorner(FVector3f(0.0f, 0.0f, 1.0f),
+                                        FVector3f(0.0f, 1.0f, 0.0f));
+  const FVertexInstanceID E = AddCorner(FVector3f(1.0f, 1.0f, 0.0f),
+                                        FVector3f(0.0f, 0.0f, 1.0f));
+  Description.CreateTriangle(Group, {A, B, C});
+  Description.CreateTriangle(Group, {B, A, D});
+  Description.CreateTriangle(Group, {A, E, C});
+  Mesh->CreateMeshDescription(0, MoveTemp(Description));
+  Mesh->CommitMeshDescription(0);
+
+  FString Summary;
+  TestTrue(TEXT("Missing smoothing groups are generated"),
+           ApplyGeneratedSmoothingGroups(Mesh, 60.0f, Summary));
+  TestFalse(TEXT("Recompute Normals remains disabled"),
+            Mesh->GetSourceModel(0).BuildSettings.bRecomputeNormals);
+
+  FMeshDescription *Generated = Mesh->GetMeshDescription(0);
+  if (!TestNotNull(TEXT("Generated mesh description exists"), Generated)) {
+    return false;
+  }
+  FStaticMeshAttributes GeneratedAttributes(*Generated);
+  TEdgeAttributesRef<bool> EdgeHardnesses =
+      GeneratedAttributes.GetEdgeHardnesses();
+  int32 HardEdgeCount = 0;
+  for (const FEdgeID EdgeID : Generated->Edges().GetElementIDs()) {
+    HardEdgeCount += EdgeHardnesses[EdgeID] ? 1 : 0;
+  }
+  TestEqual(TEXT("Fixture edge count"), Generated->Edges().Num(), 7);
+  TestEqual(TEXT("Right-angle and border edges are hard"), HardEdgeCount, 6);
+  TestTrue(TEXT("Summary records the disabled normal recompute"),
+           Summary.Contains(TEXT("Recompute Normals remains disabled")));
+  return true;
+}
+
 #endif

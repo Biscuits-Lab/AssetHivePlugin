@@ -91,6 +91,9 @@ public:
     UPROPERTY(EditAnywhere, config, Category="3D Asset Mesh", meta=(DisplayName="Large Asset Size Threshold (cm)", ToolTip="Assets whose largest bounding box axis exceeds this size use the large asset triangle budget. Default: 1000 (10 m)"))
     float Asset3DLargeSizeThresholdCm = 1000.0f;
 
+    UPROPERTY(EditAnywhere, config, Category="3D Asset Mesh", meta=(DisplayName="Missing Smoothing Group Angle (deg)", ClampMin="0.0", ClampMax="180.0", ToolTip="When a 3D Asset FBX has no smoothing-group layer, edges above this angle are marked hard while imported vertex normals are preserved. Recompute Normals remains disabled. Foliage is excluded. Default: 60"))
+    float Asset3DMissingSmoothingAngleDegrees = 60.0f;
+
 
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Atlas Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Atlas texture groups. Default: /Game/Common/MaterialInstance/MMI_Grass.MMI_Grass"))
     TSoftObjectPtr<UMaterialInterface> PlantAtlasParentMaterial;
@@ -134,6 +137,7 @@ public:
     static int32 GetAsset3DMaxLOD0Triangles();
     static int32 GetAsset3DLargeMaxLOD0Triangles();
     static float GetAsset3DLargeSizeThresholdCm();
+    static float GetAsset3DMissingSmoothingAngle();
     static FString GetDefaultPlantAtlasParentMaterialPath();
     static FString GetDefaultPlantBillboardParentMaterialPath();
     static FString GetPlantParentMaterialPath(bool bBillboard);
