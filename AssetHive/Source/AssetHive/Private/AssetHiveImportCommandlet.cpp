@@ -37,6 +37,30 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "UObject/Package.h"
+#include <type_traits>
+
+template <typename T, typename = void>
+struct TAssetHiveHasNaniteSettingsAccessor : std::false_type {};
+
+template <typename T>
+struct TAssetHiveHasNaniteSettingsAccessor<
+    T, std::void_t<decltype(std::declval<T &>().GetNaniteSettings())>>
+    : std::true_type {};
+
+// UE 5.7 adds accessors that are absent from the stock 5.6 header.
+template <typename T>
+static std::enable_if_t<TAssetHiveHasNaniteSettingsAccessor<T>::value,
+                        FMeshNaniteSettings *>
+GetMutableNaniteSettings(T *StaticMesh) {
+  return StaticMesh ? &StaticMesh->GetNaniteSettings() : nullptr;
+}
+
+template <typename T>
+static std::enable_if_t<!TAssetHiveHasNaniteSettingsAccessor<T>::value,
+                        FMeshNaniteSettings *>
+GetMutableNaniteSettings(T *StaticMesh) {
+  return StaticMesh ? &StaticMesh->NaniteSettings : nullptr;
+}
 
 
 // Wait only for the referenced texture, including a possible VT rebuild.
@@ -158,7 +182,6 @@ static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
     Profile.TypeKey = TEXT("Dressing");
   } else if (HasAssetTag(Tags, TEXT("Megascans"))) {
     Profile.TypeKey = TEXT("Megascans");
-    Profile.TypePrefix = TEXT("Megascans");
     Profile.bUseAssetIdOnly = true;
   } else if (HasAssetTag(Tags, TEXT("PBRMAX"))) {
     Profile.TypeKey = TEXT("PBRMAX");
@@ -190,47 +213,15 @@ static FString BuildEnvironmentObjectStem(const FEnvironmentAssetProfile &Profil
 
 static FString BuildEnvironmentAssetMaterialName(
     const FString &EnvironmentStem, int32 GroupId,
-    const FString &VariantKey) {
-  return FString::Printf(TEXT("MI_%s_%03d_%s"), *EnvironmentStem, GroupId,
-                         *VariantKey);
+    bool bMultipleTextureGroups, const FString &VariantKey) {
+  const FString GroupSegment =
+      bMultipleTextureGroups
+          ? FString::Printf(TEXT("_%03d"), GroupId)
+          : FString();
+  return FString::Printf(TEXT("MI_%s%s_%s"), *EnvironmentStem,
+                         *GroupSegment, *VariantKey);
 }
 
-static FString DetectResolutionTokenFromName(const FString &SourceFile) {
-  const FString BaseName = FPaths::GetBaseFilename(SourceFile);
-  const FRegexPattern Pattern(
-      TEXT("(?:^|[_\\-. ])(1K|2K|4K|8K|16K)(?=$|[_\\-. ])"));
-  FRegexMatcher Matcher(Pattern, BaseName);
-  return Matcher.FindNext() ? Matcher.GetCaptureGroup(1).ToUpper() : FString();
-}
-
-static int32 ResolutionTokenRank(const FString &Resolution) {
-  if (Resolution == TEXT("16K")) return 5;
-  if (Resolution == TEXT("8K")) return 4;
-  if (Resolution == TEXT("4K")) return 3;
-  if (Resolution == TEXT("2K")) return 2;
-  if (Resolution == TEXT("1K")) return 1;
-  return 0;
-}
-
-static FString Resolve3DTextureResolution(
-    const FString &SourceFile, const FString &SlotName,
-    const FString &ConfiguredResolution,
-    const FEnvironmentAssetProfile &Profile) {
-  const bool bPrimary = SlotName == TEXT("albedo") || SlotName == TEXT("normal");
-  const FString Limit =
-      Profile.bHighResPreset
-          ? (bPrimary ? TEXT("4K") : TEXT("2K"))
-          : (bPrimary ? TEXT("2K") : TEXT("1K"));
-  FString Resolution = ConfiguredResolution.TrimStartAndEnd().ToUpper();
-  if (Resolution.IsEmpty()) {
-    Resolution = DetectResolutionTokenFromName(SourceFile);
-  }
-  if (Resolution.IsEmpty() ||
-      ResolutionTokenRank(Resolution) > ResolutionTokenRank(Limit)) {
-    return Limit;
-  }
-  return Resolution;
-}
 
 static FString ToSlotSuffix(const FString &SlotName);
 
@@ -358,11 +349,11 @@ static bool ApplyNaniteTriangleBudget(UStaticMesh *StaticMesh,
           : FMath::Clamp(static_cast<float>(TriangleBudget) /
                              static_cast<float>(SourceTriangles),
                          0.0f, 1.0f);
-  if (FMath::IsNearlyEqual(StaticMesh->NaniteSettings.KeepPercentTriangles,
+  if (FMath::IsNearlyEqual(GetMutableNaniteSettings(StaticMesh)->KeepPercentTriangles,
                            KeepPercent, 0.0001f)) {
     return false;
   }
-  StaticMesh->NaniteSettings.KeepPercentTriangles = KeepPercent;
+  GetMutableNaniteSettings(StaticMesh)->KeepPercentTriangles = KeepPercent;
   OutSummary = FString::Printf(
       TEXT("%s %.2f m source, %d triangles, budget %d, Nanite keep %.4f"),
       *StaticMesh->GetName(), MaxDimensionCm / 100.0f, SourceTriangles,
@@ -381,7 +372,9 @@ static void Configure3DAssetCollision(UStaticMesh *StaticMesh) {
   if (!bHasCollision && GEditor) {
     if (UStaticMeshEditorSubsystem *Subsystem =
             GEditor->GetEditorSubsystem<UStaticMeshEditorSubsystem>()) {
-      Subsystem->SetConvexDecompositionCollisions(StaticMesh, 1, 16, 16);
+      // Use UE's maximum Auto Convex Collision precision for the provisional hull; 16 voxels was too coarse and rounded away silhouettes.
+      constexpr int32 TemporaryHullPrecision = 1000000;
+      Subsystem->SetConvexDecompositionCollisions(StaticMesh, 1, 16, TemporaryHullPrecision);
       BodySetup = StaticMesh->GetBodySetup();
     }
   }
@@ -1450,16 +1443,49 @@ CreateAssetMaterialInstance(const FString &AssetFolder,
   return MaterialInstance;
 }
 
-static bool MaterialHasStaticSwitch(UMaterialInterface *Material,
-                                    const FString &ParameterName) {
-  if (!Material || ParameterName.IsEmpty()) {
+static FString NormalizeMaterialParameterToken(const FString &Value) {
+  FString Token = Value;
+  Token.ReplaceInline(TEXT(" "), TEXT(""));
+  Token.ReplaceInline(TEXT("_"), TEXT(""));
+  return Token.ToLower();
+}
+
+// Static switches usually live in the base material graph, while an instance
+// only reports the switches it already overrides. Walk the parent chain (with
+// a normalized name fallback) so an imported instance can still drive it.
+static bool ResolveStaticSwitchParameterName(UMaterialInterface *Material,
+                                             const FString &ConfiguredName,
+                                             FName &OutName) {
+  if (!Material || ConfiguredName.IsEmpty()) {
     return false;
   }
+  const FName Configured(ConfiguredName);
   bool bDefaultValue = false;
   FGuid ExpressionGuid;
-  return Material->GetStaticSwitchParameterDefaultValue(
-      FHashedMaterialParameterInfo(FName(*ParameterName)), bDefaultValue,
-      ExpressionGuid);
+  if (Material->GetStaticSwitchParameterDefaultValue(
+          FHashedMaterialParameterInfo(Configured), bDefaultValue,
+          ExpressionGuid)) {
+    OutName = Configured;
+    return true;
+  }
+  const FString Wanted = NormalizeMaterialParameterToken(ConfiguredName);
+  for (UMaterialInterface *Cursor = Material; Cursor;) {
+    TMap<FMaterialParameterInfo, FMaterialParameterMetadata> Parameters;
+    Cursor->GetAllParametersOfType(EMaterialParameterType::StaticSwitch,
+                                   Parameters);
+    for (const TPair<FMaterialParameterInfo, FMaterialParameterMetadata>
+             &Parameter : Parameters) {
+      const FString Candidate = Parameter.Key.Name.ToString();
+      if (Candidate.Equals(ConfiguredName, ESearchCase::IgnoreCase) ||
+          NormalizeMaterialParameterToken(Candidate) == Wanted) {
+        OutName = Parameter.Key.Name;
+        return true;
+      }
+    }
+    UMaterialInstance *Instance = Cast<UMaterialInstance>(Cursor);
+    Cursor = Instance ? Instance->Parent : nullptr;
+  }
+  return false;
 }
 
 static UMaterialInstanceConstant *
@@ -1536,11 +1562,19 @@ CreateEnvironmentAssetMaterialInstance(
     MaterialInstance->SetTextureParameterValueEditorOnly(
         FMaterialParameterInfo(FName(*MaskParameter)), OpacityTexture);
   }
-  if (!EmissiveSwitch.IsEmpty() &&
-      MaterialHasStaticSwitch(ParentMaterial, EmissiveSwitch)) {
-    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
-        FMaterialParameterInfo(FName(*EmissiveSwitch)),
-        EmissiveTexture != nullptr);
+  if (!EmissiveSwitch.IsEmpty()) {
+    FName EmissiveSwitchName = NAME_None;
+    if (ResolveStaticSwitchParameterName(ParentMaterial, EmissiveSwitch,
+                                         EmissiveSwitchName)) {
+      MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+          FMaterialParameterInfo(EmissiveSwitchName),
+          EmissiveTexture != nullptr);
+    } else {
+      UE_LOG(LogTemp, Warning,
+             TEXT("AssetHive: static switch '%s' not found on %s; emissive "
+                  "state keeps the parent default"),
+             *EmissiveSwitch, *ParentMaterial->GetPathName());
+    }
   }
 
   UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
@@ -2327,13 +2361,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         if (bIsSurface && SourceTextureObjectNameByPath.Contains(SourceKey)) {
           ConfiguredObjectName = MakeSafeObjectName(SourceTextureObjectNameByPath[SourceKey]);
         }
-        const FString TextureResolution =
-            bIs3DAsset
-                ? Resolve3DTextureResolution(
-                      SourceFile, SlotName,
-                      SourceTextureResolutionByPath.FindRef(SourceKey),
-                      EnvironmentProfile)
-                : FString();
         FString ImportedTextureName = ConfiguredObjectName;
         if (ImportedTextureName.IsEmpty()) {
           if (bIs3DAsset) {
@@ -2342,8 +2369,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                     ? FString::Printf(TEXT("_G%03d"), GroupId)
                     : FString();
             ImportedTextureName = FString::Printf(
-                TEXT("T_%s_%s%s_%s_%s"), *EnvironmentStem,
-                *PrimaryModelVariantKey, *GroupSegment, *TextureResolution,
+                TEXT("T_%s_%s%s_%s"), *EnvironmentStem,
+                *PrimaryModelVariantKey, *GroupSegment,
                 *To3DTextureSlotSuffix(SlotName));
           } else {
             ImportedTextureName =
@@ -2566,15 +2593,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           UTexture2D *MetallicTexture =
               Resolve3DSourceTexture(TEXT("metalness"));
           if (AOTexture || RoughnessTexture || MetallicTexture) {
-            const FString ORMResolution = Resolve3DTextureResolution(
-                FString(), TEXT("orm"), FString(), EnvironmentProfile);
             const FString ORMGroup =
                 GroupIds.Num() > 1
                     ? FString::Printf(TEXT("_G%03d"), GroupId)
                     : FString();
             const FString ORMAssetName = FString::Printf(
-                TEXT("T_%s_%s%s_%s_ORM"), *EnvironmentStem,
-                *PrimaryModelVariantKey, *ORMGroup, *ORMResolution);
+                TEXT("T_%s_%s%s_ORM"), *EnvironmentStem,
+                *PrimaryModelVariantKey, *ORMGroup);
             ORMTexture = CreatePackedORMTexture(
                 AssetFolder, ORMAssetName, AOTexture, RoughnessTexture,
                 MetallicTexture,
@@ -2591,7 +2616,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         UTexture2D *OpacityTexture = Resolve3DSourceTexture(TEXT("opacity"));
         const bool bMasked = OpacityTexture != nullptr;
         const FString MaterialName = BuildEnvironmentAssetMaterialName(
-            EnvironmentStem, GroupId, PrimaryModelVariantKey);
+            EnvironmentStem, GroupId, GroupIds.Num() > 1,
+            PrimaryModelVariantKey);
         MaterialInstance = CreateEnvironmentAssetMaterialInstance(
             AssetFolder, MaterialName, EnvironmentProfile,
             TextureBySlot.FindRef(TEXT("albedo")),
@@ -2727,7 +2753,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         FString TriangleBudgetSummary;
         ApplyNaniteTriangleBudget(StaticMesh, TriangleBudgetSummary);
       }
-      StaticMesh->NaniteSettings.bEnabled = true;
+      GetMutableNaniteSettings(StaticMesh)->bEnabled = true;
       TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
       for (int32 Index = 0; Index < Slots.Num() && MaterialInstances.Num() > 0; ++Index) {
         UMaterialInstanceConstant *Material = MaterialInstances[FMath::Min(Index, MaterialInstances.Num() - 1)];
@@ -2835,14 +2861,14 @@ bool FAssetHiveMeshImportPerfTest::RunTest(const FString &Parameters) {
   if (!TestNotNull(TEXT("Mesh imported"), Mesh)) return false;
   const double ImportedAt = FPlatformTime::Seconds();
   FStaticMeshCompilingManager::Get().FinishCompilation({Mesh});
-  if (!Mesh->NaniteSettings.bEnabled) {
+  if (!GetMutableNaniteSettings(Mesh)->bEnabled) {
     Mesh->PreEditChange(nullptr);
-    Mesh->NaniteSettings.bEnabled = true;
+    GetMutableNaniteSettings(Mesh)->bEnabled = true;
     Mesh->PostEditChange();
     FStaticMeshCompilingManager::Get().FinishCompilation({Mesh});
   }
   FinalizeImportedAsset(Mesh);
-  TestTrue(TEXT("Nanite retained"), Mesh->NaniteSettings.bEnabled);
+  TestTrue(TEXT("Nanite retained"), GetMutableNaniteSettings(Mesh)->bEnabled);
   TestTrue(TEXT("Mesh stays dirty"), Mesh->GetOutermost()->IsDirty());
   TestNotNull(TEXT("Source geometry retained"), Mesh->GetMeshDescription(0));
   if (!bBaseline) TestFalse(TEXT("Authored normals retained"), Mesh->GetSourceModel(0).BuildSettings.bRecomputeNormals);
@@ -2942,13 +2968,18 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
 
   const FString MegascansStem = BuildStemForTag(TEXT("Megascans"));
   TestEqual(TEXT("Megascans uses tag and asset ID only"), MegascansStem,
-            FString(TEXT("Env_Megascans_abc123")));
+            FString(TEXT("Env_abc123")));
   TestEqual(TEXT("Megascans mesh drops display name"),
             FString::Printf(TEXT("SM_%s_%s"), *MegascansStem, TEXT("01")),
-            FString(TEXT("SM_Env_Megascans_abc123_01")));
-  TestEqual(TEXT("Megascans material instance drops display name"),
-            BuildEnvironmentAssetMaterialName(MegascansStem, 1, TEXT("01")),
-            FString(TEXT("MI_Env_Megascans_abc123_001_01")));
+            FString(TEXT("SM_Env_abc123_01")));
+  TestEqual(TEXT("Megascans single-group material instance omits group id"),
+            BuildEnvironmentAssetMaterialName(MegascansStem, 1, false,
+                                               TEXT("01")),
+            FString(TEXT("MI_Env_abc123_01")));
+  TestEqual(TEXT("Megascans multi-group material instance keeps group id"),
+            BuildEnvironmentAssetMaterialName(MegascansStem, 2, true,
+                                               TEXT("01")),
+            FString(TEXT("MI_Env_abc123_002_01")));
   return true;
 }
 
@@ -3029,7 +3060,7 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
   TestFalse(TEXT("In-budget asset keeps 100% of the source"),
             ApplyNaniteTriangleBudget(SmallMesh, SmallSummary));
   TestTrue(TEXT("Keep percentage stays at 1.0"),
-           FMath::IsNearlyEqual(SmallMesh->NaniteSettings.KeepPercentTriangles,
+           FMath::IsNearlyEqual(GetMutableNaniteSettings(SmallMesh)->KeepPercentTriangles,
                                 1.0f));
 
   // Tightening the spec makes the same asset shrink through Nanite.
@@ -3038,7 +3069,7 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("Oversized asset receives a Nanite keep percentage"),
            ApplyNaniteTriangleBudget(SmallMesh, SmallSummary));
   TestTrue(TEXT("Keep percentage follows the triangle spec"),
-           FMath::IsNearlyEqual(SmallMesh->NaniteSettings.KeepPercentTriangles,
+           FMath::IsNearlyEqual(GetMutableNaniteSettings(SmallMesh)->KeepPercentTriangles,
                                 static_cast<float>(SmallBudget) /
                                     static_cast<float>(SourceTriangles),
                                 0.001f));
@@ -3054,7 +3085,7 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
   TestFalse(TEXT("Large asset ignores the small asset budget"),
             ApplyNaniteTriangleBudget(LargeMesh, LargeSummary));
   TestTrue(TEXT("Large asset keeps 100% of the source"),
-           FMath::IsNearlyEqual(LargeMesh->NaniteSettings.KeepPercentTriangles,
+           FMath::IsNearlyEqual(GetMutableNaniteSettings(LargeMesh)->KeepPercentTriangles,
                                 1.0f));
   TestTrue(TEXT("Summary stays empty when nothing changes"),
            LargeSummary.IsEmpty());
@@ -3064,7 +3095,7 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("Large asset uses its own budget"),
            ApplyNaniteTriangleBudget(LargeMesh, LargeSummary));
   TestTrue(TEXT("Large asset keep percentage follows the large spec"),
-           FMath::IsNearlyEqual(LargeMesh->NaniteSettings.KeepPercentTriangles,
+           FMath::IsNearlyEqual(GetMutableNaniteSettings(LargeMesh)->KeepPercentTriangles,
                                 static_cast<float>(SmallBudget) /
                                     static_cast<float>(SourceTriangles),
                                 0.001f));
