@@ -48,6 +48,8 @@ UAssetHiveSettings::UAssetHiveSettings()
     PlantBillboardMaterialNamePrefix = TEXT("MI_Billboard_");
     PlantAlbedoParameter = TEXT("Albedo");
     PlantNRSParameter = TEXT("NRS");
+    PlantOpaqueParentMaterial = TSoftObjectPtr<UMaterialInterface>();
+    PlantOpaqueMaterialNamePrefix = TEXT("MI_Opaque_");
 }
 FString UAssetHiveSettings::GetDefaultImportRootPath() { return TEXT("/Game/AssetHive"); }
 FString UAssetHiveSettings::GetImportRootPath()
@@ -387,7 +389,41 @@ UMaterialInterface* UAssetHiveSettings::GetPlantParentMaterial(bool bBillboard, 
     return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
 }
 
-FString UAssetHiveSettings::GetPlantMaterialName(const FString& AssetName, bool bBillboard)
+bool UAssetHiveSettings::HasConfiguredPlantOpaqueParentMaterial()
+{
+    return !GetDefault<UAssetHiveSettings>()->PlantOpaqueParentMaterial.ToSoftObjectPath().ToString().TrimStartAndEnd().IsEmpty();
+}
+
+FString UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bool bUseVT)
+{
+    const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
+    FString Path = Settings->PlantOpaqueParentMaterial.ToSoftObjectPath().ToString().TrimStartAndEnd();
+    if (Path.IsEmpty())
+    {
+        // No dedicated parent configured: reuse the Atlas parent and let the
+        // generated instance override the blend mode to Opaque.
+        Path = GetPlantParentMaterialPath(false);
+    }
+    if (bUseVT)
+    {
+        FString PackageName;
+        FString ObjectName;
+        if (Path.Split(TEXT("."), &PackageName, &ObjectName, ESearchCase::CaseSensitive, ESearchDir::FromEnd)
+            && !ObjectName.EndsWith(TEXT("_VT"), ESearchCase::CaseSensitive))
+        {
+            Path = FString::Printf(TEXT("%s_VT.%s_VT"), *PackageName, *ObjectName);
+        }
+    }
+    return Path;
+}
+
+UMaterialInterface* UAssetHiveSettings::GetPlantOpaqueParentMaterial(bool bUseVT)
+{
+    const FString Path = GetPlantOpaqueParentMaterialPath(bUseVT);
+    return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
+}
+
+FString UAssetHiveSettings::GetPlantMaterialName(const FString& AssetName, bool bBillboard, bool bOpaque)
 {
     FString SafeAssetName = AssetName.TrimStartAndEnd();
     SafeAssetName.ReplaceInline(TEXT(" "), TEXT("_"));
@@ -395,11 +431,15 @@ FString UAssetHiveSettings::GetPlantMaterialName(const FString& AssetName, bool 
     SafeAssetName.ReplaceInline(TEXT("."), TEXT("_"));
     if (SafeAssetName.IsEmpty()) SafeAssetName = TEXT("Plant");
     const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
-    const FString ConfiguredPrefix = bBillboard
-        ? Settings->PlantBillboardMaterialNamePrefix
-        : Settings->PlantAtlasMaterialNamePrefix;
+    const FString ConfiguredPrefix = bOpaque
+        ? Settings->PlantOpaqueMaterialNamePrefix
+        : (bBillboard ? Settings->PlantBillboardMaterialNamePrefix
+                      : Settings->PlantAtlasMaterialNamePrefix);
+    const FString DefaultPrefix = bOpaque
+        ? TEXT("MI_Opaque_")
+        : (bBillboard ? TEXT("MI_Billboard_") : TEXT("MI_"));
     const FString Prefix = ConfiguredPrefix.TrimStartAndEnd().IsEmpty()
-        ? (bBillboard ? TEXT("MI_Billboard_") : TEXT("MI_"))
+        ? DefaultPrefix
         : ConfiguredPrefix.TrimStartAndEnd();
     return Prefix + SafeAssetName;
 }

@@ -146,6 +146,12 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="NRS Texture Parameter", ToolTip="Texture parameter receiving the packed Plant NRS texture."))
     FString PlantNRSParameter;
 
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Optional parent MI used for cut _OPAQUE foliage variants. Leave empty to reuse the Atlas parent with a Blend Mode override to Opaque."))
+    TSoftObjectPtr<UMaterialInterface> PlantOpaqueParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Material Name Prefix", ToolTip="Prefix for generated 3D Plant opaque material instances. Default: MI_Opaque_"))
+    FString PlantOpaqueMaterialNamePrefix;
+
     static bool IsValidImportRootPath(const FString& Path);
     static FString GetDefaultImportRootPath();
     static FString GetImportRootPath();
@@ -188,7 +194,10 @@ public:
     static FString GetPlantParentMaterialPath(bool bBillboard);
     static UMaterialInterface* GetPlantParentMaterial(bool bBillboard, bool bUseVT);
     static bool IsValidPlantParentMaterialPath(const FString& Path);
-    static FString GetPlantMaterialName(const FString& AssetName, bool bBillboard);
+    static FString GetPlantMaterialName(const FString& AssetName, bool bBillboard, bool bOpaque = false);
+    static bool HasConfiguredPlantOpaqueParentMaterial();
+    static FString GetPlantOpaqueParentMaterialPath(bool bUseVT);
+    static UMaterialInterface* GetPlantOpaqueParentMaterial(bool bUseVT);
     static FString GetPlantAlbedoParameter();
     static FString GetPlantNRSParameter();
 };

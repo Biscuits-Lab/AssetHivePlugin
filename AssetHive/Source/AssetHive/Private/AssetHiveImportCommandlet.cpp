@@ -26,6 +26,7 @@
 #include "StaticMeshAttributes.h"
 #include "StaticMeshOperations.h"
 #include "Modules/ModuleManager.h"
+#include "Materials/MaterialInstanceBasePropertyOverrides.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/FileHelper.h"
@@ -695,6 +696,14 @@ static FString NormalizeModelVariantKey(const FString &RawValue) {
 
   CleanValue.ToUpperInline();
   return CleanValue.Left(32);
+}
+
+// The library marks transparency-cut foliage variants with an OPAQUE suffix
+// (for example 01OPAQUE). They keep the asset texture set but must render as
+// true Opaque surfaces instead of Masked.
+static bool IsOpaqueModelVariantKey(const FString &VariantKey) {
+  const FString Value = VariantKey.TrimStartAndEnd().ToUpper();
+  return Value.EndsWith(TEXT("OPAQUE"));
 }
 
 static bool IsAcceptedModelVariantToken(const FString &Token) {
@@ -1722,15 +1731,20 @@ static UMaterialInstanceConstant *
 CreatePlantMaterialInstance(const FString &AssetFolder,
                             const FString &AssetName, UTexture *AlbedoTexture,
                             UTexture *NRSTexture, const FString &MaterialRole,
-                            bool bUseVT) {
+                            bool bUseVT, bool bOpaque = false) {
   const bool bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
+  const FString ParentPath =
+      bOpaque ? UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bUseVT)
+              : UAssetHiveSettings::GetPlantParentMaterialPath(bBillboard);
   UMaterialInterface *ParentMaterial =
-      UAssetHiveSettings::GetPlantParentMaterial(bBillboard, bUseVT);
+      bOpaque ? UAssetHiveSettings::GetPlantOpaqueParentMaterial(bUseVT)
+              : UAssetHiveSettings::GetPlantParentMaterial(bBillboard, bUseVT);
   if (!ParentMaterial) {
     GAssetHiveImportFailed = true;
     UE_LOG(LogTemp, Error, TEXT("AssetHive: missing Plant %s parent material: %s"),
-           bBillboard ? TEXT("Billboard") : TEXT("Atlas"),
-           *UAssetHiveSettings::GetPlantParentMaterialPath(bBillboard));
+           bOpaque ? TEXT("Opaque")
+                   : (bBillboard ? TEXT("Billboard") : TEXT("Atlas")),
+           *ParentPath);
     return nullptr;
   }
   for (UTexture *Texture : {AlbedoTexture, NRSTexture}) {
@@ -1738,7 +1752,7 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
   }
 
   const FString MaterialAssetName =
-      UAssetHiveSettings::GetPlantMaterialName(AssetName, bBillboard);
+      UAssetHiveSettings::GetPlantMaterialName(AssetName, bBillboard, bOpaque);
   const FString MaterialPackagePath = AssetFolder / MaterialAssetName;
   UPackage *MaterialPackage = CreatePackage(*MaterialPackagePath);
   UMaterialInstanceConstant *MaterialInstance =
@@ -1753,6 +1767,17 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     return nullptr;
   }
   MaterialInstance->SetParentEditorOnly(ParentMaterial);
+
+  if (bOpaque) {
+    // The transparency mask is already cut into the geometry, so the variant
+    // renders as a true Opaque surface instead of Masked.
+    // UMaterialInstance exposes BasePropertyOverrides as a public property;
+    // UpdateMaterialInstance() below pushes it through UpdateStaticPermutation().
+    FMaterialInstanceBasePropertyOverrides &Overrides =
+        MaterialInstance->BasePropertyOverrides;
+    Overrides.bOverride_BlendMode = true;
+    Overrides.BlendMode = BLEND_Opaque;
+  }
 
   if (AlbedoTexture) {
     MaterialInstance->SetTextureParameterValueEditorOnly(
@@ -2130,6 +2155,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 
     TArray<UStaticMesh *> ImportedMeshes;
     TMap<UStaticMesh *, FString> SourceFileByMesh;
+    // Model variant key per imported mesh; keys ending with OPAQUE mark cut
+    // foliage variants that must use a true Opaque material.
+    TMap<UStaticMesh *, FString> VariantKeyByMesh;
     TMap<FString, bool> FbxSmoothingGroupCache;
     TMap<int32, TMap<FString, UTexture *>> TextureBySlotByGroup;
     TMap<int32, TMap<FString, FString>> SourceTextureBySlotByGroup;
@@ -2270,6 +2298,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 
           // Nanite and materials are configured together after texture import.
           ImportedMeshes.Add(BaseMesh);
+          VariantKeyByMesh.Add(BaseMesh, VariantKey);
 
           if (bCreateFoliageForAsset) {
             CreateFoliageTypeAsset(AssetFolder, VariantStem, BaseMesh);
@@ -2349,6 +2378,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               ImportedMeshes.Add(StaticMesh);
               if (bIs3DAsset) {
                 SourceFileByMesh.Add(StaticMesh, SourceFile);
+                VariantKeyByMesh.Add(
+                    StaticMesh,
+                    ResolveModelVariantKey(SourceFile, ExplicitVariantByFile,
+                                           ImportedModelIndex + 1));
               }
             }
           }
@@ -2642,6 +2675,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     GroupIds.Sort();
     TArray<UMaterialInstanceConstant *> MaterialInstances;
+    TArray<UMaterialInstanceConstant *> OpaqueMaterialInstances;
+    bool bHasOpaqueModelVariant = false;
+    for (const TPair<UStaticMesh *, FString> &VariantPair : VariantKeyByMesh) {
+      if (IsOpaqueModelVariantKey(VariantPair.Value)) {
+        bHasOpaqueModelVariant = true;
+        break;
+      }
+    }
     for (const int32 GroupId : GroupIds) {
       const FString MaterialRole = SourceTextureMaterialRoleByGroup.FindRef(GroupId).ToLower();
       const TMap<FString, UTexture *> &TextureBySlot =
@@ -2653,6 +2694,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               ? FString::Printf(TEXT("%s_%03d"), *AssetStem, GroupId)
               : AssetStem;
       UMaterialInstanceConstant *MaterialInstance = nullptr;
+      UMaterialInstanceConstant *OpaqueMaterialInstance = nullptr;
       if (bIsHdri) {
         continue;
       } else if (bIsDecal) {
@@ -2786,6 +2828,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           MaterialInstance = CreatePlantMaterialInstance(
               AssetFolder, GroupStem, PlantAlbedoTexture, NRSTexture,
               MaterialRole, bUseVT);
+          if (bHasOpaqueModelVariant) {
+            if (!UAssetHiveSettings::HasConfiguredPlantOpaqueParentMaterial()) {
+              UE_LOG(LogTemp, Display,
+                     TEXT("AssetHive: _OPAQUE variant reuses the Atlas plant parent with a Blend Mode override to Opaque. Set Plant Material > Opaque Variant Parent Material to use a dedicated parent."));
+            }
+            OpaqueMaterialInstance = CreatePlantMaterialInstance(
+                AssetFolder, GroupStem, PlantAlbedoTexture, NRSTexture,
+                MaterialRole, bUseVT, /*bOpaque=*/true);
+          }
         } else {
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
@@ -2848,6 +2899,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       if (MaterialInstance) {
         MaterialInstances.Add(MaterialInstance);
       }
+      if (OpaqueMaterialInstance) {
+        OpaqueMaterialInstances.Add(OpaqueMaterialInstance);
+      }
     }
     for (UStaticMesh *StaticMesh : ImportedMeshes) {
       if (!StaticMesh) {
@@ -2883,8 +2937,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
       GetMutableNaniteSettings(StaticMesh)->bEnabled = true;
       TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
-      for (int32 Index = 0; Index < Slots.Num() && MaterialInstances.Num() > 0; ++Index) {
-        UMaterialInstanceConstant *Material = MaterialInstances[FMath::Min(Index, MaterialInstances.Num() - 1)];
+      // Cut _OPAQUE variants use the opaque material set of the same group.
+      const bool bOpaqueMesh =
+          IsOpaqueModelVariantKey(VariantKeyByMesh.FindRef(StaticMesh));
+      const TArray<UMaterialInstanceConstant *> &MeshMaterials =
+          (bOpaqueMesh && OpaqueMaterialInstances.Num() > 0)
+              ? OpaqueMaterialInstances
+              : MaterialInstances;
+      for (int32 Index = 0; Index < Slots.Num() && MeshMaterials.Num() > 0; ++Index) {
+        UMaterialInstanceConstant *Material = MeshMaterials[FMath::Min(Index, MeshMaterials.Num() - 1)];
         Slots[Index].MaterialInterface = Material;
         if (Slots[Index].MaterialSlotName.IsNone()) {
           Slots[Index].MaterialSlotName = Material->GetFName();
