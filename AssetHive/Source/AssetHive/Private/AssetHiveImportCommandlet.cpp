@@ -611,7 +611,7 @@ static void AppendImportedObjects(UAssetImportTask *Task,
   }
 }
 
-static UFbxImportUI *MakeStaticMeshImportOptions() {
+static UFbxImportUI *MakeStaticMeshImportOptions(bool bBuildNanite = true) {
   UFbxImportUI *ImportOptions = NewObject<UFbxImportUI>();
   ImportOptions->bImportMesh = true;
   ImportOptions->bImportMaterials = false;
@@ -625,7 +625,9 @@ static UFbxImportUI *MakeStaticMeshImportOptions() {
     ImportOptions->StaticMeshImportData->bAutoGenerateCollision = false;
     // These meshes are always finalized as Nanite. Set it before the initial
     // FBX build instead of first constructing a full conventional render mesh.
-    ImportOptions->StaticMeshImportData->bBuildNanite = true;
+    // Temporary LOD sources skip the build because only their mesh description
+    // is copied into the destination mesh.
+    ImportOptions->StaticMeshImportData->bBuildNanite = bBuildNanite;
     // Preserve authored normals; UE still generates missing normals/tangents.
     ImportOptions->StaticMeshImportData->NormalImportMethod = FBXNIM_ImportNormals;
   }
@@ -635,7 +637,8 @@ static UFbxImportUI *MakeStaticMeshImportOptions() {
 static UStaticMesh *ImportStaticMeshAsset(FAssetToolsModule &AssetToolsModule,
                                           const FString &SourceFile,
                                           const FString &DestinationPath,
-                                          const FString &DestinationName) {
+                                          const FString &DestinationName,
+                                          bool bBuildNanite = true) {
   UAssetImportTask *Task = NewObject<UAssetImportTask>();
   Task->Filename = SourceFile;
   Task->DestinationPath = DestinationPath;
@@ -644,7 +647,7 @@ static UStaticMesh *ImportStaticMeshAsset(FAssetToolsModule &AssetToolsModule,
   Task->bAutomated = true;
   Task->bAsync = false;
   Task->bSave = false;
-  Task->Options = MakeStaticMeshImportOptions();
+  Task->Options = MakeStaticMeshImportOptions(bBuildNanite);
   AssetToolsModule.Get().ImportAssetTasks({Task});
 
   TArray<UObject *> ImportedObjects;
@@ -854,6 +857,112 @@ static FString ResolveModelVariantKey(
     return ParsedVariant;
   }
   return NormalizeModelVariantKey(FString::FromInt(FMath::Max(1, FallbackVariantNumber)));
+}
+
+// Grass/Bush exports can ship an explicit LOD plan: the cut OPAQUE variant
+// becomes LOD0 while the uncut source model and its LOD chain move to LOD1..N.
+struct FPlantModelLodEntry {
+  FString SourceFile;
+  FString VariantKey = TEXT("01");
+  int32 LodIndex = 0;
+};
+
+static void CollectPlantModelLodPlan(
+    const TSharedPtr<FJsonObject> &AssetObject,
+    TMap<FString, TArray<FPlantModelLodEntry>> &OutLodsByVariant) {
+  OutLodsByVariant.Reset();
+  if (!AssetObject.IsValid()) {
+    return;
+  }
+  const TArray<TSharedPtr<FJsonValue>> *ModelLods = nullptr;
+  if (!AssetObject->TryGetArrayField(TEXT("modelLods"), ModelLods) ||
+      ModelLods == nullptr) {
+    return;
+  }
+  for (const TSharedPtr<FJsonValue> &LodValue : *ModelLods) {
+    if (!LodValue.IsValid() || LodValue->Type != EJson::Object) {
+      continue;
+    }
+    const TSharedPtr<FJsonObject> LodObject = LodValue->AsObject();
+    if (!LodObject.IsValid()) {
+      continue;
+    }
+    FString SourceFile;
+    if (!LodObject->TryGetStringField(TEXT("file"), SourceFile) &&
+        !LodObject->TryGetStringField(TEXT("path"), SourceFile) &&
+        !LodObject->TryGetStringField(TEXT("uri"), SourceFile)) {
+      continue;
+    }
+    if (SourceFile.IsEmpty() || !FPaths::FileExists(SourceFile)) {
+      UE_LOG(LogTemp, Warning, TEXT("Source file missing: %s"), *SourceFile);
+      continue;
+    }
+    int32 LodIndex = 0;
+    double RawLodIndex = 0.0;
+    if (LodObject->TryGetNumberField(TEXT("lod"), RawLodIndex)) {
+      LodIndex = FMath::Max(0, FMath::RoundToInt(RawLodIndex));
+    }
+    FString VariantKey;
+    if (!ReadModelVariantKey(LodObject, VariantKey)) {
+      const TMap<FString, FString> EmptyVariantMap;
+      VariantKey = ResolveModelVariantKey(SourceFile, EmptyVariantMap, 1);
+    }
+    FPlantModelLodEntry Entry;
+    Entry.SourceFile = SourceFile;
+    Entry.VariantKey = NormalizeModelVariantKey(VariantKey);
+    Entry.LodIndex = LodIndex;
+    OutLodsByVariant.FindOrAdd(Entry.VariantKey).Add(Entry);
+  }
+  for (TPair<FString, TArray<FPlantModelLodEntry>> &Pair : OutLodsByVariant) {
+    Pair.Value.Sort([](const FPlantModelLodEntry &A,
+                       const FPlantModelLodEntry &B) {
+      if (A.LodIndex != B.LodIndex) {
+        return A.LodIndex < B.LodIndex;
+      }
+      return A.SourceFile < B.SourceFile;
+    });
+  }
+}
+
+// Merge the planned LOD chain into the imported base mesh. The custom LOD mesh
+// descriptions live inside the destination package afterwards, so the meshes
+// imported only as LOD sources are deleted again right away.
+static int32 ImportPlantCustomLods(FAssetToolsModule &AssetToolsModule,
+                                   UStaticMesh *BaseMesh,
+                                   const TArray<FPlantModelLodEntry> &Lods,
+                                   const FString &AssetFolder,
+                                   const FString &BaseMeshName) {
+  if (!BaseMesh) {
+    return 0;
+  }
+  int32 MergedLodCount = 0;
+  for (const FPlantModelLodEntry &Lod : Lods) {
+    // LOD0 is the base mesh that was imported already.
+    if (Lod.LodIndex <= 0 || Lod.SourceFile.IsEmpty()) {
+      continue;
+    }
+    const FString TempMeshName =
+        FString::Printf(TEXT("TEMP_%s_LOD%d"), *BaseMeshName, Lod.LodIndex);
+    UStaticMesh *LodMesh =
+        ImportStaticMeshAsset(AssetToolsModule, Lod.SourceFile, AssetFolder,
+                              TempMeshName, /*bBuildNanite=*/false);
+    if (!LodMesh) {
+      UE_LOG(LogTemp, Warning,
+             TEXT("AssetHive import: failed to import LOD source %s"),
+             *Lod.SourceFile);
+      continue;
+    }
+    if (BaseMesh->SetCustomLOD(LodMesh, Lod.LodIndex, Lod.SourceFile)) {
+      MergedLodCount += 1;
+    } else {
+      UE_LOG(LogTemp, Warning,
+             TEXT("AssetHive import: failed to set LOD %d from %s"),
+             Lod.LodIndex, *Lod.SourceFile);
+    }
+    ObjectTools::DeleteSingleObject(LodMesh,
+                                    /*bPerformReferenceCheck=*/false);
+  }
+  return MergedLodCount;
 }
 
 static UFoliageType_InstancedStaticMesh *
@@ -2158,6 +2267,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // Model variant key per imported mesh; keys ending with OPAQUE mark cut
     // foliage variants that must use a true Opaque material.
     TMap<UStaticMesh *, FString> VariantKeyByMesh;
+    // Variant keys the library export flagged as cut OPAQUE bases. Newer export
+    // payloads keep the plain key (for example 01) and add an explicit flag.
+    TSet<FString> OpaqueModelVariantKeys;
+    // Base meshes that received custom LODs from the export LOD plan.
+    TSet<UStaticMesh *> MeshesWithCustomLods;
+    TMap<FString, TArray<FPlantModelLodEntry>> PlantLodsByVariant;
     TMap<FString, bool> FbxSmoothingGroupCache;
     TMap<int32, TMap<FString, UTexture *>> TextureBySlotByGroup;
     TMap<int32, TMap<FString, FString>> SourceTextureBySlotByGroup;
@@ -2191,6 +2306,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (SourceFile.IsEmpty() ||
               !ReadModelVariantKey(VariantObject, VariantKey)) {
             continue;
+          }
+          bool bOpaqueVariant = false;
+          VariantObject->TryGetBoolField(TEXT("opaque"), bOpaqueVariant);
+          if (bOpaqueVariant || IsOpaqueModelVariantKey(VariantKey)) {
+            OpaqueModelVariantKeys.Add(NormalizeModelVariantKey(VariantKey));
           }
           ExplicitVariantByFile.Add(NormalizeModelSourceKey(SourceFile), VariantKey);
           bHasExplicitModelVariants = true;
@@ -2251,6 +2371,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           return A.Compare(B) < 0;
         });
 
+        CollectPlantModelLodPlan(AssetObject, PlantLodsByVariant);
+
         for (const FString &VariantKey : VariantKeys) {
           TArray<FPlantModelEntry> &Entries = ByVariant.FindChecked(VariantKey);
           Entries.Sort(
@@ -2294,6 +2416,19 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               AssetToolsModule, BaseFile, AssetFolder, BaseMeshName);
           if (!BaseMesh) {
             continue;
+          }
+
+          // The library LOD plan (OPAQUE cut base plus the source LOD chain)
+          // is merged into the base mesh before materials are configured, so
+          // the whole LOD stack is rebuilt only once.
+          if (const TArray<FPlantModelLodEntry> *VariantLods =
+                  PlantLodsByVariant.Find(VariantKey)) {
+            const int32 MergedLodCount = ImportPlantCustomLods(
+                AssetToolsModule, BaseMesh, *VariantLods, AssetFolder,
+                BaseMeshName);
+            if (MergedLodCount > 0) {
+              MeshesWithCustomLods.Add(BaseMesh);
+            }
           }
 
           // Nanite and materials are configured together after texture import.
@@ -2676,11 +2811,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     GroupIds.Sort();
     TArray<UMaterialInstanceConstant *> MaterialInstances;
     TArray<UMaterialInstanceConstant *> OpaqueMaterialInstances;
-    bool bHasOpaqueModelVariant = false;
+    bool bHasOpaqueModelVariant = !OpaqueModelVariantKeys.IsEmpty();
     for (const TPair<UStaticMesh *, FString> &VariantPair : VariantKeyByMesh) {
+      if (bHasOpaqueModelVariant) {
+        break;
+      }
       if (IsOpaqueModelVariantKey(VariantPair.Value)) {
         bHasOpaqueModelVariant = true;
-        break;
       }
     }
     for (const int32 GroupId : GroupIds) {
@@ -2938,8 +3075,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       GetMutableNaniteSettings(StaticMesh)->bEnabled = true;
       TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
       // Cut _OPAQUE variants use the opaque material set of the same group.
+      // The library export flags them on the variant entry instead of the key.
+      const FString MeshVariantKey = VariantKeyByMesh.FindRef(StaticMesh);
       const bool bOpaqueMesh =
-          IsOpaqueModelVariantKey(VariantKeyByMesh.FindRef(StaticMesh));
+          IsOpaqueModelVariantKey(MeshVariantKey) ||
+          OpaqueModelVariantKeys.Contains(
+              NormalizeModelVariantKey(MeshVariantKey));
       const TArray<UMaterialInstanceConstant *> &MeshMaterials =
           (bOpaqueMesh && OpaqueMaterialInstances.Num() > 0)
               ? OpaqueMaterialInstances
@@ -2964,6 +3105,47 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             Candidate = FName(*(Material->GetName() + TEXT("_") + FString::FromInt(++Suffix)));
           }
           Slots[Index].ImportedMaterialSlotName = Candidate;
+        }
+      }
+      // The OPAQUE cut base carries the uncut source model as custom LOD1..N,
+      // so those LODs keep the alpha-tested Masked material while LOD0 uses the
+      // Opaque material set.
+      if (bOpaqueMesh && MeshesWithCustomLods.Contains(StaticMesh) &&
+          MaterialInstances.Num() > 0 && OpaqueMaterialInstances.Num() > 0) {
+        const int32 OpaqueSlotCount = Slots.Num();
+        TArray<int32> MaskedSlotIndexBySlot;
+        MaskedSlotIndexBySlot.Reserve(OpaqueSlotCount);
+        for (int32 Index = 0; Index < OpaqueSlotCount; ++Index) {
+          UMaterialInstanceConstant *MaskedMaterial =
+              MaterialInstances[FMath::Min(Index, MaterialInstances.Num() - 1)];
+          int32 MaskedSlotIndex = INDEX_NONE;
+          for (int32 Other = 0; Other < Slots.Num(); ++Other) {
+            if (Slots[Other].MaterialInterface == MaskedMaterial) {
+              MaskedSlotIndex = Other;
+              break;
+            }
+          }
+          if (MaskedSlotIndex == INDEX_NONE) {
+            MaskedSlotIndex = Slots.Add(FStaticMaterial(
+                MaskedMaterial, MaskedMaterial->GetFName(),
+                MaskedMaterial->GetFName()));
+          }
+          MaskedSlotIndexBySlot.Add(MaskedSlotIndex);
+        }
+        FMeshSectionInfoMap &SectionInfoMap = StaticMesh->GetSectionInfoMap();
+        for (int32 LodIndex = 1; LodIndex < StaticMesh->GetNumSourceModels();
+             ++LodIndex) {
+          const int32 SectionCount = SectionInfoMap.GetSectionNumber(LodIndex);
+          for (int32 SectionIndex = 0; SectionIndex < SectionCount;
+               ++SectionIndex) {
+            FMeshSectionInfo SectionInfo =
+                SectionInfoMap.Get(LodIndex, SectionIndex);
+            if (MaskedSlotIndexBySlot.IsValidIndex(SectionInfo.MaterialIndex)) {
+              SectionInfo.MaterialIndex =
+                  MaskedSlotIndexBySlot[SectionInfo.MaterialIndex];
+              SectionInfoMap.Set(LodIndex, SectionIndex, SectionInfo);
+            }
+          }
         }
       }
       StaticMesh->PostEditChange();
