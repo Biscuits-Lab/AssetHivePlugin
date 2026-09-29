@@ -859,8 +859,9 @@ static FString ResolveModelVariantKey(
   return NormalizeModelVariantKey(FString::FromInt(FMath::Max(1, FallbackVariantNumber)));
 }
 
-// Grass/Bush exports can ship an explicit LOD plan: the cut OPAQUE variant
-// becomes LOD0 while the uncut source model and its LOD chain move to LOD1..N.
+// Grass/Bush 有两种导出方式（软件侧导出面板选择）：OPAQUE 版本 = 裁切模型 +
+// Opaque 材质、不带 LOD；LOD 版本 = 原始 Masked 模型 + 该变体自己的 LOD 链。
+// 这里读取 LOD 版本的目标 LOD 列表（lod 已是目标序号 1..N）。
 struct FPlantModelLodEntry {
   FString SourceFile;
   FString VariantKey = TEXT("01");
@@ -924,9 +925,9 @@ static void CollectPlantModelLodPlan(
   }
 }
 
-// Merge the planned LOD chain into the imported base mesh. The custom LOD mesh
-// descriptions live inside the destination package afterwards, so the meshes
-// imported only as LOD sources are deleted again right away.
+// Merge the exported LOD chain into the imported base mesh (Masked 植被的 LOD
+// 版本). The custom LOD mesh descriptions live inside the destination package
+// afterwards, so the meshes imported only as LOD sources are deleted again.
 static int32 ImportPlantCustomLods(FAssetToolsModule &AssetToolsModule,
                                    UStaticMesh *BaseMesh,
                                    const TArray<FPlantModelLodEntry> &Lods,
@@ -2270,8 +2271,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // Variant keys the library export flagged as cut OPAQUE bases. Newer export
     // payloads keep the plain key (for example 01) and add an explicit flag.
     TSet<FString> OpaqueModelVariantKeys;
-    // Base meshes that received custom LODs from the export LOD plan.
-    TSet<UStaticMesh *> MeshesWithCustomLods;
     TMap<FString, TArray<FPlantModelLodEntry>> PlantLodsByVariant;
     TMap<FString, bool> FbxSmoothingGroupCache;
     TMap<int32, TMap<FString, UTexture *>> TextureBySlotByGroup;
@@ -2418,17 +2417,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             continue;
           }
 
-          // The library LOD plan (OPAQUE cut base plus the source LOD chain)
-          // is merged into the base mesh before materials are configured, so
-          // the whole LOD stack is rebuilt only once.
+          // LOD 版本导出的 Masked 植被：把该变体自己的 LOD 链合并成 custom LOD，
+          // 合并后才配置材质，整个 LOD 栈只重建一次。OPAQUE 版本不带任何 LOD。
           if (const TArray<FPlantModelLodEntry> *VariantLods =
                   PlantLodsByVariant.Find(VariantKey)) {
-            const int32 MergedLodCount = ImportPlantCustomLods(
-                AssetToolsModule, BaseMesh, *VariantLods, AssetFolder,
-                BaseMeshName);
-            if (MergedLodCount > 0) {
-              MeshesWithCustomLods.Add(BaseMesh);
-            }
+            ImportPlantCustomLods(AssetToolsModule, BaseMesh, *VariantLods,
+                                  AssetFolder, BaseMeshName);
           }
 
           // Nanite and materials are configured together after texture import.
@@ -3105,47 +3099,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             Candidate = FName(*(Material->GetName() + TEXT("_") + FString::FromInt(++Suffix)));
           }
           Slots[Index].ImportedMaterialSlotName = Candidate;
-        }
-      }
-      // The OPAQUE cut base carries the uncut source model as custom LOD1..N,
-      // so those LODs keep the alpha-tested Masked material while LOD0 uses the
-      // Opaque material set.
-      if (bOpaqueMesh && MeshesWithCustomLods.Contains(StaticMesh) &&
-          MaterialInstances.Num() > 0 && OpaqueMaterialInstances.Num() > 0) {
-        const int32 OpaqueSlotCount = Slots.Num();
-        TArray<int32> MaskedSlotIndexBySlot;
-        MaskedSlotIndexBySlot.Reserve(OpaqueSlotCount);
-        for (int32 Index = 0; Index < OpaqueSlotCount; ++Index) {
-          UMaterialInstanceConstant *MaskedMaterial =
-              MaterialInstances[FMath::Min(Index, MaterialInstances.Num() - 1)];
-          int32 MaskedSlotIndex = INDEX_NONE;
-          for (int32 Other = 0; Other < Slots.Num(); ++Other) {
-            if (Slots[Other].MaterialInterface == MaskedMaterial) {
-              MaskedSlotIndex = Other;
-              break;
-            }
-          }
-          if (MaskedSlotIndex == INDEX_NONE) {
-            MaskedSlotIndex = Slots.Add(FStaticMaterial(
-                MaskedMaterial, MaskedMaterial->GetFName(),
-                MaskedMaterial->GetFName()));
-          }
-          MaskedSlotIndexBySlot.Add(MaskedSlotIndex);
-        }
-        FMeshSectionInfoMap &SectionInfoMap = StaticMesh->GetSectionInfoMap();
-        for (int32 LodIndex = 1; LodIndex < StaticMesh->GetNumSourceModels();
-             ++LodIndex) {
-          const int32 SectionCount = SectionInfoMap.GetSectionNumber(LodIndex);
-          for (int32 SectionIndex = 0; SectionIndex < SectionCount;
-               ++SectionIndex) {
-            FMeshSectionInfo SectionInfo =
-                SectionInfoMap.Get(LodIndex, SectionIndex);
-            if (MaskedSlotIndexBySlot.IsValidIndex(SectionInfo.MaterialIndex)) {
-              SectionInfo.MaterialIndex =
-                  MaskedSlotIndexBySlot[SectionInfo.MaterialIndex];
-              SectionInfoMap.Set(LodIndex, SectionIndex, SectionInfo);
-            }
-          }
         }
       }
       StaticMesh->PostEditChange();
