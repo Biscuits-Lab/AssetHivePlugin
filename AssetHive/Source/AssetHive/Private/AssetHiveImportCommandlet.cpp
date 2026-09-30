@@ -1058,11 +1058,14 @@ static FString NormalizeModelVariantKey(const FString &RawValue) {
   return CleanValue.Left(32);
 }
 
-// The library marks transparency-cut foliage variants with an OPAQUE suffix
-// (for example 01OPAQUE). They keep the asset texture set but must render as
-// true Opaque surfaces instead of Masked.
+// The library marks transparency-cut foliage variants with an OPAQUE suffix.
+// The canonical file form is 01_OPAQUE; the legacy compact form 01OPAQUE and
+// metadata keys such as 01OPAQUE remain supported. Cut meshes keep the asset
+// texture set but must render as true Opaque surfaces instead of Masked.
 static bool IsOpaqueModelVariantKey(const FString &VariantKey) {
-  const FString Value = VariantKey.TrimStartAndEnd().ToUpper();
+  FString Value = VariantKey.TrimStartAndEnd().ToUpper();
+  Value.ReplaceInline(TEXT("_"), TEXT(""));
+  Value.ReplaceInline(TEXT("-"), TEXT(""));
   return Value.EndsWith(TEXT("OPAQUE"));
 }
 
