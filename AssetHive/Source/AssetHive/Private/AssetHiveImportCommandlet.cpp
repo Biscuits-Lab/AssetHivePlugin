@@ -1682,11 +1682,16 @@ static UTexture2D *CreatePackedORMTexture(
   return PackedTexture;
 }
 
-// 3D Plants 纹理预设（md §5.2）：Tree / Bush / Grass 1024-2048、
-// HeroFoliage 1024-4096、Micro 1024 且不使用 VT；VT 分档（>= 2048 开）。
-static void ApplyPlantTextureSizePreset(UTexture2D *Texture,
-                                        const FPlantAssetProfile &Profile,
-                                        bool bUseVT) {
+// 3D Plants 纹理种类（md §5.2）：Diffuse（D，albedo 代用）/ Normal（N）/
+// ORM / OpacityMasked（O，仅 masked 资产）。
+enum class EPlantTextureKind { Diffuse, Normal, ORM, OpacityMasked };
+
+// 植被纹理预设：Tree / Bush / Grass 1024-2048、HeroFoliage 1024-4096、
+// Micro 1024 且不使用 VT；VT 分档（>= 2048 开）。
+static void ApplyPlantTexturePreset(UTexture2D *Texture,
+                                    EPlantTextureKind Kind,
+                                    const FPlantAssetProfile &Profile,
+                                    bool bUseVT) {
   if (!Texture) {
     return;
   }
@@ -1701,174 +1706,71 @@ static void ApplyPlantTextureSizePreset(UTexture2D *Texture,
   Texture->VirtualTextureStreaming =
       bUseVT && Profile.bAllowVirtualTexture &&
       Texture->MaxTextureSize >= FMath::Max(1024, Profile.TextureVTSize);
+
+  switch (Kind) {
+  case EPlantTextureKind::Diffuse:
+    Texture->CompressionSettings = TC_Default;
+    Texture->SRGB = true;
+    Texture->CompressionNoAlpha = false;
+    Texture->LODGroup = TEXTUREGROUP_World;
+    Texture->LossyCompressionAmount = TLCA_Low;
+    break;
+  case EPlantTextureKind::Normal:
+    Texture->CompressionSettings = TC_Normalmap;
+    Texture->SRGB = false;
+    Texture->CompressionNoAlpha = true;
+    Texture->LODGroup = TEXTUREGROUP_WorldNormalMap;
+    Texture->LossyCompressionAmount = TLCA_Low;
+    break;
+  case EPlantTextureKind::ORM:
+  case EPlantTextureKind::OpacityMasked:
+  default:
+    Texture->CompressionSettings = TC_Masks;
+    Texture->SRGB = false;
+    Texture->CompressionNoAlpha = false;
+    Texture->LODGroup = TEXTUREGROUP_World;
+    Texture->LossyCompressionAmount = TLCA_Medium;
+    break;
+  }
 }
 
-static UTexture2D *CreatePackedPlantAlbedoTexture(
-    const FString &AssetFolder, const FString &AssetName,
-    UTexture2D *AlbedoSourceTexture, UTexture2D *OpacitySourceTexture,
-    const FPlantAssetProfile &Profile, bool bUseVT) {
-  FTexturePixels AlbedoPixels;
-  FTexturePixels OpacityPixels;
-  const bool HasAlbedo = ReadTexturePixels(AlbedoSourceTexture, AlbedoPixels);
-  if (!HasAlbedo) {
+// 把源贴图逐张落成独立的植被贴图资产（不做 Albedo/NRS 打包）。
+static UTexture2D *CreatePlantTextureAsset(const FString &AssetFolder,
+                                           const FString &AssetName,
+                                           UTexture2D *SourceTexture,
+                                           EPlantTextureKind Kind,
+                                           const FPlantAssetProfile &Profile,
+                                           bool bUseVT) {
+  FTexturePixels SourcePixels;
+  if (!ReadTexturePixels(SourceTexture, SourcePixels)) {
     return nullptr;
   }
-  const bool HasOpacity =
-      ReadTexturePixels(OpacitySourceTexture, OpacityPixels);
-
-  const int32 Width = AlbedoPixels.Width;
-  const int32 Height = AlbedoPixels.Height;
-
-  const FString TextureAssetName =
-      FString::Printf(TEXT("T_%s_Albedo"), *AssetName);
-  const FString PackagePath = AssetFolder / TextureAssetName;
+  const int32 Width = SourcePixels.Width;
+  const int32 Height = SourcePixels.Height;
+  const FString PackagePath = AssetFolder / AssetName;
   UPackage *Package = CreatePackage(*PackagePath);
   if (!Package) {
     return nullptr;
   }
-  UTexture2D *PackedTexture = NewObject<UTexture2D>(Package, *TextureAssetName,
-                                                    RF_Public | RF_Standalone);
-  if (!PackedTexture) {
+  UTexture2D *Texture = NewObject<UTexture2D>(Package, *AssetName,
+                                              RF_Public | RF_Standalone);
+  if (!Texture) {
     return nullptr;
   }
-
-  PackedTexture->Source.Init(Width, Height, 1, 1, TSF_BGRA8);
-  uint8 *DestData = PackedTexture->Source.LockMip(0);
-  for (int32 Y = 0; Y < Height; Y++) {
-    for (int32 X = 0; X < Width; X++) {
-      const FColor &AlbedoPixel = AlbedoPixels.Pixels[Y * Width + X];
-      uint8 AlphaValue;
-      if (HasOpacity) {
-        const float U =
-            Width > 1 ? static_cast<float>(X) / static_cast<float>(Width - 1)
-                      : 0.0f;
-        const float V =
-            Height > 1 ? static_cast<float>(Y) / static_cast<float>(Height - 1)
-                       : 0.0f;
-        AlphaValue = SampleLuminance(&OpacityPixels, U, V, 255);
-      } else {
-        // No separate opacity source 鈥?keep whatever alpha the albedo already
-        // has (the JS exporter pre-merges opacity into the albedo alpha when
-        // possible).
-        AlphaValue = AlbedoPixel.A;
-      }
-      const int32 DestIndex = (Y * Width + X) * 4;
-      DestData[DestIndex + 0] = AlbedoPixel.B;
-      DestData[DestIndex + 1] = AlbedoPixel.G;
-      DestData[DestIndex + 2] = AlbedoPixel.R;
-      DestData[DestIndex + 3] = AlphaValue;
-    }
-  }
-  PackedTexture->Source.UnlockMip(0);
-  // Albedo 载有 Opacity 的 alpha 通道：sRGB / Default(保留 alpha) / Lossy Low。
-  ApplyPlantTextureSizePreset(PackedTexture, Profile, bUseVT);
-  PackedTexture->CompressionSettings = TC_Default;
-  PackedTexture->SRGB = true;
-  PackedTexture->CompressionNoAlpha = false;
-  PackedTexture->LODGroup = TEXTUREGROUP_World;
-  PackedTexture->LossyCompressionAmount = TLCA_Low;
-  PackedTexture->PostEditChange();
-  PackedTexture->MarkPackageDirty();
-  ForceTextureDataReady(PackedTexture);
-  FinalizeImportedAsset(PackedTexture);
-  FAssetRegistryModule::AssetCreated(PackedTexture);
-  return PackedTexture;
+  Texture->Source.Init(Width, Height, 1, 1, TSF_BGRA8);
+  uint8 *DestData = Texture->Source.LockMip(0);
+  FMemory::Memcpy(DestData, SourcePixels.Pixels.GetData(),
+                  static_cast<SIZE_T>(Width) * static_cast<SIZE_T>(Height) * 4);
+  Texture->Source.UnlockMip(0);
+  ApplyPlantTexturePreset(Texture, Kind, Profile, bUseVT);
+  Texture->PostEditChange();
+  Texture->MarkPackageDirty();
+  ForceTextureDataReady(Texture);
+  FinalizeImportedAsset(Texture);
+  FAssetRegistryModule::AssetCreated(Texture);
+  return Texture;
 }
 
-static UTexture2D *
-CreatePackedNRSTexture(const FString &AssetFolder, const FString &AssetName,
-                       UTexture2D *NormalTexture, UTexture2D *RoughnessTexture,
-                       UTexture2D *TranslucencyTexture, UTexture2D *SizeRefA,
-                       UTexture2D *SizeRefB,
-                       const FPlantAssetProfile &Profile, bool bUseVT) {
-  FTexturePixels NormalPixels;
-  FTexturePixels RoughnessPixels;
-  FTexturePixels TranslucencyPixels;
-  const bool HasNormal = ReadTexturePixels(NormalTexture, NormalPixels);
-  const bool HasRoughness =
-      ReadTexturePixels(RoughnessTexture, RoughnessPixels);
-  const bool HasTranslucency =
-      ReadTexturePixels(TranslucencyTexture, TranslucencyPixels);
-  int32 Width = 0;
-  int32 Height = 0;
-  if (HasNormal) {
-    Width = NormalPixels.Width;
-    Height = NormalPixels.Height;
-  } else if (HasRoughness) {
-    Width = RoughnessPixels.Width;
-    Height = RoughnessPixels.Height;
-  } else if (HasTranslucency) {
-    Width = TranslucencyPixels.Width;
-    Height = TranslucencyPixels.Height;
-  } else {
-    FTexturePixels RefPixels;
-    if (ReadTexturePixels(SizeRefA, RefPixels) ||
-        ReadTexturePixels(SizeRefB, RefPixels)) {
-      Width = RefPixels.Width;
-      Height = RefPixels.Height;
-    } else {
-      Width = 1024;
-      Height = 1024;
-    }
-  }
-
-  const FString TextureAssetName =
-      FString::Printf(TEXT("T_%s_NRS"), *AssetName);
-  const FString PackagePath = AssetFolder / TextureAssetName;
-  UPackage *Package = CreatePackage(*PackagePath);
-  if (!Package) {
-    return nullptr;
-  }
-  UTexture2D *PackedTexture = NewObject<UTexture2D>(Package, *TextureAssetName,
-                                                    RF_Public | RF_Standalone);
-  if (!PackedTexture) {
-    return nullptr;
-  }
-
-  PackedTexture->Source.Init(Width, Height, 1, 1, TSF_BGRA8);
-  uint8 *DestData = PackedTexture->Source.LockMip(0);
-  const uint8 DefaultNormal = 0;
-  const uint8 DefaultRoughness = static_cast<uint8>(204);
-  const uint8 DefaultTranslucency = static_cast<uint8>(255);
-  for (int32 Y = 0; Y < Height; Y++) {
-    for (int32 X = 0; X < Width; X++) {
-      const float U =
-          Width > 1 ? static_cast<float>(X) / static_cast<float>(Width - 1)
-                    : 0.0f;
-      const float V =
-          Height > 1 ? static_cast<float>(Y) / static_cast<float>(Height - 1)
-                     : 0.0f;
-      const uint8 NormalR = SampleChannel(HasNormal ? &NormalPixels : nullptr,
-                                          U, V, 0, DefaultNormal);
-      const uint8 NormalG = SampleChannel(HasNormal ? &NormalPixels : nullptr,
-                                          U, V, 1, DefaultNormal);
-      const uint8 Roughness = SampleChannel(
-          HasRoughness ? &RoughnessPixels : nullptr, U, V, 0, DefaultRoughness);
-      const uint8 Translucency =
-          SampleLuminance(HasTranslucency ? &TranslucencyPixels : nullptr, U, V,
-                          DefaultTranslucency);
-      const int32 DestIndex = (Y * Width + X) * 4;
-      DestData[DestIndex + 0] = Roughness;
-      DestData[DestIndex + 1] = NormalG;
-      DestData[DestIndex + 2] = NormalR;
-      DestData[DestIndex + 3] = Translucency;
-    }
-  }
-  PackedTexture->Source.UnlockMip(0);
-  // NRS 打包（N/R/T 四通道）保持 Mask(no sRGB)，压缩损失按法线口径取 Low。
-  ApplyPlantTextureSizePreset(PackedTexture, Profile, bUseVT);
-  PackedTexture->CompressionSettings = TC_Masks;
-  PackedTexture->SRGB = false;
-  PackedTexture->CompressionNoAlpha = false;
-  PackedTexture->LODGroup = TEXTUREGROUP_World;
-  PackedTexture->LossyCompressionAmount = TLCA_Low;
-  PackedTexture->PostEditChange();
-  PackedTexture->MarkPackageDirty();
-  ForceTextureDataReady(PackedTexture);
-  FinalizeImportedAsset(PackedTexture);
-  FAssetRegistryModule::AssetCreated(PackedTexture);
-  return PackedTexture;
-}
 
 // Match Megascans: opt into VT conversion only when both project switches are on.
 static bool IsAssetVirtualTextureImportEnabled() {
@@ -2222,9 +2124,11 @@ static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
 
 static UMaterialInstanceConstant *
 CreatePlantMaterialInstance(const FString &AssetFolder,
-                            const FString &AssetName, UTexture *AlbedoTexture,
-                            UTexture *NRSTexture, const FString &MaterialRole,
-                            bool bUseVT, bool bOpaque = false) {
+                            const FString &AssetName, UTexture *DiffuseTexture,
+                            UTexture *NormalTexture, UTexture *ORMTexture,
+                            UTexture *OpacityMaskTexture,
+                            const FString &MaterialRole, bool bUseVT,
+                            bool bOpaque = false) {
   const bool bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
   const FString ParentPath =
       bOpaque ? UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bUseVT)
@@ -2240,7 +2144,8 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
            *ParentPath);
     return nullptr;
   }
-  for (UTexture *Texture : {AlbedoTexture, NRSTexture}) {
+  for (UTexture *Texture :
+       {DiffuseTexture, NormalTexture, ORMTexture, OpacityMaskTexture}) {
     ForceTextureDataReady(Texture);
   }
 
@@ -2272,13 +2177,36 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     Overrides.BlendMode = BLEND_Opaque;
   }
 
-  if (AlbedoTexture) {
+  // 植被材质参数（md §5.2）：Diffuse（albedo 代用）/ Normal / ORM /
+  // OpacityMasked（masked 资产），默认名对齐项目 GrassBend 母材质。
+  const FString DiffuseParameter = UAssetHiveSettings::GetPlantDiffuseParameter();
+  const FString NormalParameter = UAssetHiveSettings::GetPlantNormalParameter();
+  const FString ORMParameter = UAssetHiveSettings::GetPlantORMParameter();
+  const FString OpacityMaskedParameter =
+      UAssetHiveSettings::GetPlantOpacityMaskedParameter();
+  if (DiffuseTexture && !DiffuseParameter.IsEmpty()) {
     MaterialInstance->SetTextureParameterValueEditorOnly(
-        FMaterialParameterInfo(FName(*UAssetHiveSettings::GetPlantAlbedoParameter())), AlbedoTexture);
+        FMaterialParameterInfo(FName(*DiffuseParameter)), DiffuseTexture);
   }
-  if (NRSTexture) {
+  if (NormalTexture && !NormalParameter.IsEmpty()) {
     MaterialInstance->SetTextureParameterValueEditorOnly(
-        FMaterialParameterInfo(FName(*UAssetHiveSettings::GetPlantNRSParameter())), NRSTexture);
+        FMaterialParameterInfo(FName(*NormalParameter)), NormalTexture);
+  }
+  if (ORMTexture && !ORMParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*ORMParameter)), ORMTexture);
+  }
+  const bool bUseOpacityMasked = !bOpaque && OpacityMaskTexture != nullptr;
+  if (bUseOpacityMasked && !OpacityMaskedParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*OpacityMaskedParameter)),
+        OpacityMaskTexture);
+  }
+  const FString OpacityMaskedSwitch =
+      UAssetHiveSettings::GetPlantUseOpacityMaskedSwitch();
+  if (!OpacityMaskedSwitch.IsEmpty()) {
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*OpacityMaskedSwitch)), bUseOpacityMasked);
   }
 
   // Publish the complete parameter set once, after texture compilation.
@@ -2611,7 +2539,56 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                                   NormalizedSlotName == TEXT("ormh"))) {
             NormalizedSlotName = TEXT("orm");
           }
-          if (bIsSurface && NormalizedSlotName == TEXT("bcr")) {
+          const bool bIsPlantAsset = AssetType == TEXT("3dplant");
+          if (bIsPlantAsset &&
+              (NormalizedSlotName == TEXT("al") ||
+               NormalizedSlotName == TEXT("d") ||
+               NormalizedSlotName == TEXT("bc") ||
+               NormalizedSlotName == TEXT("diffuse") ||
+               NormalizedSlotName == TEXT("basecolor") ||
+               NormalizedSlotName == TEXT("albedo"))) {
+            NormalizedSlotName = TEXT("albedo");
+          } else if (bIsPlantAsset &&
+                     (NormalizedSlotName == TEXT("n") ||
+                      NormalizedSlotName == TEXT("normal") ||
+                      NormalizedSlotName == TEXT("nrm"))) {
+            NormalizedSlotName = TEXT("normal");
+          } else if (bIsPlantAsset &&
+                     (NormalizedSlotName == TEXT("orm") ||
+                      NormalizedSlotName == TEXT("ormh"))) {
+            NormalizedSlotName = TEXT("orm");
+          } else if (bIsPlantAsset &&
+                     (NormalizedSlotName == TEXT("o") ||
+                      NormalizedSlotName == TEXT("opacity") ||
+                      NormalizedSlotName == TEXT("opacitymask") ||
+                      NormalizedSlotName == TEXT("opacitymasked") ||
+                      NormalizedSlotName == TEXT("opacity_masked") ||
+                      NormalizedSlotName == TEXT("alpha"))) {
+            NormalizedSlotName = TEXT("opacity");
+          } else if (bIsPlantAsset &&
+                     (NormalizedSlotName == TEXT("ao") ||
+                      NormalizedSlotName == TEXT("occlusion"))) {
+            NormalizedSlotName = TEXT("ao");
+          } else if (bIsPlantAsset &&
+                     (NormalizedSlotName == TEXT("m") ||
+                      NormalizedSlotName == TEXT("metalness") ||
+                      NormalizedSlotName == TEXT("metallic"))) {
+            NormalizedSlotName = TEXT("metalness");
+          } else if (bIsPlantAsset &&
+                     (NormalizedSlotName == TEXT("r") ||
+                      NormalizedSlotName == TEXT("roughness"))) {
+            NormalizedSlotName = TEXT("roughness");
+          } else if (bIsPlantAsset &&
+                     (NormalizedSlotName == TEXT("e") ||
+                      NormalizedSlotName == TEXT("emissive"))) {
+            NormalizedSlotName = TEXT("emissive");
+          } else if (bIsPlantAsset &&
+                     (NormalizedSlotName == TEXT("t") ||
+                      NormalizedSlotName == TEXT("translucency") ||
+                      NormalizedSlotName == TEXT("subsurface") ||
+                      NormalizedSlotName == TEXT("ssc"))) {
+            NormalizedSlotName = TEXT("translucency");
+          } else if (bIsSurface && NormalizedSlotName == TEXT("bcr")) {
             NormalizedSlotName = TEXT("bcr");
           } else if (bIsSurface && (NormalizedSlotName == TEXT("n") || NormalizedSlotName == TEXT("normal"))) {
             NormalizedSlotName = TEXT("normal");
@@ -3013,8 +2990,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         const bool bAllowPlantSlots =
             bIsPlant &&
             (SlotName == TEXT("albedo") || SlotName == TEXT("normal") ||
-             SlotName == TEXT("fuzz") || SlotName == TEXT("mask") ||
-             SlotName == TEXT("roughness") ||
+             SlotName == TEXT("orm") || SlotName == TEXT("opacity") ||
+             SlotName == TEXT("ao") || SlotName == TEXT("metalness") ||
+             SlotName == TEXT("emissive") || SlotName == TEXT("fuzz") ||
+             SlotName == TEXT("mask") || SlotName == TEXT("roughness") ||
              SlotName == TEXT("subsurfacecolor") ||
              ((SlotName == TEXT("displacement") ||
                SlotName == TEXT("translucency")) &&
@@ -3232,9 +3211,30 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     if (GroupIds.Num() == 0) {
       GroupIds.Add(1);
     }
-    GroupIds.Sort();
+    // md §5.2（2026-09-30）：3D Plants 的材质槽顺序对齐 FBX 材质顺序——Atlas
+    // （非 billboard）组排在 billboard 组之前。Megascans 的 Billboard 贴图条目
+    // 可能先于 Atlas 入库并拿到更小的 groupId，若直接按 groupId 排序，网格首个
+    // 材质槽会被 Billboard 的 MI_Billboard_* 材质占用。其它 Asset Type 没有
+    // billboard 角色，排序结果与原 GroupIds.Sort() 一致。
+    GroupIds.Sort(
+        [&SourceTextureMaterialRoleByGroup](const int32 A, const int32 B) {
+          const bool bABillboard =
+              SourceTextureMaterialRoleByGroup.FindRef(A).Equals(
+                  TEXT("billboard"), ESearchCase::IgnoreCase);
+          const bool bBBillboard =
+              SourceTextureMaterialRoleByGroup.FindRef(B).Equals(
+                  TEXT("billboard"), ESearchCase::IgnoreCase);
+          if (bABillboard != bBBillboard) {
+            return !bABillboard;
+          }
+          return A < B;
+        });
     TArray<UMaterialInstanceConstant *> MaterialInstances;
     TArray<UMaterialInstanceConstant *> OpaqueMaterialInstances;
+    // 与上面两个材质列表一一对应的材质组 ID：槽位指派按材质角色判定，不再用列表
+    // 下标反推组 ID（Megascans 的 billboard 组会被 OPAQUE 变体整体剔除）。
+    TArray<int32> MaterialGroupIds;
+    TArray<int32> OpaqueMaterialGroupIds;
     bool bHasOpaqueModelVariant = !OpaqueModelVariantKeys.IsEmpty();
     for (const TPair<UStaticMesh *, FString> &VariantPair : VariantKeyByMesh) {
       if (bHasOpaqueModelVariant) {
@@ -3359,58 +3359,77 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 22, 0, 99)),
               FString::Printf(TEXT("合成 Albedo+Opacity 贴图: %s"),
                               *AssetName), false);
-          UTexture2D *AlbedoSourceTexture =
-              SourceTextureBySlot.Contains(TEXT("albedo"))
-                  ? FImageUtils::ImportFileAsTexture2D(
-                        SourceTextureBySlot[TEXT("albedo")])
-                  : nullptr;
-          UTexture2D *OpacitySourceTexture =
-              SourceTextureBySlot.Contains(TEXT("opacity"))
-                  ? FImageUtils::ImportFileAsTexture2D(
-                        SourceTextureBySlot[TEXT("opacity")])
-                  : nullptr;
-          UTexture2D *PlantAlbedoTexture = CreatePackedPlantAlbedoTexture(
-              AssetFolder, PlantTextureStem, AlbedoSourceTexture,
-              OpacitySourceTexture, PlantProfile, bUseVT);
+          auto ImportPlantSource = [&SourceTextureBySlot](
+                                       const TCHAR *SlotKey) -> UTexture2D * {
+            return SourceTextureBySlot.Contains(SlotKey)
+                       ? FImageUtils::ImportFileAsTexture2D(
+                             SourceTextureBySlot[SlotKey])
+                       : nullptr;
+          };
+          const FString TextureStem = PlantTextureStem;
+
+          // md §5.2：植被贴图按 Diffuse（albedo 代用，D）/ Normal（N）/
+          // ORM / OpacityMasked（O，masked 资产）分张导出，类型用缩写。
+          UTexture2D *DiffuseTexture = CreatePlantTextureAsset(
+              AssetFolder, FString::Printf(TEXT("T_%s_D"), *TextureStem),
+              ImportPlantSource(TEXT("albedo")), EPlantTextureKind::Diffuse,
+              PlantProfile, bUseVT);
 
           SetStageProgress(
-              static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
-              FString::Printf(TEXT("合成 NRS 贴图: %s"), *AssetName), false);
-          UTexture2D *NormalSourceTexture =
-              SourceTextureBySlot.Contains(TEXT("normal"))
-                  ? FImageUtils::ImportFileAsTexture2D(
-                        SourceTextureBySlot[TEXT("normal")])
-                  : nullptr;
-          UTexture2D *RoughnessSourceTexture =
-              SourceTextureBySlot.Contains(TEXT("roughness"))
-                  ? FImageUtils::ImportFileAsTexture2D(
-                        SourceTextureBySlot[TEXT("roughness")])
-                  : nullptr;
-          // The library exports the Megascans Translucency (T) map as the
-          // SubsurfaceColor slot; its luminance still feeds the NRS alpha.
-          // Legacy jobs may still deliver the same map as "translucency".
-          FString SubsurfaceSourceSlot;
-          if (SourceTextureBySlot.Contains(TEXT("subsurfacecolor"))) {
-            SubsurfaceSourceSlot = TEXT("subsurfacecolor");
-          } else if (SourceTextureBySlot.Contains(TEXT("translucency"))) {
-            SubsurfaceSourceSlot = TEXT("translucency");
+              static_cast<float>(FMath::Clamp(AssetBaseProgress + 24, 0, 99)),
+              FString::Printf(TEXT("导出 Normal 贴图: %s"), *AssetName), false);
+          UTexture2D *NormalTexture = CreatePlantTextureAsset(
+              AssetFolder, FString::Printf(TEXT("T_%s_N"), *TextureStem),
+              ImportPlantSource(TEXT("normal")), EPlantTextureKind::Normal,
+              PlantProfile, bUseVT);
+
+          UTexture2D *ORMTexture = nullptr;
+          if (SourceTextureBySlot.Contains(TEXT("orm"))) {
+            ORMTexture = CreatePlantTextureAsset(
+                AssetFolder, FString::Printf(TEXT("T_%s_ORM"), *TextureStem),
+                ImportPlantSource(TEXT("orm")), EPlantTextureKind::ORM,
+                PlantProfile, bUseVT);
+          } else {
+            UTexture2D *AOSource = ImportPlantSource(TEXT("ao"));
+            UTexture2D *RoughnessSource = ImportPlantSource(TEXT("roughness"));
+            UTexture2D *MetallicSource = ImportPlantSource(TEXT("metalness"));
+            if (AOSource || RoughnessSource || MetallicSource) {
+              ORMTexture = CreatePackedORMTexture(
+                  AssetFolder, FString::Printf(TEXT("T_%s_ORM"), *TextureStem),
+                  AOSource, RoughnessSource, MetallicSource, DiffuseTexture,
+                  NormalTexture);
+              if (ORMTexture) {
+                ORMTexture->PreEditChange(nullptr);
+                ApplyPlantTexturePreset(ORMTexture, EPlantTextureKind::ORM,
+                                        PlantProfile, bUseVT);
+                ORMTexture->PostEditChange();
+                ORMTexture->MarkPackageDirty();
+                ForceTextureDataReady(ORMTexture);
+                FinalizeImportedAsset(ORMTexture);
+              }
+            }
           }
-          UTexture2D *TranslucencySourceTexture =
-              SubsurfaceSourceSlot.IsEmpty()
-                  ? nullptr
-                  : FImageUtils::ImportFileAsTexture2D(
-                        SourceTextureBySlot.FindRef(SubsurfaceSourceSlot));
-          UTexture2D *NRSTexture = CreatePackedNRSTexture(
-              AssetFolder, PlantTextureStem, NormalSourceTexture,
-              RoughnessSourceTexture, TranslucencySourceTexture,
-              PlantAlbedoTexture, NormalSourceTexture, PlantProfile, bUseVT);
+
+          UTexture2D *OpacityMaskTexture = nullptr;
+          if (SourceTextureBySlot.Contains(TEXT("opacity"))) {
+            OpacityMaskTexture = CreatePlantTextureAsset(
+                AssetFolder, FString::Printf(TEXT("T_%s_O"), *TextureStem),
+                ImportPlantSource(TEXT("opacity")),
+                EPlantTextureKind::OpacityMasked, PlantProfile, bUseVT);
+          }
+
+          SetStageProgress(
+              static_cast<float>(FMath::Clamp(AssetBaseProgress + 26, 0, 99)),
+              FString::Printf(TEXT("创建植被材质实例: %s"), *AssetName), false);
           MaterialInstance = CreatePlantMaterialInstance(
-              AssetFolder, PlantMaterialStem, PlantAlbedoTexture, NRSTexture,
-              MaterialRole, bUseVT);
-          if (bHasOpaqueModelVariant) {
+              AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
+              ORMTexture, OpacityMaskTexture, MaterialRole, bUseVT);
+          // md §5.2：OPAQUE 裁切变体不创建 billboard 材质实例。
+          if (bHasOpaqueModelVariant &&
+              !MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
             OpaqueMaterialInstance = CreatePlantMaterialInstance(
-                AssetFolder, PlantMaterialStem, PlantAlbedoTexture, NRSTexture,
-                MaterialRole, bUseVT, /*bOpaque=*/true);
+                AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
+                ORMTexture, nullptr, MaterialRole, bUseVT, /*bOpaque=*/true);
           }
         } else {
           SetStageProgress(
@@ -3473,9 +3492,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
       if (MaterialInstance) {
         MaterialInstances.Add(MaterialInstance);
+        MaterialGroupIds.Add(GroupId);
       }
       if (OpaqueMaterialInstance) {
         OpaqueMaterialInstances.Add(OpaqueMaterialInstance);
+        OpaqueMaterialGroupIds.Add(GroupId);
       }
     }
     for (UStaticMesh *StaticMesh : ImportedMeshes) {
@@ -3546,10 +3567,48 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           IsOpaqueModelVariantKey(MeshVariantKey) ||
           OpaqueModelVariantKeys.Contains(
               NormalizeModelVariantKey(MeshVariantKey));
-      const TArray<UMaterialInstanceConstant *> &MeshMaterials =
-          (bOpaqueMesh && OpaqueMaterialInstances.Num() > 0)
-              ? OpaqueMaterialInstances
-              : MaterialInstances;
+      const bool bUseOpaqueMaterialSet =
+          bOpaqueMesh && OpaqueMaterialInstances.Num() > 0;
+      const TArray<UMaterialInstanceConstant *> &SourceMaterials =
+          bUseOpaqueMaterialSet ? OpaqueMaterialInstances : MaterialInstances;
+      const TArray<int32> &SourceMaterialGroupIds =
+          bUseOpaqueMaterialSet ? OpaqueMaterialGroupIds : MaterialGroupIds;
+      auto IsBillboardGroup = [&SourceTextureMaterialRoleByGroup](int32 GroupId) {
+        return SourceTextureMaterialRoleByGroup.FindRef(GroupId)
+            .Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
+      };
+
+      // md §5.2（2026-09-30）：Megascans 导入的植被剪切出的 _OPAQUE 裁切网格不带
+      // billboard 材质槽——billboard 组既不参与槽位指派，指派结束后引用该槽位的
+      // section 会重映射回 Atlas 槽位，槽位本身再从网格材质列表里移除。
+      TArray<int32> BillboardSlotIndexes;
+      int32 AtlasSlotIndex = INDEX_NONE;
+      if (bOpaqueMesh) {
+        for (int32 SlotIndex = 0;
+             SlotIndex < Slots.Num() && SlotIndex < GroupIds.Num(); ++SlotIndex) {
+          if (IsBillboardGroup(GroupIds[SlotIndex])) {
+            BillboardSlotIndexes.Add(SlotIndex);
+          } else if (AtlasSlotIndex == INDEX_NONE) {
+            AtlasSlotIndex = SlotIndex;
+          }
+        }
+      }
+
+      TArray<UMaterialInstanceConstant *> MeshMaterials;
+      for (int32 MaterialIndex = 0; MaterialIndex < SourceMaterials.Num();
+           ++MaterialIndex) {
+        const int32 GroupId =
+            SourceMaterialGroupIds.IsValidIndex(MaterialIndex)
+                ? SourceMaterialGroupIds[MaterialIndex]
+                : INDEX_NONE;
+        if (bOpaqueMesh && GroupId != INDEX_NONE && IsBillboardGroup(GroupId)) {
+          continue;
+        }
+        MeshMaterials.Add(SourceMaterials[MaterialIndex]);
+      }
+      if (MeshMaterials.Num() == 0) {
+        MeshMaterials = SourceMaterials;
+      }
       for (int32 Index = 0; Index < Slots.Num() && MeshMaterials.Num() > 0; ++Index) {
         UMaterialInstanceConstant *Material = MeshMaterials[FMath::Min(Index, MeshMaterials.Num() - 1)];
         Slots[Index].MaterialInterface = Material;
@@ -3571,6 +3630,34 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           }
           Slots[Index].ImportedMaterialSlotName = Candidate;
         }
+      }
+      if (bOpaqueMesh && BillboardSlotIndexes.Num() > 0) {
+        // 引用 billboard 槽位的 section 先回落到 Atlas 槽位，再交给引擎移除尾部
+        // 未使用材质槽，保证 OPAQUE 网格材质列表里不再出现 billboard 槽位。
+        const int32 BillboardRemapTarget =
+            AtlasSlotIndex == INDEX_NONE ? 0 : AtlasSlotIndex;
+        FMeshSectionInfoMap &SectionInfoMap = StaticMesh->GetSectionInfoMap();
+        int32 RemappedSectionCount = 0;
+        const int32 SourceModelCount = StaticMesh->GetNumSourceModels();
+        for (int32 LodIndex = 0; LodIndex < SourceModelCount; ++LodIndex) {
+          const int32 SectionCount = SectionInfoMap.GetSectionNumber(LodIndex);
+          for (int32 SectionIndex = 0; SectionIndex < SectionCount;
+               ++SectionIndex) {
+            FMeshSectionInfo SectionInfo =
+                SectionInfoMap.Get(LodIndex, SectionIndex);
+            if (BillboardSlotIndexes.Contains(SectionInfo.MaterialIndex)) {
+              SectionInfo.MaterialIndex = BillboardRemapTarget;
+              SectionInfoMap.Set(LodIndex, SectionIndex, SectionInfo);
+              RemappedSectionCount++;
+            }
+          }
+        }
+        UStaticMesh::RemoveUnusedMaterialSlots(StaticMesh);
+        UE_LOG(LogTemp, Display,
+               TEXT("AssetHive import: %s 移除 OPAQUE 变体的 billboard 材质槽 %d 个"
+                    "（重映射 section %d 个）"),
+               *StaticMesh->GetName(), BillboardSlotIndexes.Num(),
+               RemappedSectionCount);
       }
       StaticMesh->PostEditChange();
       StaticMesh->MarkPackageDirty();
@@ -3791,9 +3878,9 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("Plant opaque mesh name"),
             FString::Printf(TEXT("SM_%s_%s_OPAQUE"), *PlantStem, TEXT("01")),
             FString(TEXT("SM_Env_Grass_abc123_01_OPAQUE")));
-  TestEqual(TEXT("Plant texture name drops resolution"),
-            FString::Printf(TEXT("T_%s_%s"), *PlantStem, TEXT("Albedo")),
-            FString(TEXT("T_Env_Grass_abc123_Albedo")));
+  TestEqual(TEXT("Plant texture name uses slot abbreviation"),
+            FString::Printf(TEXT("T_%s_%s"), *PlantStem, TEXT("D")),
+            FString(TEXT("T_Env_Grass_abc123_D")));
   TestEqual(TEXT("Plant atlas material name"),
             UAssetHiveSettings::GetPlantMaterialName(
                 FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), false,

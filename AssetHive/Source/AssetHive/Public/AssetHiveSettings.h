@@ -140,11 +140,20 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Billboard Material Name Prefix", ToolTip="Prefix for 3D Plant Billboard material instances. Default: MI_Billboard_"))
     FString PlantBillboardMaterialNamePrefix;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Albedo Texture Parameter", ToolTip="Texture parameter receiving the packed Plant albedo/opacity texture."))
-    FString PlantAlbedoParameter;
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the Plant Diffuse texture T_..._D (albedo used as diffuse). Default: Diffuse_VT"))
+    FString PlantDiffuseParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="NRS Texture Parameter", ToolTip="Texture parameter receiving the packed Plant NRS texture."))
-    FString PlantNRSParameter;
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Plant Normal texture T_..._N. Default: Normal_VT"))
+    FString PlantNormalParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="ORM Texture Parameter", ToolTip="Texture parameter receiving the Plant ORM texture T_..._ORM. Default: ORM_VT"))
+    FString PlantORMParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="OpacityMasked Texture Parameter", ToolTip="Texture parameter receiving the Plant OpacityMasked texture T_..._O (masked foliage only). Default: OpacityMasked_VT"))
+    FString PlantOpacityMaskedParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Use OpacityMasked Switch", ToolTip="Static switch enabled when masked foliage carries an OpacityMasked texture. Default: Use OpacityMasked"))
+    FString PlantUseOpacityMaskedSwitch;
 
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for cut _OPAQUE foliage variants (grass and bush). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT; leaving it empty falls back to the same default."))
     TSoftObjectPtr<UMaterialInterface> PlantOpaqueParentMaterial;
@@ -195,6 +204,9 @@ public:
     static FString GetPlantMaterialName(const FString& AssetName, bool bBillboard, bool bOpaque = false);
     static FString GetPlantOpaqueParentMaterialPath(bool bUseVT);
     static UMaterialInterface* GetPlantOpaqueParentMaterial(bool bUseVT);
-    static FString GetPlantAlbedoParameter();
-    static FString GetPlantNRSParameter();
+    static FString GetPlantDiffuseParameter();
+    static FString GetPlantNormalParameter();
+    static FString GetPlantORMParameter();
+    static FString GetPlantOpacityMaskedParameter();
+    static FString GetPlantUseOpacityMaskedSwitch();
 };

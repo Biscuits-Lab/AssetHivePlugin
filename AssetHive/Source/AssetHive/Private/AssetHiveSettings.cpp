@@ -47,8 +47,13 @@ UAssetHiveSettings::UAssetHiveSettings()
     PlantBillboardParentMaterial = PlantAtlasParentMaterial;
     PlantAtlasMaterialNamePrefix = TEXT("MI_");
     PlantBillboardMaterialNamePrefix = TEXT("MI_Billboard_");
-    PlantAlbedoParameter = TEXT("Albedo");
-    PlantNRSParameter = TEXT("NRS");
+    // 2026-09-30：植被贴图按 Diffuse / Normal / ORM / OpacityMasked 分张导出，
+    // 参数名对齐项目 GrassBend 母材质（M_Env_GrassBend_ST）。
+    PlantDiffuseParameter = TEXT("Diffuse_VT");
+    PlantNormalParameter = TEXT("Normal_VT");
+    PlantORMParameter = TEXT("ORM_VT");
+    PlantOpacityMaskedParameter = TEXT("OpacityMasked_VT");
+    PlantUseOpacityMaskedSwitch = TEXT("Use OpacityMasked");
     // 2026-09-30：_OPAQUE 裁切变体（grass & bush）使用 Opaque 版本。
     PlantOpaqueParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT")));
 }
@@ -445,14 +450,32 @@ FString UAssetHiveSettings::GetPlantMaterialName(const FString& AssetName, bool 
                    : Prefix + SafeAssetName;
 }
 
-FString UAssetHiveSettings::GetPlantAlbedoParameter()
+FString UAssetHiveSettings::GetPlantDiffuseParameter()
 {
-    const FString Value = GetDefault<UAssetHiveSettings>()->PlantAlbedoParameter.TrimStartAndEnd();
-    return Value.IsEmpty() ? TEXT("Albedo") : Value;
+    const FString Value = GetDefault<UAssetHiveSettings>()->PlantDiffuseParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Diffuse_VT") : Value;
 }
 
-FString UAssetHiveSettings::GetPlantNRSParameter()
+FString UAssetHiveSettings::GetPlantNormalParameter()
 {
-    const FString Value = GetDefault<UAssetHiveSettings>()->PlantNRSParameter.TrimStartAndEnd();
-    return Value.IsEmpty() ? TEXT("NRS") : Value;
+    const FString Value = GetDefault<UAssetHiveSettings>()->PlantNormalParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Normal_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetPlantORMParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->PlantORMParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("ORM_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetPlantOpacityMaskedParameter()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->PlantOpacityMaskedParameter.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("OpacityMasked_VT") : Value;
+}
+
+FString UAssetHiveSettings::GetPlantUseOpacityMaskedSwitch()
+{
+    const FString Value = GetDefault<UAssetHiveSettings>()->PlantUseOpacityMaskedSwitch.TrimStartAndEnd();
+    return Value.IsEmpty() ? TEXT("Use OpacityMasked") : Value;
 }

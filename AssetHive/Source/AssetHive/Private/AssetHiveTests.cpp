@@ -52,8 +52,11 @@ bool FAssetHiveSettingsTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Plant billboard parent valid"), UAssetHiveSettings::IsValidPlantParentMaterialPath(UAssetHiveSettings::GetPlantParentMaterialPath(true)));
     TestEqual(TEXT("Plant atlas MI name"), UAssetHiveSettings::GetPlantMaterialName(TEXT("Fern_001"), false), FString(TEXT("MI_Fern_001")));
     TestEqual(TEXT("Plant billboard MI name"), UAssetHiveSettings::GetPlantMaterialName(TEXT("Fern_001"), true), FString(TEXT("MI_Billboard_Fern_001")));
-    TestEqual(TEXT("Plant albedo parameter"), UAssetHiveSettings::GetPlantAlbedoParameter(), FString(TEXT("Albedo")));
-    TestEqual(TEXT("Plant NRS parameter"), UAssetHiveSettings::GetPlantNRSParameter(), FString(TEXT("NRS")));
+    TestEqual(TEXT("Plant diffuse parameter"), UAssetHiveSettings::GetPlantDiffuseParameter(), FString(TEXT("Diffuse_VT")));
+    TestEqual(TEXT("Plant normal parameter"), UAssetHiveSettings::GetPlantNormalParameter(), FString(TEXT("Normal_VT")));
+    TestEqual(TEXT("Plant ORM parameter"), UAssetHiveSettings::GetPlantORMParameter(), FString(TEXT("ORM_VT")));
+    TestEqual(TEXT("Plant opacity masked parameter"), UAssetHiveSettings::GetPlantOpacityMaskedParameter(), FString(TEXT("OpacityMasked_VT")));
+    TestEqual(TEXT("Plant opacity masked switch"), UAssetHiveSettings::GetPlantUseOpacityMaskedSwitch(), FString(TEXT("Use OpacityMasked")));
 
     UAssetHiveSettings* Defaults = GetMutableDefault<UAssetHiveSettings>();
     const FString Original = Defaults->ImportRootPath;
