@@ -149,9 +149,6 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for cut _OPAQUE foliage variants (grass and bush). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT; leaving it empty falls back to the same default."))
     TSoftObjectPtr<UMaterialInterface> PlantOpaqueParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Material Name Prefix", ToolTip="Prefix for generated 3D Plant opaque material instances. Default: MI_Opaque_"))
-    FString PlantOpaqueMaterialNamePrefix;
-
     static bool IsValidImportRootPath(const FString& Path);
     static FString GetDefaultImportRootPath();
     static FString GetImportRootPath();

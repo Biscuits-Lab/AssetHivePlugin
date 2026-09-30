@@ -134,6 +134,35 @@ static void CollectAssetTags(const TSharedPtr<FJsonObject> &AssetObject,
   }
 }
 
+// 3D Plants 命名（用户口头 P0，2026-09-30 定稿）：
+// SM_Env_<标准AssetTag>_<资产ID>_<变体编号>[_OPAQUE] /
+// T_Env_<标准AssetTag>_<资产ID>_<纹理类型>（不带分辨率）/
+// MI_Env_<标准AssetTag>_<资产ID>_<变体编号>[_OPAQUE]。
+static FString ResolvePlantTagSegment(const TArray<FString> &Tags) {
+  const TCHAR *PreferredTags[] = {TEXT("Tree"), TEXT("Bush"), TEXT("Grass"),
+                                  TEXT("MicroFoliage"), TEXT("HeroFoliage")};
+  for (const TCHAR *Preferred : PreferredTags) {
+    if (HasAssetTag(Tags, Preferred)) {
+      return FString(Preferred);
+    }
+  }
+  for (const FString &Tag : Tags) {
+    const FString SafeTag = MakeSafeObjectName(Tag.TrimStartAndEnd());
+    if (!SafeTag.IsEmpty()) {
+      return SafeTag;
+    }
+  }
+  return TEXT("Plant");
+}
+
+static FString BuildPlantObjectStem(const TArray<FString> &Tags,
+                                    const FString &AssetId) {
+  const FString Id = MakeSafeObjectName(AssetId).TrimStartAndEnd();
+  const FString Tag = ResolvePlantTagSegment(Tags);
+  return Id.IsEmpty() ? FString::Printf(TEXT("Env_%s"), *Tag)
+                      : FString::Printf(TEXT("Env_%s_%s"), *Tag, *Id);
+}
+
 struct FEnvironmentAssetProfile {
   FString TypeKey = TEXT("Objects");
   FString TypePrefix;
@@ -2090,8 +2119,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     FEnvironmentAssetProfile EnvironmentProfile;
     TArray<FString> AssetStandardTags;
-    if (bIs3DAsset) {
+    if (bIs3DAsset || AssetType == TEXT("3dplant")) {
       CollectAssetTags(AssetObject, AssetStandardTags);
+    }
+    if (bIs3DAsset) {
       EnvironmentProfile = ResolveEnvironmentAssetProfile(AssetStandardTags);
       CategoryFolder = EnvironmentProfile.FolderName;
     }
@@ -2126,6 +2157,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     const FString AssetStem =
         FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
+    // 3D Plants（2026-09-30 定稿）：资产名不入名，改用 标准 Asset Tag + 资产ID。
+    const FString PlantObjectStem =
+        AssetType == TEXT("3dplant")
+            ? BuildPlantObjectStem(AssetStandardTags, SafeAssetId)
+            : FString();
     const FString EnvironmentStem =
         bIs3DAsset ? BuildEnvironmentObjectStem(EnvironmentProfile, AssetName,
                                                 AssetId)
@@ -2398,14 +2434,23 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             continue;
           }
 
+          const bool bPlantAsset = AssetType == TEXT("3dplant");
+          const bool bOpaqueMeshVariant =
+              bPlantAsset && (IsOpaqueModelVariantKey(VariantKey) ||
+                              OpaqueModelVariantKeys.Contains(
+                                  NormalizeModelVariantKey(VariantKey)));
           const bool bNeedsVariantSuffix =
-              bHasExplicitModelVariants || VariantKeys.Num() > 1;
+              bPlantAsset || bHasExplicitModelVariants || VariantKeys.Num() > 1;
           const FString VariantStem =
               bNeedsVariantSuffix
-                  ? FString::Printf(TEXT("%s_%s"), *AssetStem, *VariantKey)
-                  : AssetStem;
+                  ? FString::Printf(TEXT("%s_%s"),
+                                    bPlantAsset ? *PlantObjectStem : *AssetStem,
+                                    *VariantKey)
+                  : (bPlantAsset ? PlantObjectStem : AssetStem);
           const FString BaseMeshName =
-              FString::Printf(TEXT("SM_%s"), *VariantStem);
+              bOpaqueMeshVariant
+                  ? FString::Printf(TEXT("SM_%s_OPAQUE"), *VariantStem)
+                  : FString::Printf(TEXT("SM_%s"), *VariantStem);
 
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 8, 0, 99)),
@@ -2477,13 +2522,24 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           } else if (bIsCustomAsset && bIsModelAsset) {
             const FString VariantKey = ResolveModelVariantKey(
                 SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
+            const bool bPlantAsset = AssetType == TEXT("3dplant");
+            const bool bOpaqueMeshVariant =
+                bPlantAsset &&
+                (IsOpaqueModelVariantKey(VariantKey) ||
+                 OpaqueModelVariantKeys.Contains(
+                     NormalizeModelVariantKey(VariantKey)));
             const bool bNeedsVariantSuffix =
-                bHasExplicitModelVariants || ValidModelCount > 1;
+                bPlantAsset || bHasExplicitModelVariants || ValidModelCount > 1;
             ModelAssetName =
                 bNeedsVariantSuffix
-                    ? FString::Printf(TEXT("SM_%s_%s"), *AssetStem,
+                    ? FString::Printf(TEXT("SM_%s_%s"),
+                                      bPlantAsset ? *PlantObjectStem : *AssetStem,
                                       *VariantKey)
-                    : FString::Printf(TEXT("SM_%s"), *AssetStem);
+                    : FString::Printf(TEXT("SM_%s"),
+                                      bPlantAsset ? *PlantObjectStem : *AssetStem);
+            if (bOpaqueMeshVariant) {
+              ModelAssetName += TEXT("_OPAQUE");
+            }
           } else {
             ModelAssetName = FString::Printf(TEXT("SM_%s_%s"), *AssetStem,
                                              *DetectModelSuffix(SourceFile));
@@ -2824,6 +2880,24 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           GroupIds.Num() > 1
               ? FString::Printf(TEXT("%s_%03d"), *AssetStem, GroupId)
               : AssetStem;
+      // 3D Plants 命名（2026-09-30 定稿）：纹理不带变体号、不带分辨率；
+      // 材质实例带主变体号；多变体组沿用 _00N 组号段（与 3D Assets 一致）。
+      const bool bPlantAsset = AssetType == TEXT("3dplant");
+      const FString PlantTextureStem =
+          bPlantAsset
+              ? (GroupIds.Num() > 1
+                     ? FString::Printf(TEXT("%s_%03d"), *PlantObjectStem,
+                                       GroupId)
+                     : PlantObjectStem)
+              : GroupStem;
+      const FString PlantMaterialStem =
+          bPlantAsset
+              ? (GroupIds.Num() > 1
+                     ? FString::Printf(TEXT("%s_%03d_%s"), *PlantObjectStem,
+                                       GroupId, *PrimaryModelVariantKey)
+                     : FString::Printf(TEXT("%s_%s"), *PlantObjectStem,
+                                       *PrimaryModelVariantKey))
+              : GroupStem;
       UMaterialInstanceConstant *MaterialInstance = nullptr;
       UMaterialInstanceConstant *OpaqueMaterialInstance = nullptr;
       if (bIsHdri) {
@@ -2922,7 +2996,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                         SourceTextureBySlot[TEXT("opacity")])
                   : nullptr;
           UTexture2D *PlantAlbedoTexture = CreatePackedPlantAlbedoTexture(
-              AssetFolder, GroupStem, AlbedoSourceTexture,
+              AssetFolder, PlantTextureStem, AlbedoSourceTexture,
               OpacitySourceTexture);
 
           SetStageProgress(
@@ -2953,15 +3027,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                   : FImageUtils::ImportFileAsTexture2D(
                         SourceTextureBySlot.FindRef(SubsurfaceSourceSlot));
           UTexture2D *NRSTexture = CreatePackedNRSTexture(
-              AssetFolder, GroupStem, NormalSourceTexture,
+              AssetFolder, PlantTextureStem, NormalSourceTexture,
               RoughnessSourceTexture, TranslucencySourceTexture,
               PlantAlbedoTexture, NormalSourceTexture);
           MaterialInstance = CreatePlantMaterialInstance(
-              AssetFolder, GroupStem, PlantAlbedoTexture, NRSTexture,
+              AssetFolder, PlantMaterialStem, PlantAlbedoTexture, NRSTexture,
               MaterialRole, bUseVT);
           if (bHasOpaqueModelVariant) {
             OpaqueMaterialInstance = CreatePlantMaterialInstance(
-                AssetFolder, GroupStem, PlantAlbedoTexture, NRSTexture,
+                AssetFolder, PlantMaterialStem, PlantAlbedoTexture, NRSTexture,
                 MaterialRole, bUseVT, /*bOpaque=*/true);
           }
         } else {
@@ -3300,6 +3374,38 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
             BuildEnvironmentAssetMaterialName(MegascansStem, 2, true,
                                                TEXT("01")),
             FString(TEXT("MI_Env_abc123_002_01")));
+
+  // 3D Plants 命名（2026-09-30 定稿）：SM_/MI_/T_ 采用
+  // Env_<标准AssetTag>_<资产ID> 模板，OPAQUE 变体追加 _OPAQUE 后缀。
+  TArray<FString> PlantTags;
+  PlantTags.Add(TEXT("Grass"));
+  const FString PlantStem = BuildPlantObjectStem(PlantTags, TEXT("abc123"));
+  TestEqual(TEXT("Plant stem uses tag and asset ID"), PlantStem,
+            FString(TEXT("Env_Grass_abc123")));
+  TestEqual(TEXT("Plant masked mesh name"),
+            FString::Printf(TEXT("SM_%s_%s"), *PlantStem, TEXT("01")),
+            FString(TEXT("SM_Env_Grass_abc123_01")));
+  TestEqual(TEXT("Plant opaque mesh name"),
+            FString::Printf(TEXT("SM_%s_%s_OPAQUE"), *PlantStem, TEXT("01")),
+            FString(TEXT("SM_Env_Grass_abc123_01_OPAQUE")));
+  TestEqual(TEXT("Plant texture name drops resolution"),
+            FString::Printf(TEXT("T_%s_%s"), *PlantStem, TEXT("Albedo")),
+            FString(TEXT("T_Env_Grass_abc123_Albedo")));
+  TestEqual(TEXT("Plant atlas material name"),
+            UAssetHiveSettings::GetPlantMaterialName(
+                FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), false,
+                false),
+            FString(TEXT("MI_Env_Grass_abc123_01")));
+  TestEqual(TEXT("Plant opaque material name uses _OPAQUE suffix"),
+            UAssetHiveSettings::GetPlantMaterialName(
+                FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), false,
+                true),
+            FString(TEXT("MI_Env_Grass_abc123_01_OPAQUE")));
+  TestEqual(TEXT("Plant billboard material keeps prefix"),
+            UAssetHiveSettings::GetPlantMaterialName(
+                FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), true,
+                false),
+            FString(TEXT("MI_Billboard_Env_Grass_abc123_01")));
   return true;
 }
 

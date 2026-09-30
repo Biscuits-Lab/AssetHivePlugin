@@ -51,7 +51,6 @@ UAssetHiveSettings::UAssetHiveSettings()
     PlantNRSParameter = TEXT("NRS");
     // 2026-09-30：_OPAQUE 裁切变体（grass & bush）使用 Opaque 版本。
     PlantOpaqueParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT")));
-    PlantOpaqueMaterialNamePrefix = TEXT("MI_Opaque_");
 }
 FString UAssetHiveSettings::GetDefaultImportRootPath() { return TEXT("/Game/AssetHive"); }
 FString UAssetHiveSettings::GetImportRootPath()
@@ -434,17 +433,16 @@ FString UAssetHiveSettings::GetPlantMaterialName(const FString& AssetName, bool 
     SafeAssetName.ReplaceInline(TEXT("."), TEXT("_"));
     if (SafeAssetName.IsEmpty()) SafeAssetName = TEXT("Plant");
     const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
-    const FString ConfiguredPrefix = bOpaque
-        ? Settings->PlantOpaqueMaterialNamePrefix
-        : (bBillboard ? Settings->PlantBillboardMaterialNamePrefix
-                      : Settings->PlantAtlasMaterialNamePrefix);
-    const FString DefaultPrefix = bOpaque
-        ? TEXT("MI_Opaque_")
-        : (bBillboard ? TEXT("MI_Billboard_") : TEXT("MI_"));
+    const FString ConfiguredPrefix = bBillboard
+        ? Settings->PlantBillboardMaterialNamePrefix
+        : Settings->PlantAtlasMaterialNamePrefix;
+    const FString DefaultPrefix = bBillboard ? TEXT("MI_Billboard_") : TEXT("MI_");
     const FString Prefix = ConfiguredPrefix.TrimStartAndEnd().IsEmpty()
         ? DefaultPrefix
         : ConfiguredPrefix.TrimStartAndEnd();
-    return Prefix + SafeAssetName;
+    // 2026-09-30 定稿：Opaque 变体使用固定 _OPAQUE 后缀（不再用 MI_Opaque_ 前缀）。
+    return bOpaque ? Prefix + SafeAssetName + TEXT("_OPAQUE")
+                   : Prefix + SafeAssetName;
 }
 
 FString UAssetHiveSettings::GetPlantAlbedoParameter()
