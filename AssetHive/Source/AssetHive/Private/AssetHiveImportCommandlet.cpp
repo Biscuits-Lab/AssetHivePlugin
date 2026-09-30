@@ -2960,10 +2960,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               AssetFolder, GroupStem, PlantAlbedoTexture, NRSTexture,
               MaterialRole, bUseVT);
           if (bHasOpaqueModelVariant) {
-            if (!UAssetHiveSettings::HasConfiguredPlantOpaqueParentMaterial()) {
-              UE_LOG(LogTemp, Display,
-                     TEXT("AssetHive: _OPAQUE variant reuses the Atlas plant parent with a Blend Mode override to Opaque. Set Plant Material > Opaque Variant Parent Material to use a dedicated parent."));
-            }
             OpaqueMaterialInstance = CreatePlantMaterialInstance(
                 AssetFolder, GroupStem, PlantAlbedoTexture, NRSTexture,
                 MaterialRole, bUseVT, /*bOpaque=*/true);

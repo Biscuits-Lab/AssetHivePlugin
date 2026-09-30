@@ -128,7 +128,7 @@ public:
     float Asset3DMissingSmoothingAngleDegrees = 60.0f;
 
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Atlas Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Atlas texture groups. Default: /Game/Common/MaterialInstance/MMI_Grass.MMI_Grass"))
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Atlas Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Atlas texture groups (masked foliage). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_Masked_ST_VT.MI_Env_GrassBend_Masked_ST_VT"))
     TSoftObjectPtr<UMaterialInterface> PlantAtlasParentMaterial;
 
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Billboard Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Billboard texture groups. Defaults to the Atlas parent so the two texture sets still produce separate material instances."))
@@ -146,7 +146,7 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="NRS Texture Parameter", ToolTip="Texture parameter receiving the packed Plant NRS texture."))
     FString PlantNRSParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Optional parent MI used for cut _OPAQUE foliage variants. Leave empty to reuse the Atlas parent with a Blend Mode override to Opaque."))
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for cut _OPAQUE foliage variants (grass and bush). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT; leaving it empty falls back to the same default."))
     TSoftObjectPtr<UMaterialInterface> PlantOpaqueParentMaterial;
 
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Material Name Prefix", ToolTip="Prefix for generated 3D Plant opaque material instances. Default: MI_Opaque_"))
@@ -190,12 +190,12 @@ public:
     static float GetAsset3DLargeSizeThresholdCm();
     static float GetAsset3DMissingSmoothingAngle();
     static FString GetDefaultPlantAtlasParentMaterialPath();
+    static FString GetDefaultPlantOpaqueParentMaterialPath();
     static FString GetDefaultPlantBillboardParentMaterialPath();
     static FString GetPlantParentMaterialPath(bool bBillboard);
     static UMaterialInterface* GetPlantParentMaterial(bool bBillboard, bool bUseVT);
     static bool IsValidPlantParentMaterialPath(const FString& Path);
     static FString GetPlantMaterialName(const FString& AssetName, bool bBillboard, bool bOpaque = false);
-    static bool HasConfiguredPlantOpaqueParentMaterial();
     static FString GetPlantOpaqueParentMaterialPath(bool bUseVT);
     static UMaterialInterface* GetPlantOpaqueParentMaterial(bool bUseVT);
     static FString GetPlantAlbedoParameter();

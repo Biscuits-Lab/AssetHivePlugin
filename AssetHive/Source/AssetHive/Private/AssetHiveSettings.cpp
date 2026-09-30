@@ -42,13 +42,15 @@ UAssetHiveSettings::UAssetHiveSettings()
     Asset3DLargeMaxLOD0Triangles = 550000;
     Asset3DLargeSizeThresholdCm = 1000.0f;
     Asset3DMissingSmoothingAngleDegrees = 60.0f;
-    PlantAtlasParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/Common/MaterialInstance/MMI_Grass.MMI_Grass")));
+    // 2026-09-30：项目侧统一使用 GrassBend 植被材质，未裁切（Masked）植被用 Masked 版本。
+    PlantAtlasParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_Masked_ST_VT.MI_Env_GrassBend_Masked_ST_VT")));
     PlantBillboardParentMaterial = PlantAtlasParentMaterial;
     PlantAtlasMaterialNamePrefix = TEXT("MI_");
     PlantBillboardMaterialNamePrefix = TEXT("MI_Billboard_");
     PlantAlbedoParameter = TEXT("Albedo");
     PlantNRSParameter = TEXT("NRS");
-    PlantOpaqueParentMaterial = TSoftObjectPtr<UMaterialInterface>();
+    // 2026-09-30：_OPAQUE 裁切变体（grass & bush）使用 Opaque 版本。
+    PlantOpaqueParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT")));
     PlantOpaqueMaterialNamePrefix = TEXT("MI_Opaque_");
 }
 FString UAssetHiveSettings::GetDefaultImportRootPath() { return TEXT("/Game/AssetHive"); }
@@ -351,7 +353,14 @@ float UAssetHiveSettings::GetAsset3DMissingSmoothingAngle()
 
 FString UAssetHiveSettings::GetDefaultPlantAtlasParentMaterialPath()
 {
-    return TEXT("/Game/Common/MaterialInstance/MMI_Grass.MMI_Grass");
+    // 2026-09-30：未裁切（Masked）植被的默认父材质。
+    return TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_Masked_ST_VT.MI_Env_GrassBend_Masked_ST_VT");
+}
+
+FString UAssetHiveSettings::GetDefaultPlantOpaqueParentMaterialPath()
+{
+    // 2026-09-30：_OPAQUE 裁切变体（grass & bush）的默认父材质。
+    return TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT");
 }
 
 FString UAssetHiveSettings::GetDefaultPlantBillboardParentMaterialPath()
@@ -389,20 +398,14 @@ UMaterialInterface* UAssetHiveSettings::GetPlantParentMaterial(bool bBillboard, 
     return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
 }
 
-bool UAssetHiveSettings::HasConfiguredPlantOpaqueParentMaterial()
-{
-    return !GetDefault<UAssetHiveSettings>()->PlantOpaqueParentMaterial.ToSoftObjectPath().ToString().TrimStartAndEnd().IsEmpty();
-}
-
 FString UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bool bUseVT)
 {
     const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
     FString Path = Settings->PlantOpaqueParentMaterial.ToSoftObjectPath().ToString().TrimStartAndEnd();
     if (Path.IsEmpty())
     {
-        // No dedicated parent configured: reuse the Atlas parent and let the
-        // generated instance override the blend mode to Opaque.
-        Path = GetPlantParentMaterialPath(false);
+        // 未配置时回退到 GrassBend Opaque 父材质；裁切几何不再依赖遮罩。
+        Path = GetDefaultPlantOpaqueParentMaterialPath();
     }
     if (bUseVT)
     {
