@@ -1069,6 +1069,24 @@ static bool IsOpaqueModelVariantKey(const FString &VariantKey) {
   return Value.EndsWith(TEXT("OPAQUE"));
 }
 
+// A masked/LOD fallback variant still needs the original Masked/Atlas
+// material set. When every imported model variant is a cut OPAQUE variant,
+// that set is redundant and must not be created.
+static bool HasMaskedPlantModelVariant(
+    const TMap<UStaticMesh *, FString> &VariantKeyByMesh,
+    const TSet<FString> &OpaqueModelVariantKeys) {
+  for (const TPair<UStaticMesh *, FString> &VariantPair : VariantKeyByMesh) {
+    const bool bOpaqueVariant =
+        IsOpaqueModelVariantKey(VariantPair.Value) ||
+        OpaqueModelVariantKeys.Contains(
+            NormalizeModelVariantKey(VariantPair.Value));
+    if (!bOpaqueVariant) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static bool IsAcceptedModelVariantToken(const FString &Token) {
   const FString LowerToken = Token.ToLower();
   if (LowerToken.IsEmpty() || LowerToken == TEXT("base") ||
@@ -3024,19 +3042,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // Keep the legacy all-opaque heuristic for older payloads.
     bool bBillboardExcluded = false;
     AssetObject->TryGetBoolField(TEXT("billboardExcluded"), bBillboardExcluded);
-    bool bAllModelVariantsOpaque = false;
-    if (AssetType == TEXT("3dplant") && VariantKeyByMesh.Num() > 0) {
-      bAllModelVariantsOpaque = true;
-      for (const TPair<UStaticMesh *, FString> &VariantPair : VariantKeyByMesh) {
-        const FString NormalizedVariantKey =
-            NormalizeModelVariantKey(VariantPair.Value);
-        if (!IsOpaqueModelVariantKey(VariantPair.Value) &&
-            !OpaqueModelVariantKeys.Contains(NormalizedVariantKey)) {
-          bAllModelVariantsOpaque = false;
-          break;
-        }
-      }
-    }
+    const bool bHasMaskedModelVariant =
+        AssetType == TEXT("3dplant") &&
+        HasMaskedPlantModelVariant(VariantKeyByMesh, OpaqueModelVariantKeys);
+    const bool bAllModelVariantsOpaque =
+        AssetType == TEXT("3dplant") && VariantKeyByMesh.Num() > 0 &&
+        !bHasMaskedModelVariant;
     const bool bSuppressBillboardExport =
         bBillboardExcluded || bAllModelVariantsOpaque;
     const TArray<TSharedPtr<FJsonValue>> *TextureFiles = nullptr;
@@ -3550,10 +3561,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 26, 0, 99)),
               FString::Printf(TEXT("创建植被材质实例: %s"), *AssetName), false);
-          MaterialInstance = CreatePlantMaterialInstance(
-              AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
-              ORMTexture, OpacityMaskTexture, SubsurfaceTexture, MaterialRole,
-              bUseVT);
+          if (bHasMaskedModelVariant) {
+            MaterialInstance = CreatePlantMaterialInstance(
+                AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
+                ORMTexture, OpacityMaskTexture, SubsurfaceTexture, MaterialRole,
+                bUseVT);
+          }
           // md §5.2：OPAQUE 裁切变体不创建 billboard 材质实例。
           if (bHasOpaqueModelVariant &&
               !MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
@@ -3699,7 +3712,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           OpaqueModelVariantKeys.Contains(
               NormalizeModelVariantKey(MeshVariantKey));
       const bool bUseOpaqueMaterialSet =
-          bOpaqueMesh && OpaqueMaterialInstances.Num() > 0;
+          OpaqueMaterialInstances.Num() > 0 &&
+          (bOpaqueMesh || MaterialInstances.Num() == 0);
       const TArray<UMaterialInstanceConstant *> &SourceMaterials =
           bUseOpaqueMaterialSet ? OpaqueMaterialInstances : MaterialInstances;
       const TArray<int32> &SourceMaterialGroupIds =
@@ -4029,6 +4043,27 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                 FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), true,
                 false),
             FString(TEXT("MI_Billboard_Env_Grass_abc123_01")));
+
+  TMap<UStaticMesh *, FString> OpaqueOnlyPlantVariants;
+  OpaqueOnlyPlantVariants.Add(nullptr, TEXT("01"));
+  TSet<FString> OpaquePlantVariantKeys;
+  OpaquePlantVariantKeys.Add(TEXT("01"));
+  TestFalse(TEXT("Opaque-only plant skips masked material set"),
+            HasMaskedPlantModelVariant(OpaqueOnlyPlantVariants,
+                                       OpaquePlantVariantKeys));
+
+  TMap<UStaticMesh *, FString> OpaqueSuffixPlantVariants;
+  OpaqueSuffixPlantVariants.Add(nullptr, TEXT("01_OPAQUE"));
+  TSet<FString> NoOpaquePlantVariantKeys;
+  TestFalse(TEXT("Opaque suffix plant skips masked material set"),
+            HasMaskedPlantModelVariant(OpaqueSuffixPlantVariants,
+                                       NoOpaquePlantVariantKeys));
+
+  TMap<UStaticMesh *, FString> MaskedFallbackPlantVariants;
+  MaskedFallbackPlantVariants.Add(nullptr, TEXT("01"));
+  TestTrue(TEXT("Masked fallback plant keeps masked material set"),
+           HasMaskedPlantModelVariant(MaskedFallbackPlantVariants,
+                                      NoOpaquePlantVariantKeys));
 
   // 命名模板只对 FBX 原始资产生效：st9（SpeedTree）保持原有命名。
   auto FbxPlantObject = MakeShared<FJsonObject>();
