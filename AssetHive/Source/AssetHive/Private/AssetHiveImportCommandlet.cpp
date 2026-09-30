@@ -163,6 +163,62 @@ static FString BuildPlantObjectStem(const TArray<FString> &Tags,
                       : FString::Printf(TEXT("Env_%s_%s"), *Tag, *Id);
 }
 
+// 3D Plants 导出档案（md §5.2，2026-09-30 插件侧定稿）：路径 / 面数 / Nanite /
+// 碰撞 / 纹理预设按标准 Asset Tag 分子类；命名模板仍只对 FBX 原始资产生效。
+struct FPlantAssetProfile {
+  FString SubtypeFolder;  // Vegetation 下的子类目录，未识别时留空
+  int32 MaxLOD0Triangles = 0;
+  bool bNanite = true;
+  bool bHandleCollision = false;
+  bool bTrunkCollision = false;
+  int32 TextureMaxSize = 2048;
+  int32 TextureVTSize = 2048;
+  bool bAllowVirtualTexture = true;
+};
+
+static FPlantAssetProfile ResolvePlantAssetProfile(const TArray<FString> &Tags) {
+  FPlantAssetProfile Profile;
+  if (HasAssetTag(Tags, TEXT("Tree"))) {
+    Profile.SubtypeFolder = TEXT("Tree");
+    Profile.MaxLOD0Triangles = 100000;
+    Profile.bHandleCollision = true;
+    Profile.bTrunkCollision = true;
+    return Profile;
+  }
+  if (HasAssetTag(Tags, TEXT("Bush"))) {
+    Profile.SubtypeFolder = TEXT("Bush");
+    Profile.MaxLOD0Triangles = 35000;
+    Profile.bHandleCollision = true;
+    return Profile;
+  }
+  if (HasAssetTag(Tags, TEXT("Grass"))) {
+    Profile.SubtypeFolder = TEXT("Grass");
+    Profile.MaxLOD0Triangles = 10000;
+    Profile.bHandleCollision = true;
+    return Profile;
+  }
+  if (HasAssetTag(Tags, TEXT("MicroFoliage"))) {
+    Profile.SubtypeFolder = TEXT("Micro");
+    Profile.MaxLOD0Triangles = 500;
+    Profile.bHandleCollision = true;
+    Profile.bNanite = false;
+    Profile.TextureMaxSize = 1024;
+    Profile.bAllowVirtualTexture = false;
+    return Profile;
+  }
+  if (HasAssetTag(Tags, TEXT("HeroFoliage"))) {
+    Profile.SubtypeFolder = TEXT("HeroFoliage");
+    Profile.MaxLOD0Triangles = 200000;
+    Profile.bHandleCollision = true;
+    Profile.bTrunkCollision = true;
+    Profile.TextureMaxSize = 4096;
+    return Profile;
+  }
+  // 未识别的植被不做子类分档，也不改写 Nanite / 碰撞设置。
+  Profile.MaxLOD0Triangles = 0;
+  return Profile;
+}
+
 // 命名模板只对原始资产为 FBX 的 3D Plants 生效（st9 保持原有命名）。
 // 口径与软件侧 buildExportModelPlan 一致：模型文件存在且全部为 .fbx。
 static bool AssetHasFbxPlantModels(const TSharedPtr<FJsonObject> &AssetObject) {
@@ -445,6 +501,43 @@ static bool ApplyNaniteTriangleBudget(UStaticMesh *StaticMesh,
   return true;
 }
 
+// 3D Plants 面数规范（md §5.2）：Tree 100k / Bush 35k / Grass 10k /
+// HeroFoliage 200k / Micro 0.5k。超出时用 Nanite 保留百分比压到规范内。
+static bool ApplyPlantNaniteTriangleBudget(UStaticMesh *StaticMesh,
+                                           int32 TriangleBudget,
+                                           FString &OutSummary) {
+  OutSummary.Reset();
+  if (!StaticMesh || TriangleBudget <= 0) {
+    return false;
+  }
+  const FMeshDescription *SourceMesh = StaticMesh->GetMeshDescription(0);
+  if (!SourceMesh) {
+    return false;
+  }
+  const int32 SourceTriangles = SourceMesh->Triangles().Num();
+  if (SourceTriangles <= 0) {
+    return false;
+  }
+  const float MaxDimensionCm = GetSourceMeshMaxDimensionCm(*SourceMesh);
+  const float KeepPercent =
+      SourceTriangles <= TriangleBudget
+          ? 1.0f
+          : FMath::Clamp(static_cast<float>(TriangleBudget) /
+                             static_cast<float>(SourceTriangles),
+                         0.0f, 1.0f);
+  if (FMath::IsNearlyEqual(GetMutableNaniteSettings(StaticMesh)->KeepPercentTriangles,
+                           KeepPercent, 0.0001f)) {
+    return false;
+  }
+  GetMutableNaniteSettings(StaticMesh)->KeepPercentTriangles = KeepPercent;
+  OutSummary = FString::Printf(
+      TEXT("%s %.2f m plant source, %d triangles, plant budget %d, Nanite keep %.4f"),
+      *StaticMesh->GetName(), MaxDimensionCm / 100.0f, SourceTriangles,
+      TriangleBudget, KeepPercent);
+  UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
+  return true;
+}
+
 static bool FbxHasSmoothingGroupLayer(const FString &SourceFile) {
   TArray<uint8> FileData;
   if (!FFileHelper::LoadFileToArray(FileData, *SourceFile)) {
@@ -573,6 +666,185 @@ static void Configure3DAssetCollision(UStaticMesh *StaticMesh) {
       constexpr int32 TemporaryHullPrecision = 1000000;
       Subsystem->SetConvexDecompositionCollisions(StaticMesh, 1, 16, TemporaryHullPrecision);
       BodySetup = StaticMesh->GetBodySetup();
+    }
+  }
+  if (BodySetup) {
+    BodySetup->DefaultInstance.SetCollisionProfileName(
+        UCollisionProfile::BlockAll_ProfileName);
+    BodySetup->MarkPackageDirty();
+  }
+  FinalizeImportedAsset(StaticMesh);
+}
+
+// 3D Plants 碰撞（md §5.2）：Tree / HeroFoliage 只做树干碰撞——已有碰撞原样保留，
+// 缺失时按树干材质槽位（识别不到槽位时退化为高度下段 30%）生成临时凸包；
+// Bush / Grass / Micro 不参与碰撞。
+static bool IsPlantTrunkSlotToken(const FString &SlotName) {
+  const FString Lower = SlotName.ToLower();
+  static const TCHAR *const Tokens[] = {TEXT("trunk"), TEXT("bark"),
+                                        TEXT("stem"),  TEXT("log"),
+                                        TEXT("wood"),  TEXT("branch")};
+  for (const TCHAR *Token : Tokens) {
+    if (Lower.Contains(Token)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void CollectPlantCollisionPoints(const UStaticMesh &StaticMesh,
+                                        const FMeshDescription &MeshDescription,
+                                        TSet<FVector> &OutPoints,
+                                        bool &bOutUsedTrunkSlots) {
+  const FStaticMeshConstAttributes Attributes(MeshDescription);
+  const TVertexAttributesConstRef<FVector3f> VertexPositions =
+      Attributes.GetVertexPositions();
+  const TPolygonGroupAttributesConstRef<FName> PolygonGroupSlotNames =
+      Attributes.GetPolygonGroupMaterialSlotNames();
+  const TArray<FStaticMaterial> &Slots = StaticMesh.GetStaticMaterials();
+
+  bool bHasTrunkSlot = false;
+  for (const FStaticMaterial &Slot : Slots) {
+    if (IsPlantTrunkSlotToken(Slot.MaterialSlotName.ToString()) ||
+        IsPlantTrunkSlotToken(Slot.ImportedMaterialSlotName.ToString())) {
+      bHasTrunkSlot = true;
+      break;
+    }
+  }
+
+  TSet<FIntVector> SeenPoints;
+  TArray<FVector> AllPoints;
+  TArray<FVertexInstanceID, TInlineAllocator<8>> PolygonVertexInstances;
+  bool bGatheredTrunkPoints = false;
+  auto AddPoint = [&OutPoints, &SeenPoints](const FVector &Position) {
+    const FIntVector Key(FMath::RoundToInt(Position.X * 10.0),
+                         FMath::RoundToInt(Position.Y * 10.0),
+                         FMath::RoundToInt(Position.Z * 10.0));
+    bool bAlreadySeen = false;
+    SeenPoints.Add(Key, &bAlreadySeen);
+    if (!bAlreadySeen) {
+      OutPoints.Add(Position);
+    }
+  };
+  for (const FPolygonID PolygonID : MeshDescription.Polygons().GetElementIDs()) {
+    const FPolygonGroupID PolygonGroupID =
+        MeshDescription.GetPolygonPolygonGroup(PolygonID);
+    FString SlotName = PolygonGroupSlotNames[PolygonGroupID].ToString();
+    if (SlotName.IsEmpty() && Slots.IsValidIndex(PolygonGroupID.GetValue())) {
+      const FStaticMaterial &Slot = Slots[PolygonGroupID.GetValue()];
+      SlotName = Slot.MaterialSlotName.IsNone()
+                     ? Slot.ImportedMaterialSlotName.ToString()
+                     : Slot.MaterialSlotName.ToString();
+    }
+    const bool bTrunkPolygon = bHasTrunkSlot && IsPlantTrunkSlotToken(SlotName);
+    PolygonVertexInstances.Reset();
+    MeshDescription.GetPolygonVertexInstances(PolygonID,
+                                              PolygonVertexInstances);
+    for (const FVertexInstanceID VertexInstanceID : PolygonVertexInstances) {
+      const FVertexID VertexID =
+          MeshDescription.GetVertexInstanceVertex(VertexInstanceID);
+      const FVector Position(VertexPositions[VertexID]);
+      if (bTrunkPolygon && !bGatheredTrunkPoints) {
+        bGatheredTrunkPoints = true;
+      }
+      if (bTrunkPolygon) {
+        AddPoint(Position);
+      } else if (!bHasTrunkSlot) {
+        // 槽位识别失败时才需要收集全网格顶点用于高度下段退化。
+        AllPoints.Add(Position);
+      }
+    }
+  }
+  if (bGatheredTrunkPoints) {
+    bOutUsedTrunkSlots = true;
+    return;
+  }
+  // 没有可识别的树干槽位：退化为“高度下段 30%”，保证仍有临时碰撞。
+  OutPoints.Reset();
+  SeenPoints.Reset();
+  if (AllPoints.Num() == 0) {
+    return;
+  }
+  double MinZ = AllPoints[0].Z;
+  double MaxZ = AllPoints[0].Z;
+  for (const FVector &Point : AllPoints) {
+    MinZ = FMath::Min(MinZ, Point.Z);
+    MaxZ = FMath::Max(MaxZ, Point.Z);
+  }
+  const double SliceHeight = MinZ + (MaxZ - MinZ) * 0.3;
+  for (const FVector &Point : AllPoints) {
+    if (Point.Z <= SliceHeight) {
+      AddPoint(Point);
+    }
+  }
+}
+
+static bool BuildPlantTrunkConvexElement(const UStaticMesh &StaticMesh,
+                                         const FMeshDescription &MeshDescription,
+                                         FKConvexElem &OutElem,
+                                         FString &OutSummary) {
+  TSet<FVector> Points;
+  bool bUsedTrunkSlots = false;
+  CollectPlantCollisionPoints(StaticMesh, MeshDescription, Points,
+                              bUsedTrunkSlots);
+  if (Points.Num() < 4) {
+    return false;
+  }
+  OutElem.VertexData = Points.Array();
+  OutElem.UpdateElemBox();
+  OutSummary = FString::Printf(
+      TEXT("%s trunk collision from %d vertices (%s)"),
+      *StaticMesh.GetName(), OutElem.VertexData.Num(),
+      bUsedTrunkSlots ? TEXT("trunk material slots") : TEXT("lower 30% slice"));
+  UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
+  return true;
+}
+
+static void ConfigurePlantAssetCollision(UStaticMesh *StaticMesh,
+                                         const FPlantAssetProfile &Profile) {
+  if (!StaticMesh || !Profile.bHandleCollision) {
+    return;
+  }
+  UBodySetup *BodySetup = StaticMesh->GetBodySetup();
+  const bool bHasCollision =
+      BodySetup && BodySetup->AggGeom.GetElementCount() > 0;
+  if (!Profile.bTrunkCollision) {
+    // Bush / Grass / Micro：植被不参与碰撞。
+    if (bHasCollision) {
+      if (UStaticMeshEditorSubsystem *Subsystem =
+              GEditor ? GEditor->GetEditorSubsystem<UStaticMeshEditorSubsystem>()
+                      : nullptr) {
+        Subsystem->RemoveCollisions(StaticMesh);
+      } else if (BodySetup) {
+        BodySetup->RemoveSimpleCollision();
+      }
+      BodySetup = StaticMesh->GetBodySetup();
+    }
+    if (BodySetup) {
+      BodySetup->DefaultInstance.SetCollisionProfileName(
+          UCollisionProfile::NoCollision_ProfileName);
+      BodySetup->MarkPackageDirty();
+    }
+    FinalizeImportedAsset(StaticMesh);
+    return;
+  }
+  // Tree / HeroFoliage：已有碰撞原样保留，缺失时补一个临时树干凸包。
+  if (!bHasCollision) {
+    const FMeshDescription *SourceMesh = StaticMesh->GetMeshDescription(0);
+    if (BodySetup && SourceMesh) {
+      FKConvexElem TrunkElem;
+      FString TrunkSummary;
+      if (BuildPlantTrunkConvexElement(*StaticMesh, *SourceMesh, TrunkElem,
+                                       TrunkSummary)) {
+        BodySetup->AggGeom.ConvexElems.Add(MoveTemp(TrunkElem));
+        BodySetup->InvalidatePhysicsData();
+        BodySetup->CreatePhysicsMeshes();
+        BodySetup = StaticMesh->GetBodySetup();
+      } else {
+        UE_LOG(LogTemp, Warning,
+               TEXT("AssetHive import: %s 未找到可用的树干几何，跳过临时碰撞生成"),
+               *StaticMesh->GetName());
+      }
     }
   }
   if (BodySetup) {
@@ -1412,7 +1684,8 @@ static UTexture2D *CreatePackedORMTexture(
 
 static UTexture2D *CreatePackedPlantAlbedoTexture(
     const FString &AssetFolder, const FString &AssetName,
-    UTexture2D *AlbedoSourceTexture, UTexture2D *OpacitySourceTexture) {
+    UTexture2D *AlbedoSourceTexture, UTexture2D *OpacitySourceTexture,
+    const FPlantAssetProfile &Profile, bool bUseVT) {
   FTexturePixels AlbedoPixels;
   FTexturePixels OpacityPixels;
   const bool HasAlbedo = ReadTexturePixels(AlbedoSourceTexture, AlbedoPixels);
@@ -1466,10 +1739,13 @@ static UTexture2D *CreatePackedPlantAlbedoTexture(
     }
   }
   PackedTexture->Source.UnlockMip(0);
+  // Albedo 载有 Opacity 的 alpha 通道：sRGB / Default(保留 alpha) / Lossy Low。
+  ApplyPlantTextureSizePreset(PackedTexture, Profile, bUseVT);
   PackedTexture->CompressionSettings = TC_Default;
   PackedTexture->SRGB = true;
-  PackedTexture->MipGenSettings = TMGS_Sharpen7;
   PackedTexture->CompressionNoAlpha = false;
+  PackedTexture->LODGroup = TEXTUREGROUP_World;
+  PackedTexture->LossyCompressionAmount = TLCA_Low;
   PackedTexture->PostEditChange();
   PackedTexture->MarkPackageDirty();
   ForceTextureDataReady(PackedTexture);
@@ -1482,7 +1758,8 @@ static UTexture2D *
 CreatePackedNRSTexture(const FString &AssetFolder, const FString &AssetName,
                        UTexture2D *NormalTexture, UTexture2D *RoughnessTexture,
                        UTexture2D *TranslucencyTexture, UTexture2D *SizeRefA,
-                       UTexture2D *SizeRefB) {
+                       UTexture2D *SizeRefB,
+                       const FPlantAssetProfile &Profile, bool bUseVT) {
   FTexturePixels NormalPixels;
   FTexturePixels RoughnessPixels;
   FTexturePixels TranslucencyPixels;
@@ -1557,9 +1834,13 @@ CreatePackedNRSTexture(const FString &AssetFolder, const FString &AssetName,
     }
   }
   PackedTexture->Source.UnlockMip(0);
+  // NRS 打包（N/R/T 四通道）保持 Mask(no sRGB)，压缩损失按法线口径取 Low。
+  ApplyPlantTextureSizePreset(PackedTexture, Profile, bUseVT);
   PackedTexture->CompressionSettings = TC_Masks;
   PackedTexture->SRGB = false;
   PackedTexture->CompressionNoAlpha = false;
+  PackedTexture->LODGroup = TEXTUREGROUP_World;
+  PackedTexture->LossyCompressionAmount = TLCA_Low;
   PackedTexture->PostEditChange();
   PackedTexture->MarkPackageDirty();
   ForceTextureDataReady(PackedTexture);
@@ -2170,6 +2451,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       AssetId = TEXT("UnknownId");
     }
     FEnvironmentAssetProfile EnvironmentProfile;
+    FPlantAssetProfile PlantProfile;
     TArray<FString> AssetStandardTags;
     if (bIs3DAsset || AssetType == TEXT("3dplant")) {
       CollectAssetTags(AssetObject, AssetStandardTags);
@@ -2177,6 +2459,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     if (bIs3DAsset) {
       EnvironmentProfile = ResolveEnvironmentAssetProfile(AssetStandardTags);
       CategoryFolder = EnvironmentProfile.FolderName;
+    } else if (AssetType == TEXT("3dplant")) {
+      // 3D Plants（md §5.2）：按标准 Asset Tag 落到 Vegetation/<子类>/。
+      PlantProfile = ResolvePlantAssetProfile(AssetStandardTags);
+      CategoryFolder = PlantProfile.SubtypeFolder;
     }
     // Third party scans follow the Dressing triangle budget even when their
     // tags route them into another asset folder.
@@ -2188,6 +2474,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
          EnvironmentProfile.TypeKey == TEXT("PBRMAX"));
     FString AssetDestinationPath =
         bIs3DAsset ? TEXT("/Game/Environment/Asset") : DestinationPath;
+    if (AssetType == TEXT("3dplant")) {
+      // md §5.2：Content/Environment/Asset/Vegetation/<Tree|Bush|Grass|Micro|HeroFoliage>/
+      AssetDestinationPath = TEXT("/Game/Environment/Asset/Vegetation");
+    }
     FString SurfaceExportRootPath;
     if ((bIsSurface || bIsDecal) && AssetObject->TryGetStringField(TEXT("exportRootPath"),
                                                      SurfaceExportRootPath) &&
@@ -2221,7 +2511,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                                                 AssetId)
                    : FString();
     const FString AssetFolder =
-        AssetDestinationPath / SafeCategoryFolder / SafeAssetFolderName;
+        SafeCategoryFolder.IsEmpty()
+            ? AssetDestinationPath / SafeAssetFolderName
+            : AssetDestinationPath / SafeCategoryFolder / SafeAssetFolderName;
     const bool bUsesMaterialFolders = bIsSurface || bIsDecal;
     const FString TextureFolder = bUsesMaterialFolders ? AssetFolder / TEXT("Tex") : AssetFolder;
     const FString MaterialFolder = bUsesMaterialFolders ? AssetFolder / TEXT("MI") : AssetFolder;
@@ -2513,7 +2805,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               FString::Printf(TEXT("导入植物模型: %s"),
                               *FPaths::GetCleanFilename(BaseFile)));
           UStaticMesh *BaseMesh = ImportStaticMeshAsset(
-              AssetToolsModule, BaseFile, AssetFolder, BaseMeshName);
+              AssetToolsModule, BaseFile, AssetFolder, BaseMeshName,
+              PlantProfile.bNanite);
           if (!BaseMesh) {
             continue;
           }
@@ -2608,7 +2901,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           Task->bAutomated = true;
           Task->bAsync = false;
           Task->bSave = false;
-          Task->Options = MakeStaticMeshImportOptions();
+          Task->Options = MakeStaticMeshImportOptions(
+              AssetType == TEXT("3dplant") ? PlantProfile.bNanite : true);
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 8, 0, 99)),
               FString::Printf(TEXT("导入模型: %s"),
@@ -3056,7 +3350,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                   : nullptr;
           UTexture2D *PlantAlbedoTexture = CreatePackedPlantAlbedoTexture(
               AssetFolder, PlantTextureStem, AlbedoSourceTexture,
-              OpacitySourceTexture);
+              OpacitySourceTexture, PlantProfile, bUseVT);
 
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
@@ -3088,7 +3382,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           UTexture2D *NRSTexture = CreatePackedNRSTexture(
               AssetFolder, PlantTextureStem, NormalSourceTexture,
               RoughnessSourceTexture, TranslucencySourceTexture,
-              PlantAlbedoTexture, NormalSourceTexture);
+              PlantAlbedoTexture, NormalSourceTexture, PlantProfile, bUseVT);
           MaterialInstance = CreatePlantMaterialInstance(
               AssetFolder, PlantMaterialStem, PlantAlbedoTexture, NRSTexture,
               MaterialRole, bUseVT);
@@ -3195,7 +3489,34 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         FString TriangleBudgetSummary;
         ApplyNaniteTriangleBudget(StaticMesh, TriangleBudgetSummary);
       }
-      GetMutableNaniteSettings(StaticMesh)->bEnabled = true;
+      if (AssetType == TEXT("3dplant")) {
+        // 3D Plants（md §5.2）：Nanite 按子类开关（Micro 不使用），面数按子类
+        // 规范压到上限内，并保留面积。
+        if (PlantProfile.bNanite && PlantProfile.MaxLOD0Triangles > 0) {
+          FString PlantBudgetSummary;
+          ApplyPlantNaniteTriangleBudget(StaticMesh,
+                                         PlantProfile.MaxLOD0Triangles,
+                                         PlantBudgetSummary);
+        } else if (PlantProfile.MaxLOD0Triangles > 0) {
+          // Micro 不使用 Nanite：面数只能提示，无法靠保留百分比自动收敛。
+          const FMeshDescription *BudgetMesh = StaticMesh->GetMeshDescription(0);
+          const int32 PlantTriangles =
+              BudgetMesh ? BudgetMesh->Triangles().Num() : 0;
+          if (PlantTriangles > PlantProfile.MaxLOD0Triangles) {
+            UE_LOG(LogTemp, Warning,
+                   TEXT("AssetHive import: %s 面数 %d 超出植被规范 %d（Micro 不使用 Nanite，未自动收敛）"),
+                   *StaticMesh->GetName(), PlantTriangles,
+                   PlantProfile.MaxLOD0Triangles);
+          }
+        }
+        FMeshNaniteSettings *NaniteSettings =
+            GetMutableNaniteSettings(StaticMesh);
+        NaniteSettings->bEnabled = PlantProfile.bNanite;
+        NaniteSettings->ShapePreservation =
+            ENaniteShapePreservation::PreserveArea;
+      } else {
+        GetMutableNaniteSettings(StaticMesh)->bEnabled = true;
+      }
       TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
       // Cut _OPAQUE variants use the opaque material set of the same group.
       // The library export flags them on the variant entry instead of the key.
@@ -3235,6 +3556,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       FinalizeImportedAsset(StaticMesh);
       if (bIs3DAsset) {
         Configure3DAssetCollision(StaticMesh);
+      } else if (AssetType == TEXT("3dplant")) {
+        ConfigurePlantAssetCollision(StaticMesh, PlantProfile);
       }
     }
 
@@ -3480,6 +3803,62 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
       {MakeShared<FJsonValueString>(FString(TEXT("D:/Plant/tree_01.st9")))});
   TestFalse(TEXT("st9 plant keeps legacy naming"),
             AssetHasFbxPlantModels(St9PlantObject));
+
+  // 3D Plants 导出档案（md §5.2）：路径 / 面数 / Nanite / 碰撞 / 纹理预设。
+  const FPlantAssetProfile TreeProfile =
+      ResolvePlantAssetProfile({FString(TEXT("Tree"))});
+  TestEqual(TEXT("Plant tree folder"), TreeProfile.SubtypeFolder,
+            FString(TEXT("Tree")));
+  TestEqual(TEXT("Plant tree triangle budget"), TreeProfile.MaxLOD0Triangles,
+            100000);
+  TestTrue(TEXT("Plant tree uses trunk collision"), TreeProfile.bTrunkCollision);
+  TestEqual(TEXT("Plant tree texture size"), TreeProfile.TextureMaxSize, 2048);
+
+  const FPlantAssetProfile BushProfile =
+      ResolvePlantAssetProfile({FString(TEXT("Bush"))});
+  TestEqual(TEXT("Plant bush triangle budget"), BushProfile.MaxLOD0Triangles,
+            35000);
+  TestTrue(TEXT("Plant bush manages collision"), BushProfile.bHandleCollision);
+  TestFalse(TEXT("Plant bush has no trunk collision"),
+            BushProfile.bTrunkCollision);
+
+  const FPlantAssetProfile GrassProfile =
+      ResolvePlantAssetProfile({FString(TEXT("Grass"))});
+  TestEqual(TEXT("Plant grass triangle budget"), GrassProfile.MaxLOD0Triangles,
+            10000);
+
+  const FPlantAssetProfile HeroProfile =
+      ResolvePlantAssetProfile({FString(TEXT("HeroFoliage"))});
+  TestEqual(TEXT("Hero foliage triangle budget"),
+            HeroProfile.MaxLOD0Triangles, 200000);
+  TestTrue(TEXT("Hero foliage uses trunk collision"),
+           HeroProfile.bTrunkCollision);
+  TestEqual(TEXT("Hero foliage texture size"), HeroProfile.TextureMaxSize,
+            4096);
+
+  const FPlantAssetProfile MicroProfile =
+      ResolvePlantAssetProfile({FString(TEXT("MicroFoliage"))});
+  TestEqual(TEXT("Plant micro folder"), MicroProfile.SubtypeFolder,
+            FString(TEXT("Micro")));
+  TestEqual(TEXT("Plant micro triangle budget"), MicroProfile.MaxLOD0Triangles,
+            500);
+  TestFalse(TEXT("Plant micro disables Nanite"), MicroProfile.bNanite);
+  TestEqual(TEXT("Plant micro texture size"), MicroProfile.TextureMaxSize,
+            1024);
+  TestFalse(TEXT("Plant micro disables virtual textures"),
+            MicroProfile.bAllowVirtualTexture);
+
+  const FPlantAssetProfile UnknownProfile =
+      ResolvePlantAssetProfile({FString(TEXT("Kit"))});
+  TestTrue(TEXT("Unknown plant tag keeps folder empty"),
+           UnknownProfile.SubtypeFolder.IsEmpty());
+  TestFalse(TEXT("Unknown plant tag leaves collision untouched"),
+            UnknownProfile.bHandleCollision);
+
+  TestTrue(TEXT("Trunk slot token matches bark"),
+           IsPlantTrunkSlotToken(TEXT("Common_Beech_Bark")));
+  TestFalse(TEXT("Trunk slot token ignores atlas"),
+            IsPlantTrunkSlotToken(TEXT("Common_Beech_Atlas")));
   return true;
 }
 
