@@ -1682,6 +1682,27 @@ static UTexture2D *CreatePackedORMTexture(
   return PackedTexture;
 }
 
+// 3D Plants 纹理预设（md §5.2）：Tree / Bush / Grass 1024-2048、
+// HeroFoliage 1024-4096、Micro 1024 且不使用 VT；VT 分档（>= 2048 开）。
+static void ApplyPlantTextureSizePreset(UTexture2D *Texture,
+                                        const FPlantAssetProfile &Profile,
+                                        bool bUseVT) {
+  if (!Texture) {
+    return;
+  }
+  const int32 ActualMax = FMath::Max(Texture->GetSizeX(), Texture->GetSizeY());
+  int32 DesiredSize =
+      Profile.TextureMaxSize > 0 ? Profile.TextureMaxSize : ActualMax;
+  if (ActualMax > 0) {
+    DesiredSize = FMath::Min(DesiredSize, ActualMax);
+  }
+  Texture->MaxTextureSize = FMath::Clamp(DesiredSize, 256, 8192);
+  Texture->MipGenSettings = TMGS_FromTextureGroup;
+  Texture->VirtualTextureStreaming =
+      bUseVT && Profile.bAllowVirtualTexture &&
+      Texture->MaxTextureSize >= FMath::Max(1024, Profile.TextureVTSize);
+}
+
 static UTexture2D *CreatePackedPlantAlbedoTexture(
     const FString &AssetFolder, const FString &AssetName,
     UTexture2D *AlbedoSourceTexture, UTexture2D *OpacitySourceTexture,
