@@ -2136,7 +2136,7 @@ static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
 }
 
 // SSC（SubsurfaceColor）纹理参数名在不同植被母材质上命名不同：
-// GrassBend（插件默认父材质 M_Env_GrassBend_ST）用 Subsurface_VT，
+// GrassBend（插件默认父材质 M_Env_GrassBend_ST）用 SubsurfaceColor，
 // Tree / Bush / Grass（M_Env_Tree_ST 等）用 SubsurfaceColor_VT。
 // 这里先在父材质链上解析真实存在的纹理参数，避免写入不存在的参数。
 static bool ResolvePlantSubsurfaceParameterName(UMaterialInterface *Material,
@@ -2145,9 +2145,9 @@ static bool ResolvePlantSubsurfaceParameterName(UMaterialInterface *Material,
   if (!Material || ConfiguredName.IsEmpty()) {
     return false;
   }
-  const TCHAR *FallbackNames[] = {TEXT("SubsurfaceColor_VT"),
-                                  TEXT("Subsurface_VT"),
-                                  TEXT("SubsurfaceColor"), TEXT("Subsurface")};
+  const TCHAR *FallbackNames[] = {TEXT("SubsurfaceColor"),
+                                  TEXT("SubsurfaceColor_VT"),
+                                  TEXT("Subsurface_VT"), TEXT("Subsurface")};
   TArray<FString> Candidates;
   Candidates.Add(ConfiguredName);
   for (const TCHAR *FallbackName : FallbackNames) {
@@ -2849,10 +2849,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           }
 
           const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
+          // The cut mesh is also recognised from its own file name
+          // (SM_..._01OPAQUE.fbx) so a missing variant flag cannot turn an
+          // opaque export back into a masked one.
           const bool bOpaqueMeshVariant =
-              bFbxPlantAsset && (IsOpaqueModelVariantKey(VariantKey) ||
-                                 OpaqueModelVariantKeys.Contains(
-                                     NormalizeModelVariantKey(VariantKey)));
+              bFbxPlantAsset &&
+              (IsOpaqueModelVariantKey(VariantKey) ||
+               IsOpaqueModelVariantKey(FPaths::GetBaseFilename(BaseFile)) ||
+               OpaqueModelVariantKeys.Contains(
+                   NormalizeModelVariantKey(VariantKey)));
           const bool bNeedsVariantSuffix =
               bFbxPlantAsset || bHasExplicitModelVariants ||
               VariantKeys.Num() > 1;
@@ -2943,6 +2948,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             const bool bOpaqueMeshVariant =
                 bFbxPlantAsset &&
                 (IsOpaqueModelVariantKey(VariantKey) ||
+                 IsOpaqueModelVariantKey(FPaths::GetBaseFilename(SourceFile)) ||
                  OpaqueModelVariantKeys.Contains(
                      NormalizeModelVariantKey(VariantKey)));
             const bool bNeedsVariantSuffix =

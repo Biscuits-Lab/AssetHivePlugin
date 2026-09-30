@@ -155,7 +155,7 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Use OpacityMasked Switch", ToolTip="Static switch enabled when masked foliage carries an OpacityMasked texture. Default: Use OpacityMasked"))
     FString PlantUseOpacityMaskedSwitch;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SubsurfaceColor Texture Parameter", ToolTip="Texture parameter receiving the Plant SubsurfaceColor (SSC) texture T_..._SSC; the Megascans Translucency (T) map fills this slot. Resolved on the parent material (GrassBend = Subsurface_VT, Tree/Bush/Grass = SubsurfaceColor_VT). Default: Subsurface_VT"))
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SubsurfaceColor Texture Parameter", ToolTip="Texture parameter receiving the Plant SubsurfaceColor (SSC) texture T_..._SSC; the Megascans Translucency (T) map fills this slot. Resolved on the parent material (GrassBend = SubsurfaceColor, Tree/Bush/Grass = SubsurfaceColor_VT). Default: SubsurfaceColor"))
     FString PlantSubsurfaceParameter;
 
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for cut _OPAQUE foliage variants (grass and bush). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT; leaving it empty falls back to the same default."))

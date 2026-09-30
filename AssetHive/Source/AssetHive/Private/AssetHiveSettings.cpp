@@ -53,9 +53,10 @@ UAssetHiveSettings::UAssetHiveSettings()
     PlantNormalParameter = TEXT("Normal_VT");
     PlantORMParameter = TEXT("ORM_VT");
     PlantOpacityMaskedParameter = TEXT("OpacityMasked_VT");
-    // 2026-09-30：Megascans 植被的 Translucency(T) 贴图落到 SSC 槽位，参数名对齐
-    // 项目 GrassBend 母材质（M_Env_GrassBend_ST）的 Subsurface_VT。
-    PlantSubsurfaceParameter = TEXT("Subsurface_VT");
+    // 2026-09-30：Megascans 植被的 Translucency(T) 贴图落到 SSC 槽位；项目 GrassBend
+    // 母材质（M_Env_GrassBend_ST）的 SSC 槽已改名为 SubsurfaceColor，Tree / Bush /
+    // Grass 仍是 SubsurfaceColor_VT，插件解析父材质上实际存在的纹理参数后写入。
+    PlantSubsurfaceParameter = TEXT("SubsurfaceColor");
     PlantUseOpacityMaskedSwitch = TEXT("Use OpacityMasked");
     // 2026-09-30：_OPAQUE 裁切变体（grass & bush）使用 Opaque 版本。
     PlantOpaqueParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT")));
@@ -480,7 +481,7 @@ FString UAssetHiveSettings::GetPlantOpacityMaskedParameter()
 FString UAssetHiveSettings::GetPlantSubsurfaceParameter()
 {
     const FString Value = GetDefault<UAssetHiveSettings>()->PlantSubsurfaceParameter.TrimStartAndEnd();
-    return Value.IsEmpty() ? TEXT("Subsurface_VT") : Value;
+    return Value.IsEmpty() ? TEXT("SubsurfaceColor") : Value;
 }
 
 FString UAssetHiveSettings::GetPlantUseOpacityMaskedSwitch()
