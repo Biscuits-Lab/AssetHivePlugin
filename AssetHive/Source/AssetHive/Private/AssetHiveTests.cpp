@@ -56,6 +56,7 @@ bool FAssetHiveSettingsTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("Plant normal parameter"), UAssetHiveSettings::GetPlantNormalParameter(), FString(TEXT("Normal_VT")));
     TestEqual(TEXT("Plant ORM parameter"), UAssetHiveSettings::GetPlantORMParameter(), FString(TEXT("ORM_VT")));
     TestEqual(TEXT("Plant opacity masked parameter"), UAssetHiveSettings::GetPlantOpacityMaskedParameter(), FString(TEXT("OpacityMasked_VT")));
+    TestEqual(TEXT("Plant subsurface parameter"), UAssetHiveSettings::GetPlantSubsurfaceParameter(), FString(TEXT("Subsurface_VT")));
     TestEqual(TEXT("Plant opacity masked switch"), UAssetHiveSettings::GetPlantUseOpacityMaskedSwitch(), FString(TEXT("Use OpacityMasked")));
 
     UAssetHiveSettings* Defaults = GetMutableDefault<UAssetHiveSettings>();

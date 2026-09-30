@@ -976,6 +976,10 @@ static UFbxImportUI *MakeStaticMeshImportOptions(bool bBuildNanite = true) {
   if (ImportOptions->StaticMeshImportData) {
     ImportOptions->StaticMeshImportData->bGenerateLightmapUVs = false;
     ImportOptions->StaticMeshImportData->bAutoGenerateCollision = false;
+    // Honor the FBX file unit (cm/m). Legacy foliage OPAQUE FBXs were
+    // exported as meters (UnitScaleFactor=100) with a 0.01 root scale; the
+    // cm conversion cancels that scale. cm-native FBX files are unchanged.
+    ImportOptions->StaticMeshImportData->bConvertSceneUnit = true;
     // These meshes are always finalized as Nanite. Set it before the initial
     // FBX build instead of first constructing a full conventional render mesh.
     // Temporary LOD sources skip the build because only their mesh description
@@ -1684,7 +1688,8 @@ static UTexture2D *CreatePackedORMTexture(
 
 // 3D Plants 纹理种类（md §5.2）：Diffuse（D，albedo 代用）/ Normal（N）/
 // ORM / OpacityMasked（O，仅 masked 资产）。
-enum class EPlantTextureKind { Diffuse, Normal, ORM, OpacityMasked };
+enum class EPlantTextureKind { Diffuse, Normal, ORM, OpacityMasked,
+                                SubsurfaceColor };
 
 // 植被纹理预设：Tree / Bush / Grass 1024-2048、HeroFoliage 1024-4096、
 // Micro 1024 且不使用 VT；VT 分档（>= 2048 开）。
@@ -1721,6 +1726,14 @@ static void ApplyPlantTexturePreset(UTexture2D *Texture,
     Texture->CompressionNoAlpha = true;
     Texture->LODGroup = TEXTUREGROUP_WorldNormalMap;
     Texture->LossyCompressionAmount = TLCA_Low;
+    break;
+  case EPlantTextureKind::SubsurfaceColor:
+    // 植被纹理预设（export-3dplants.html）：Emissive / SSC = sRGB + Default(BC1)。
+    Texture->CompressionSettings = TC_Default;
+    Texture->SRGB = true;
+    Texture->CompressionNoAlpha = true;
+    Texture->LODGroup = TEXTUREGROUP_World;
+    Texture->LossyCompressionAmount = TLCA_Medium;
     break;
   case EPlantTextureKind::ORM:
   case EPlantTextureKind::OpacityMasked:
@@ -2122,11 +2135,49 @@ static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
   return MaterialInstance;
 }
 
+// SSC（SubsurfaceColor）纹理参数名在不同植被母材质上命名不同：
+// GrassBend（插件默认父材质 M_Env_GrassBend_ST）用 Subsurface_VT，
+// Tree / Bush / Grass（M_Env_Tree_ST 等）用 SubsurfaceColor_VT。
+// 这里先在父材质链上解析真实存在的纹理参数，避免写入不存在的参数。
+static bool ResolvePlantSubsurfaceParameterName(UMaterialInterface *Material,
+                                                const FString &ConfiguredName,
+                                                FName &OutName) {
+  if (!Material || ConfiguredName.IsEmpty()) {
+    return false;
+  }
+  const TCHAR *FallbackNames[] = {TEXT("SubsurfaceColor_VT"),
+                                  TEXT("Subsurface_VT"),
+                                  TEXT("SubsurfaceColor"), TEXT("Subsurface")};
+  TArray<FString> Candidates;
+  Candidates.Add(ConfiguredName);
+  for (const TCHAR *FallbackName : FallbackNames) {
+    Candidates.Add(FString(FallbackName));
+  }
+  for (UMaterialInterface *Cursor = Material; Cursor;) {
+    TMap<FMaterialParameterInfo, FMaterialParameterMetadata> Parameters;
+    Cursor->GetAllParametersOfType(EMaterialParameterType::Texture, Parameters);
+    for (const FString &Candidate : Candidates) {
+      for (const TPair<FMaterialParameterInfo, FMaterialParameterMetadata>
+               &Parameter : Parameters) {
+        if (Parameter.Key.Name.ToString().Equals(Candidate,
+                                                 ESearchCase::IgnoreCase)) {
+          OutName = Parameter.Key.Name;
+          return true;
+        }
+      }
+    }
+    UMaterialInstance *Instance = Cast<UMaterialInstance>(Cursor);
+    Cursor = Instance ? Instance->Parent : nullptr;
+  }
+  return false;
+}
+
 static UMaterialInstanceConstant *
 CreatePlantMaterialInstance(const FString &AssetFolder,
                             const FString &AssetName, UTexture *DiffuseTexture,
                             UTexture *NormalTexture, UTexture *ORMTexture,
                             UTexture *OpacityMaskTexture,
+                            UTexture *SubsurfaceTexture,
                             const FString &MaterialRole, bool bUseVT,
                             bool bOpaque = false) {
   const bool bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
@@ -2145,7 +2196,8 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     return nullptr;
   }
   for (UTexture *Texture :
-       {DiffuseTexture, NormalTexture, ORMTexture, OpacityMaskTexture}) {
+       {DiffuseTexture, NormalTexture, ORMTexture, OpacityMaskTexture,
+        SubsurfaceTexture}) {
     ForceTextureDataReady(Texture);
   }
 
@@ -2178,12 +2230,17 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
   }
 
   // 植被材质参数（md §5.2）：Diffuse（albedo 代用）/ Normal / ORM /
-  // OpacityMasked（masked 资产），默认名对齐项目 GrassBend 母材质。
+  // OpacityMasked（masked 资产）/ SubsurfaceColor（SSC，Megascans Translucency），
+  // 默认名对齐项目 GrassBend 母材质（M_Env_GrassBend_ST）。
   const FString DiffuseParameter = UAssetHiveSettings::GetPlantDiffuseParameter();
   const FString NormalParameter = UAssetHiveSettings::GetPlantNormalParameter();
   const FString ORMParameter = UAssetHiveSettings::GetPlantORMParameter();
   const FString OpacityMaskedParameter =
       UAssetHiveSettings::GetPlantOpacityMaskedParameter();
+  FName SubsurfaceParameterName;
+  const bool bHasSubsurfaceParameter = ResolvePlantSubsurfaceParameterName(
+      ParentMaterial, UAssetHiveSettings::GetPlantSubsurfaceParameter(),
+      SubsurfaceParameterName);
   if (DiffuseTexture && !DiffuseParameter.IsEmpty()) {
     MaterialInstance->SetTextureParameterValueEditorOnly(
         FMaterialParameterInfo(FName(*DiffuseParameter)), DiffuseTexture);
@@ -2201,6 +2258,19 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     MaterialInstance->SetTextureParameterValueEditorOnly(
         FMaterialParameterInfo(FName(*OpacityMaskedParameter)),
         OpacityMaskTexture);
+  }
+  // SSC 槽位：Megascans 植被的 Translucency（T）贴图；Opaque 裁切变体同样需要。
+  if (SubsurfaceTexture) {
+    if (bHasSubsurfaceParameter) {
+      MaterialInstance->SetTextureParameterValueEditorOnly(
+          FMaterialParameterInfo(SubsurfaceParameterName), SubsurfaceTexture);
+    } else {
+      UE_LOG(LogTemp, Warning,
+             TEXT("AssetHive: %s has no SubsurfaceColor texture parameter ")
+             TEXT("(configured '%s'); SSC texture not assigned."),
+             *ParentPath,
+             *UAssetHiveSettings::GetPlantSubsurfaceParameter());
+    }
   }
   const FString OpacityMaskedSwitch =
       UAssetHiveSettings::GetPlantUseOpacityMaskedSwitch();
@@ -2939,6 +3009,27 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         break;
       }
     }
+    // OPAQUE foliage exports must not carry billboard textures or
+    // MI_Billboard_* instances. New desktop payloads set billboardExcluded
+    // explicitly, so a masked fallback variant cannot re-enable billboard.
+    // Keep the legacy all-opaque heuristic for older payloads.
+    bool bBillboardExcluded = false;
+    AssetObject->TryGetBoolField(TEXT("billboardExcluded"), bBillboardExcluded);
+    bool bAllModelVariantsOpaque = false;
+    if (AssetType == TEXT("3dplant") && VariantKeyByMesh.Num() > 0) {
+      bAllModelVariantsOpaque = true;
+      for (const TPair<UStaticMesh *, FString> &VariantPair : VariantKeyByMesh) {
+        const FString NormalizedVariantKey =
+            NormalizeModelVariantKey(VariantPair.Value);
+        if (!IsOpaqueModelVariantKey(VariantPair.Value) &&
+            !OpaqueModelVariantKeys.Contains(NormalizedVariantKey)) {
+          bAllModelVariantsOpaque = false;
+          break;
+        }
+      }
+    }
+    const bool bSuppressBillboardExport =
+        bBillboardExcluded || bAllModelVariantsOpaque;
     const TArray<TSharedPtr<FJsonValue>> *TextureFiles = nullptr;
     if (AssetObject->TryGetArrayField(TEXT("textureFiles"), TextureFiles) &&
         TextureFiles != nullptr) {
@@ -2957,6 +3048,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             SourceTextureGroupByPath.Contains(SourceKey)
                 ? FMath::Max(1, SourceTextureGroupByPath[SourceKey])
                 : 1;
+        if (bSuppressBillboardExport) {
+          const FString *GroupMaterialRole =
+              SourceTextureMaterialRoleByGroup.Find(GroupId);
+          if (GroupMaterialRole &&
+              GroupMaterialRole->Equals(TEXT("billboard"),
+                                        ESearchCase::IgnoreCase)) {
+            continue;
+          }
+        }
         const TMap<FString, FString> &GroupSlotMap =
             SourceTextureSlotMapByGroup.FindOrAdd(GroupId);
         const FString SlotName = GroupSlotMap.Contains(SourceKey)
@@ -3246,6 +3346,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     for (const int32 GroupId : GroupIds) {
       const FString MaterialRole = SourceTextureMaterialRoleByGroup.FindRef(GroupId).ToLower();
+      if (bSuppressBillboardExport &&
+          MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
+        continue;
+      }
       const TMap<FString, UTexture *> &TextureBySlot =
           TextureBySlotByGroup.FindOrAdd(GroupId);
       const TMap<FString, FString> &SourceTextureBySlot =
@@ -3418,18 +3522,36 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 EPlantTextureKind::OpacityMasked, PlantProfile, bUseVT);
           }
 
+          // SSC（SubsurfaceColor）：Megascans 植被的 Translucency（T）贴图，
+          // 导出 Job 用 subsurfacecolor 槽位传递，旧 Job 保留 translucency 兜底。
+          FString SubsurfaceSourcePath =
+              SourceTextureBySlot.FindRef(TEXT("subsurfacecolor"));
+          if (SubsurfaceSourcePath.IsEmpty()) {
+            SubsurfaceSourcePath =
+                SourceTextureBySlot.FindRef(TEXT("translucency"));
+          }
+          UTexture2D *SubsurfaceTexture = nullptr;
+          if (!SubsurfaceSourcePath.IsEmpty()) {
+            SubsurfaceTexture = CreatePlantTextureAsset(
+                AssetFolder, FString::Printf(TEXT("T_%s_SSC"), *TextureStem),
+                FImageUtils::ImportFileAsTexture2D(SubsurfaceSourcePath),
+                EPlantTextureKind::SubsurfaceColor, PlantProfile, bUseVT);
+          }
+
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 26, 0, 99)),
               FString::Printf(TEXT("创建植被材质实例: %s"), *AssetName), false);
           MaterialInstance = CreatePlantMaterialInstance(
               AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
-              ORMTexture, OpacityMaskTexture, MaterialRole, bUseVT);
+              ORMTexture, OpacityMaskTexture, SubsurfaceTexture, MaterialRole,
+              bUseVT);
           // md §5.2：OPAQUE 裁切变体不创建 billboard 材质实例。
           if (bHasOpaqueModelVariant &&
               !MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
             OpaqueMaterialInstance = CreatePlantMaterialInstance(
                 AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
-                ORMTexture, nullptr, MaterialRole, bUseVT, /*bOpaque=*/true);
+                ORMTexture, nullptr, SubsurfaceTexture, MaterialRole, bUseVT,
+                /*bOpaque=*/true);
           }
         } else {
           SetStageProgress(
@@ -3583,7 +3705,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // section 会重映射回 Atlas 槽位，槽位本身再从网格材质列表里移除。
       TArray<int32> BillboardSlotIndexes;
       int32 AtlasSlotIndex = INDEX_NONE;
-      if (bOpaqueMesh) {
+      if (bOpaqueMesh || bSuppressBillboardExport) {
         for (int32 SlotIndex = 0;
              SlotIndex < Slots.Num() && SlotIndex < GroupIds.Num(); ++SlotIndex) {
           if (IsBillboardGroup(GroupIds[SlotIndex])) {
@@ -3601,7 +3723,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             SourceMaterialGroupIds.IsValidIndex(MaterialIndex)
                 ? SourceMaterialGroupIds[MaterialIndex]
                 : INDEX_NONE;
-        if (bOpaqueMesh && GroupId != INDEX_NONE && IsBillboardGroup(GroupId)) {
+        if ((bOpaqueMesh || bSuppressBillboardExport) &&
+            GroupId != INDEX_NONE && IsBillboardGroup(GroupId)) {
           continue;
         }
         MeshMaterials.Add(SourceMaterials[MaterialIndex]);
@@ -3631,7 +3754,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           Slots[Index].ImportedMaterialSlotName = Candidate;
         }
       }
-      if (bOpaqueMesh && BillboardSlotIndexes.Num() > 0) {
+      if ((bOpaqueMesh || bSuppressBillboardExport) &&
+          BillboardSlotIndexes.Num() > 0) {
         // 引用 billboard 槽位的 section 先回落到 Atlas 槽位，再交给引擎移除尾部
         // 未使用材质槽，保证 OPAQUE 网格材质列表里不再出现 billboard 槽位。
         const int32 BillboardRemapTarget =
