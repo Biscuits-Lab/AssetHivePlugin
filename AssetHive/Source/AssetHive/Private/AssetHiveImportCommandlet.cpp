@@ -163,6 +163,58 @@ static FString BuildPlantObjectStem(const TArray<FString> &Tags,
                       : FString::Printf(TEXT("Env_%s_%s"), *Tag, *Id);
 }
 
+// 命名模板只对原始资产为 FBX 的 3D Plants 生效（st9 保持原有命名）。
+// 口径与软件侧 buildExportModelPlan 一致：模型文件存在且全部为 .fbx。
+static bool AssetHasFbxPlantModels(const TSharedPtr<FJsonObject> &AssetObject) {
+  if (!AssetObject.IsValid()) {
+    return false;
+  }
+  TArray<FString> ModelFiles;
+  const TArray<TSharedPtr<FJsonValue>> *VariantValues = nullptr;
+  if (AssetObject->TryGetArrayField(TEXT("modelVariants"), VariantValues) &&
+      VariantValues) {
+    for (const TSharedPtr<FJsonValue> &Value : *VariantValues) {
+      if (!Value.IsValid() || Value->Type != EJson::Object) {
+        continue;
+      }
+      const TSharedPtr<FJsonObject> VariantObject = Value->AsObject();
+      if (!VariantObject.IsValid()) {
+        continue;
+      }
+      FString SourceFile;
+      if ((VariantObject->TryGetStringField(TEXT("file"), SourceFile) ||
+           VariantObject->TryGetStringField(TEXT("path"), SourceFile) ||
+           VariantObject->TryGetStringField(TEXT("uri"), SourceFile)) &&
+          !SourceFile.IsEmpty()) {
+        ModelFiles.AddUnique(SourceFile);
+      }
+    }
+  }
+  if (ModelFiles.Num() == 0) {
+    const TArray<TSharedPtr<FJsonValue>> *FileValues = nullptr;
+    if (AssetObject->TryGetArrayField(TEXT("modelFiles"), FileValues) &&
+        FileValues) {
+      for (const TSharedPtr<FJsonValue> &Value : *FileValues) {
+        if (Value.IsValid() && Value->Type == EJson::String) {
+          const FString SourceFile = Value->AsString();
+          if (!SourceFile.IsEmpty()) {
+            ModelFiles.AddUnique(SourceFile);
+          }
+        }
+      }
+    }
+  }
+  if (ModelFiles.Num() == 0) {
+    return false;
+  }
+  for (const FString &SourceFile : ModelFiles) {
+    if (FPaths::GetExtension(SourceFile).ToLower() != TEXT("fbx")) {
+      return false;
+    }
+  }
+  return true;
+}
+
 struct FEnvironmentAssetProfile {
   FString TypeKey = TEXT("Objects");
   FString TypePrefix;
@@ -2157,11 +2209,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     const FString AssetStem =
         FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
-    // 3D Plants（2026-09-30 定稿）：资产名不入名，改用 标准 Asset Tag + 资产ID。
+    // 3D Plants（2026-09-30 定稿）：资产名不入名，改用 标准 Asset Tag + 资产ID；
+    // 该命名模板只对原始资产为 FBX 的资产生效（st9 保持原有命名）。
+    const bool bFbxPlantNaming =
+        AssetType == TEXT("3dplant") && AssetHasFbxPlantModels(AssetObject);
     const FString PlantObjectStem =
-        AssetType == TEXT("3dplant")
-            ? BuildPlantObjectStem(AssetStandardTags, SafeAssetId)
-            : FString();
+        bFbxPlantNaming ? BuildPlantObjectStem(AssetStandardTags, SafeAssetId)
+                        : FString();
     const FString EnvironmentStem =
         bIs3DAsset ? BuildEnvironmentObjectStem(EnvironmentProfile, AssetName,
                                                 AssetId)
@@ -2434,19 +2488,21 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             continue;
           }
 
-          const bool bPlantAsset = AssetType == TEXT("3dplant");
+          const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
           const bool bOpaqueMeshVariant =
-              bPlantAsset && (IsOpaqueModelVariantKey(VariantKey) ||
-                              OpaqueModelVariantKeys.Contains(
-                                  NormalizeModelVariantKey(VariantKey)));
+              bFbxPlantAsset && (IsOpaqueModelVariantKey(VariantKey) ||
+                                 OpaqueModelVariantKeys.Contains(
+                                     NormalizeModelVariantKey(VariantKey)));
           const bool bNeedsVariantSuffix =
-              bPlantAsset || bHasExplicitModelVariants || VariantKeys.Num() > 1;
+              bFbxPlantAsset || bHasExplicitModelVariants ||
+              VariantKeys.Num() > 1;
           const FString VariantStem =
               bNeedsVariantSuffix
-                  ? FString::Printf(TEXT("%s_%s"),
-                                    bPlantAsset ? *PlantObjectStem : *AssetStem,
-                                    *VariantKey)
-                  : (bPlantAsset ? PlantObjectStem : AssetStem);
+                  ? FString::Printf(
+                        TEXT("%s_%s"),
+                        bFbxPlantAsset ? *PlantObjectStem : *AssetStem,
+                        *VariantKey)
+                  : (bFbxPlantAsset ? PlantObjectStem : AssetStem);
           const FString BaseMeshName =
               bOpaqueMeshVariant
                   ? FString::Printf(TEXT("SM_%s_OPAQUE"), *VariantStem)
@@ -2522,21 +2578,24 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           } else if (bIsCustomAsset && bIsModelAsset) {
             const FString VariantKey = ResolveModelVariantKey(
                 SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
-            const bool bPlantAsset = AssetType == TEXT("3dplant");
+            const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
             const bool bOpaqueMeshVariant =
-                bPlantAsset &&
+                bFbxPlantAsset &&
                 (IsOpaqueModelVariantKey(VariantKey) ||
                  OpaqueModelVariantKeys.Contains(
                      NormalizeModelVariantKey(VariantKey)));
             const bool bNeedsVariantSuffix =
-                bPlantAsset || bHasExplicitModelVariants || ValidModelCount > 1;
+                bFbxPlantAsset || bHasExplicitModelVariants ||
+                ValidModelCount > 1;
             ModelAssetName =
                 bNeedsVariantSuffix
-                    ? FString::Printf(TEXT("SM_%s_%s"),
-                                      bPlantAsset ? *PlantObjectStem : *AssetStem,
-                                      *VariantKey)
-                    : FString::Printf(TEXT("SM_%s"),
-                                      bPlantAsset ? *PlantObjectStem : *AssetStem);
+                    ? FString::Printf(
+                          TEXT("SM_%s_%s"),
+                          bFbxPlantAsset ? *PlantObjectStem : *AssetStem,
+                          *VariantKey)
+                    : FString::Printf(
+                          TEXT("SM_%s"),
+                          bFbxPlantAsset ? *PlantObjectStem : *AssetStem);
             if (bOpaqueMeshVariant) {
               ModelAssetName += TEXT("_OPAQUE");
             }
@@ -2880,18 +2939,18 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           GroupIds.Num() > 1
               ? FString::Printf(TEXT("%s_%03d"), *AssetStem, GroupId)
               : AssetStem;
-      // 3D Plants 命名（2026-09-30 定稿）：纹理不带变体号、不带分辨率；
-      // 材质实例带主变体号；多变体组沿用 _00N 组号段（与 3D Assets 一致）。
-      const bool bPlantAsset = AssetType == TEXT("3dplant");
+      // 3D Plants 命名（2026-09-30 定稿，仅 FBX 原始资产）：纹理不带变体号、
+      // 不带分辨率；材质实例带主变体号；多变体组沿用 _00N 组号段。
+      const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
       const FString PlantTextureStem =
-          bPlantAsset
+          bFbxPlantAsset
               ? (GroupIds.Num() > 1
                      ? FString::Printf(TEXT("%s_%03d"), *PlantObjectStem,
                                        GroupId)
                      : PlantObjectStem)
               : GroupStem;
       const FString PlantMaterialStem =
-          bPlantAsset
+          bFbxPlantAsset
               ? (GroupIds.Num() > 1
                      ? FString::Printf(TEXT("%s_%03d_%s"), *PlantObjectStem,
                                        GroupId, *PrimaryModelVariantKey)
@@ -3406,6 +3465,21 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                 FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), true,
                 false),
             FString(TEXT("MI_Billboard_Env_Grass_abc123_01")));
+
+  // 命名模板只对 FBX 原始资产生效：st9（SpeedTree）保持原有命名。
+  auto FbxPlantObject = MakeShared<FJsonObject>();
+  FbxPlantObject->SetArrayField(
+      TEXT("modelFiles"),
+      {MakeShared<FJsonValueString>(FString(TEXT("D:/Plant/fern_01.fbx")))});
+  TestTrue(TEXT("FBX plant uses the tag naming template"),
+           AssetHasFbxPlantModels(FbxPlantObject));
+
+  auto St9PlantObject = MakeShared<FJsonObject>();
+  St9PlantObject->SetArrayField(
+      TEXT("modelFiles"),
+      {MakeShared<FJsonValueString>(FString(TEXT("D:/Plant/tree_01.st9")))});
+  TestFalse(TEXT("st9 plant keeps legacy naming"),
+            AssetHasFbxPlantModels(St9PlantObject));
   return true;
 }
 
