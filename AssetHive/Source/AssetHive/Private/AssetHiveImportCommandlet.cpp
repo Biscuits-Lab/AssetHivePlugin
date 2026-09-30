@@ -2139,7 +2139,7 @@ static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
 }
 
 // SSC（SubsurfaceColor）纹理参数名在不同植被母材质上命名不同：
-// GrassBend（插件默认父材质 M_Env_GrassBend_ST）用 SubsurfaceColor，
+// GrassBend Opaque / Masked (MI_Env_GrassBend_ST_VT / MI_Env_GrassBend_Masked_ST_VT) use SubsurfaceColor_VT.
 // Tree / Bush / Grass（M_Env_Tree_ST 等）用 SubsurfaceColor_VT。
 // 这里先在父材质链上解析真实存在的纹理参数，避免写入不存在的参数。
 static bool ResolvePlantSubsurfaceParameterName(UMaterialInterface *Material,
@@ -2148,8 +2148,8 @@ static bool ResolvePlantSubsurfaceParameterName(UMaterialInterface *Material,
   if (!Material || ConfiguredName.IsEmpty()) {
     return false;
   }
-  const TCHAR *FallbackNames[] = {TEXT("SubsurfaceColor"),
-                                  TEXT("SubsurfaceColor_VT"),
+  const TCHAR *FallbackNames[] = {TEXT("SubsurfaceColor_VT"),
+                                  TEXT("SubsurfaceColor"),
                                   TEXT("Subsurface_VT"), TEXT("Subsurface")};
   TArray<FString> Candidates;
   Candidates.Add(ConfiguredName);
