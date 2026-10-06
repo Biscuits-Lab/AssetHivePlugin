@@ -161,6 +161,12 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for cut _OPAQUE foliage variants (grass and bush). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT; leaving it empty falls back to the same default."))
     TSoftObjectPtr<UMaterialInterface> PlantOpaqueParentMaterial;
 
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SpeedTree Grass Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant grass assets that carry synthetic SpeedTree wind data (branch1). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Grass_ST_VT"))
+    TSoftObjectPtr<UMaterialInterface> PlantGrassSTParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SpeedTree Bush Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant bush assets that carry synthetic SpeedTree wind data (branch1 + branch2 remapped to UV3). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Bush_ST_VT"))
+    TSoftObjectPtr<UMaterialInterface> PlantBushSTParentMaterial;
+
     static bool IsValidImportRootPath(const FString& Path);
     static FString GetDefaultImportRootPath();
     static FString GetImportRootPath();
@@ -207,6 +213,12 @@ public:
     static FString GetPlantMaterialName(const FString& AssetName, bool bBillboard, bool bOpaque = false);
     static FString GetPlantOpaqueParentMaterialPath(bool bUseVT);
     static UMaterialInterface* GetPlantOpaqueParentMaterial(bool bUseVT);
+    static FString GetDefaultPlantGrassSTParentMaterialPath();
+    static FString GetDefaultPlantBushSTParentMaterialPath();
+    static FString GetPlantGrassSTParentMaterialPath(bool bUseVT);
+    static FString GetPlantBushSTParentMaterialPath(bool bUseVT);
+    static UMaterialInterface* GetPlantGrassSTParentMaterial(bool bUseVT);
+    static UMaterialInterface* GetPlantBushSTParentMaterial(bool bUseVT);
     static FString GetPlantDiffuseParameter();
     static FString GetPlantNormalParameter();
     static FString GetPlantORMParameter();

@@ -165,6 +165,150 @@ static FString BuildPlantObjectStem(const TArray<FString> &Tags,
 
 // 3D Plants 导出档案（md §5.2，2026-09-30 插件侧定稿）：路径 / 面数 / Nanite /
 // 碰撞 / 纹理预设按标准 Asset Tag 分子类；命名模板仍只对 FBX 原始资产生效。
+// ---------------------------------------------------------------------------
+// 合成 SpeedTree 风（Megascans 3D Plants，2026-10-07）
+//
+// 项目材质 MF_Foliage_Wind_ST 的读取约定（材质侧已确认）：
+//   Branch1：UV1=(PackedPosition, PackedDirection)，UV2.r=Weight（恒定读取）
+//   Branch2：勾选 "Use Remapped UV3" 后读 UV3=(lo, hi)，HLSL 解码：
+//     lo = round(UV.x * 16383); hi = round(UV.y * 16383);
+//     xq = floor(hi / 16); yqHigh = fmod(hi, 16); yqLow = floor(lo / 256); wq = fmod(lo, 256);
+//     yq = yqHigh * 64 + yqLow;
+//     x = XMin + (xq / 1023) * XRange; y = YMin + (yq / 1023) * YRange; w = WMin + (wq / 255) * WRange;
+//   其中 xMin/xMax/yMin/yMax/wMin/wMax 是材质实例标量参数——注意 xMax/yMax/wMax
+//   承载的是 Range（范围）而不是最大值，必须与这里的编码范围保持一致。
+//
+// PackedPosition 按 UnpackInteger3（系数 6/6/7）解码为 (s1/5, q1/5, q0/6)，即归一化
+//   锚点位置 x/y 各 6 档、z 7 档；编码时写回 (q0*36 + q1*6 + s1)/256。
+// PackedDirection 按 UnpackDirection 解码为 normalize(frac(In/(16,1,0.0625))*2-1)，
+//   In∈[0,16) 只有 1 个自由度，编码时枚举档位取最接近目标方向的解。
+// ---------------------------------------------------------------------------
+enum class EPlantSyntheticWind : uint8 {
+  None,
+  // Megascans Grass：只写 branch1（UV1/UV2），branch2 关闭。
+  Branch1,
+  // Megascans Bush：branch1 + branch2 重映射到 UV3（Use Remapped UV3）。
+  Branch1Branch2UV3,
+};
+
+namespace AssetHivePlantWind {
+// 编码范围与材质实例参数一一对应（固定范围，跨资产共享，便于母材质复用）。
+constexpr float PositionMin = 0.0f;
+constexpr float PositionRange = 1.0f;
+constexpr float DirectionMin = 0.0f;
+constexpr float DirectionRange = 16.0f;
+constexpr float WeightMin = 0.0f;
+constexpr float WeightRange = 1.0f;
+
+// UnpackInteger3 系数 6/6/7 → x/y 各 6 档、z 7 档；档位基数为 6。
+constexpr int32 PositionStepsX = 5;
+constexpr int32 PositionStepsY = 5;
+constexpr int32 PositionStepsZ = 6;
+constexpr int32 PositionLevelBase = 6;
+
+// UV3 的分档：位置/方向 10bit，权重 8bit。
+constexpr int32 UV3CodeMax = 1023;
+constexpr int32 UV3WeightCodeMax = 255;
+
+const TCHAR *const SwitchUseRemappedUV3 = TEXT("Use Remapped UV3");
+const TCHAR *const SwitchBranch1Enable = TEXT("Branch1Enable");
+const TCHAR *const SwitchBranch2Enable = TEXT("Branch2Enable");
+const TCHAR *const SwitchHasBranch2Data = TEXT("HasBranch2Data_Internal");
+const TCHAR *const ScalarPositionMin = TEXT("xMin");
+const TCHAR *const ScalarPositionRange = TEXT("xMax");
+const TCHAR *const ScalarDirectionMin = TEXT("yMin");
+const TCHAR *const ScalarDirectionRange = TEXT("yMax");
+const TCHAR *const ScalarWeightMin = TEXT("wMin");
+const TCHAR *const ScalarWeightRange = TEXT("wMax");
+
+// 复刻材质侧 frac()（x - floor(x)）。
+inline float MaterialFrac(float Value) {
+  return Value - FMath::FloorToFloat(Value);
+}
+
+inline FVector3f DecodeDirection(float PackedDirection) {
+  FVector3f Direction(MaterialFrac(PackedDirection / 16.0f) * 2.0f - 1.0f,
+                      MaterialFrac(PackedDirection) * 2.0f - 1.0f,
+                      MaterialFrac(PackedDirection * 16.0f) * 2.0f - 1.0f);
+  if (!Direction.Normalize()) {
+    return FVector3f(0.0f, 0.0f, 1.0f);
+  }
+  return Direction;
+}
+
+// bQuantized=true：只能落在 UV3 的 10bit 档位（branch2）；
+// bQuantized=false：UV1.y 是连续浮点，再细化一次搜索（branch1）。
+inline float PackDirection(const FVector3f &Direction, bool bQuantized) {
+  const FVector3f Target = Direction.GetSafeNormal();
+  if (Target.IsNearlyZero()) {
+    return 0.0f;
+  }
+  int32 BestCode = 0;
+  float BestDot = -1.0f;
+  for (int32 Code = 0; Code <= UV3CodeMax; ++Code) {
+    const float Candidate =
+        DirectionRange * static_cast<float>(Code) / static_cast<float>(UV3CodeMax);
+    const float Dot = FVector3f::DotProduct(DecodeDirection(Candidate), Target);
+    if (Dot > BestDot) {
+      BestDot = Dot;
+      BestCode = Code;
+    }
+  }
+  float Packed =
+      DirectionRange * static_cast<float>(BestCode) / static_cast<float>(UV3CodeMax);
+  if (bQuantized) {
+    return Packed;
+  }
+  const float Step = DirectionRange / static_cast<float>(UV3CodeMax);
+  constexpr int32 RefineSteps = 32;
+  for (int32 Index = -RefineSteps; Index <= RefineSteps; ++Index) {
+    const float Candidate = FMath::Clamp(
+        Packed + Step * static_cast<float>(Index) / RefineSteps, 0.0f,
+        DirectionRange);
+    const float Dot = FVector3f::DotProduct(DecodeDirection(Candidate), Target);
+    if (Dot > BestDot) {
+      BestDot = Dot;
+      Packed = Candidate;
+    }
+  }
+  return Packed;
+}
+
+// 归一化锚点位置 → UnpackInteger3 的打包值（取值 0..251/256）。
+inline float PackPosition(const FVector3f &NormalizedPosition) {
+  const int32 LevelZ = FMath::Clamp(
+      FMath::RoundToInt(NormalizedPosition.Z * static_cast<float>(PositionStepsZ)), 0,
+      PositionStepsZ);
+  const int32 LevelY = FMath::Clamp(
+      FMath::RoundToInt(NormalizedPosition.Y * static_cast<float>(PositionStepsY)), 0,
+      PositionStepsY);
+  const int32 LevelX = FMath::Clamp(
+      FMath::RoundToInt(NormalizedPosition.X * static_cast<float>(PositionStepsX)), 0,
+      PositionStepsX);
+  const int32 Packed = LevelZ * PositionLevelBase * PositionLevelBase +
+                       LevelY * PositionLevelBase + LevelX;
+  return static_cast<float>(Packed) / 256.0f;
+}
+
+inline int32 ToUV3Code(float Value, float Min, float Range, int32 CodeMax) {
+  if (Range <= KINDA_SMALL_NUMBER) {
+    return 0;
+  }
+  const float Normalized = (Value - Min) / Range;
+  return FMath::Clamp(FMath::RoundToInt(Normalized * static_cast<float>(CodeMax)), 0,
+                      CodeMax);
+}
+
+// UV3.x = lo：方向低 6 位在高 8 位、权重在低 8 位；
+// UV3.y = hi：位置 10 位在高 10 位、方向高 4 位在低 4 位。
+inline FVector2f EncodeUV3(int32 PositionCode, int32 DirectionCode, int32 WeightCode) {
+  const int32 Low = (DirectionCode % 64) * 256 + WeightCode;
+  const int32 High = PositionCode * 16 + (DirectionCode / 64);
+  return FVector2f(static_cast<float>(Low) / 16383.0f,
+                   static_cast<float>(High) / 16383.0f);
+}
+} // namespace AssetHivePlantWind
+
 struct FPlantAssetProfile {
   FString SubtypeFolder;  // Vegetation 下的子类目录，未识别时留空
   int32 MaxLOD0Triangles = 0;
@@ -174,10 +318,14 @@ struct FPlantAssetProfile {
   int32 TextureMaxSize = 2048;
   int32 TextureVTSize = 2048;
   bool bAllowVirtualTexture = true;
+  // 合成 SpeedTree 风：仅 Megascans 3D Plants（Grass=branch1；Bush=branch1+branch2→UV3）。
+  EPlantSyntheticWind SyntheticWind = EPlantSyntheticWind::None;
 };
 
 static FPlantAssetProfile ResolvePlantAssetProfile(const TArray<FString> &Tags) {
   FPlantAssetProfile Profile;
+  // 合成风只针对 Megascans 导入的 3D Plants；st9 等原生资产保持不动。
+  const bool bMegascansPlant = HasAssetTag(Tags, TEXT("Megascans"));
   if (HasAssetTag(Tags, TEXT("Tree"))) {
     Profile.SubtypeFolder = TEXT("Tree");
     Profile.MaxLOD0Triangles = 100000;
@@ -189,12 +337,18 @@ static FPlantAssetProfile ResolvePlantAssetProfile(const TArray<FString> &Tags) 
     Profile.SubtypeFolder = TEXT("Bush");
     Profile.MaxLOD0Triangles = 35000;
     Profile.bHandleCollision = true;
+    if (bMegascansPlant) {
+      Profile.SyntheticWind = EPlantSyntheticWind::Branch1Branch2UV3;
+    }
     return Profile;
   }
   if (HasAssetTag(Tags, TEXT("Grass"))) {
     Profile.SubtypeFolder = TEXT("Grass");
     Profile.MaxLOD0Triangles = 10000;
     Profile.bHandleCollision = true;
+    if (bMegascansPlant) {
+      Profile.SyntheticWind = EPlantSyntheticWind::Branch1;
+    }
     return Profile;
   }
   if (HasAssetTag(Tags, TEXT("MicroFoliage"))) {
@@ -648,6 +802,254 @@ static bool ApplyGeneratedSmoothingGroups(UStaticMesh *StaticMesh,
       TEXT("%s: generated smoothing groups for %d LOD(s), %d hard edge(s), angle %.1f deg; Recompute Normals remains disabled"),
       *StaticMesh->GetName(), GeneratedLodCount, GeneratedHardEdgeCount,
       ClampedAngle);
+  UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
+  return true;
+}
+
+// 合成 SpeedTree 风：按连通片（叶片/枝条卡片）写 branch1（UV1/UV2）与 branch2（UV3）数据。
+// 每片：锚点 = 片内最低 25% 顶点质心（归一化到网格包围盒），方向 = 底 25% → 顶 25% 质心的方向，
+// 权重 = 顶点沿方向相对锚点的投影占比（0=根部，1=梢部）。
+// UV3 是 16383 进制编码，必须 32bit UV 精度，因此同时把该 LOD 的 UV 精度设为全精度。
+static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBranch2,
+                                        FString &OutSummary) {
+  OutSummary.Reset();
+  if (!StaticMesh || StaticMesh->GetNumSourceModels() == 0) {
+    return false;
+  }
+
+  struct FPlantWindIsland {
+    FVector3f BasePosition = FVector3f::ZeroVector;
+    FVector3f Direction = FVector3f(0.0f, 0.0f, 1.0f);
+    float PackedPosition = 0.0f;
+    float PackedDirection = 0.0f;
+    int32 PositionCode = 0;
+    int32 DirectionCode = 0;
+    float MaxProjection = 1.0f;
+  };
+  struct FPlantWindIslandAccumulator {
+    int32 Count = 0;
+    float MinZ = TNumericLimits<float>::Max();
+    float MaxZ = -TNumericLimits<float>::Max();
+    FVector3f Min = FVector3f(TNumericLimits<float>::Max());
+    FVector3f Max = FVector3f(-TNumericLimits<float>::Max());
+    FVector3d Sum = FVector3d::ZeroVector;
+    FVector3d LowSum = FVector3d::ZeroVector;
+    int32 LowCount = 0;
+    FVector3d HighSum = FVector3d::ZeroVector;
+    int32 HighCount = 0;
+    float MaxProjection = 0.0f;
+  };
+
+  const int32 RequiredChannels = bWriteBranch2 ? 4 : 3;
+  int32 ProcessedLods = 0;
+  int32 TotalIslands = 0;
+  int32 TotalVertices = 0;
+
+  for (int32 LodIndex = 0; LodIndex < StaticMesh->GetNumSourceModels(); ++LodIndex) {
+    FMeshDescription *Mesh = StaticMesh->GetMeshDescription(LodIndex);
+    if (!Mesh || Mesh->Triangles().Num() == 0) {
+      continue;
+    }
+    FStaticMeshAttributes Attributes(*Mesh);
+    Attributes.Register(true);
+    TVertexAttributesRef<FVector3f> Positions = Attributes.GetVertexPositions();
+    TVertexInstanceAttributesRef<FVector2f> UVs = Attributes.GetVertexInstanceUVs();
+    const int32 VertexCount = Mesh->Vertices().Num();
+    if (VertexCount == 0) {
+      continue;
+    }
+
+    // 连通片：共享顶点即同片（并查集 + 路径压缩）。
+    TArray<int32> Parents;
+    Parents.SetNumUninitialized(VertexCount);
+    for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+      Parents[VertexIndex] = VertexIndex;
+    }
+    auto FindRoot = [&Parents](int32 Index) {
+      while (Parents[Index] != Index) {
+        Parents[Index] = Parents[Parents[Index]];
+        Index = Parents[Index];
+      }
+      return Index;
+    };
+    for (const FTriangleID TriangleID : Mesh->Triangles().GetElementIDs()) {
+      const TArrayView<const FVertexID> Corners =
+          Mesh->GetTriangleVertices(TriangleID);
+      if (Corners.Num() < 3) {
+        continue;
+      }
+      const int32 First = Corners[0].GetValue();
+      for (int32 Corner = 1; Corner < 3; ++Corner) {
+        const int32 RootA = FindRoot(First);
+        const int32 RootB = FindRoot(Corners[Corner].GetValue());
+        if (RootA != RootB) {
+          Parents[RootB] = RootA;
+        }
+      }
+    }
+
+    TArray<int32> IslandOfVertex;
+    IslandOfVertex.SetNumUninitialized(VertexCount);
+    TArray<int32> IslandIndexByRoot;
+    IslandIndexByRoot.Init(INDEX_NONE, VertexCount);
+    TArray<FPlantWindIslandAccumulator> Accumulators;
+    FVector3f BoundsMin(TNumericLimits<float>::Max());
+    FVector3f BoundsMax(-TNumericLimits<float>::Max());
+    for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+      const FVector3f Position = Positions[FVertexID(VertexIndex)];
+      const int32 Root = FindRoot(VertexIndex);
+      int32 IslandIndex = IslandIndexByRoot[Root];
+      if (IslandIndex == INDEX_NONE) {
+        IslandIndex = Accumulators.AddDefaulted();
+        IslandIndexByRoot[Root] = IslandIndex;
+      }
+      IslandOfVertex[VertexIndex] = IslandIndex;
+      FPlantWindIslandAccumulator &Accumulator = Accumulators[IslandIndex];
+      Accumulator.Count += 1;
+      Accumulator.MinZ = FMath::Min(Accumulator.MinZ, Position.Z);
+      Accumulator.MaxZ = FMath::Max(Accumulator.MaxZ, Position.Z);
+      for (int32 Axis = 0; Axis < 3; ++Axis) {
+        Accumulator.Min[Axis] = FMath::Min(Accumulator.Min[Axis], Position[Axis]);
+        Accumulator.Max[Axis] = FMath::Max(Accumulator.Max[Axis], Position[Axis]);
+        BoundsMin[Axis] = FMath::Min(BoundsMin[Axis], Position[Axis]);
+        BoundsMax[Axis] = FMath::Max(BoundsMax[Axis], Position[Axis]);
+      }
+      Accumulator.Sum += FVector3d(Position);
+    }
+
+    // 底/顶 25%（按片内 Z 范围）质心。
+    for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+      FPlantWindIslandAccumulator &Accumulator =
+          Accumulators[IslandOfVertex[VertexIndex]];
+      const float HeightRange = Accumulator.MaxZ - Accumulator.MinZ;
+      const FVector3f Position = Positions[FVertexID(VertexIndex)];
+      if (Position.Z <= Accumulator.MinZ + HeightRange * 0.25f) {
+        Accumulator.LowSum += FVector3d(Position);
+        Accumulator.LowCount += 1;
+      }
+      if (Position.Z >= Accumulator.MaxZ - HeightRange * 0.25f) {
+        Accumulator.HighSum += FVector3d(Position);
+        Accumulator.HighCount += 1;
+      }
+    }
+
+    const FVector3f MeshSize = BoundsMax - BoundsMin;
+    const FVector3f SafeMeshSize(FMath::Max(MeshSize.X, KINDA_SMALL_NUMBER),
+                                 FMath::Max(MeshSize.Y, KINDA_SMALL_NUMBER),
+                                 FMath::Max(MeshSize.Z, KINDA_SMALL_NUMBER));
+    TArray<FPlantWindIsland> Islands;
+    Islands.SetNum(Accumulators.Num());
+    for (int32 IslandIndex = 0; IslandIndex < Accumulators.Num(); ++IslandIndex) {
+      const FPlantWindIslandAccumulator &Accumulator = Accumulators[IslandIndex];
+      const FVector3d Center = Accumulator.Count > 0
+                                   ? Accumulator.Sum / Accumulator.Count
+                                   : FVector3d::ZeroVector;
+      FVector3f Base = FVector3f(Center);
+      FVector3f Tip = FVector3f(Center);
+      if (Accumulator.LowCount > 0) {
+        Base = FVector3f(Accumulator.LowSum / Accumulator.LowCount);
+      }
+      if (Accumulator.HighCount > 0) {
+        Tip = FVector3f(Accumulator.HighSum / Accumulator.HighCount);
+      }
+      FPlantWindIsland &Island = Islands[IslandIndex];
+      Island.BasePosition = Base;
+      const float HeightRange = Accumulator.MaxZ - Accumulator.MinZ;
+      const FVector3f Delta = Tip - Base;
+      const float MinDirectionLength =
+          FMath::Max(HeightRange * 0.05f, KINDA_SMALL_NUMBER);
+      if (Delta.SizeSquared() > MinDirectionLength * MinDirectionLength) {
+        Island.Direction = Delta.GetSafeNormal();
+      } else {
+        // 退化片（例如水平卡片）：取该片最长轴作为方向。
+        const FVector3f Extent = Accumulator.Max - Accumulator.Min;
+        int32 Axis = 0;
+        if (Extent.Y > Extent.X) {
+          Axis = 1;
+        }
+        if (Extent.Z > Extent[Axis]) {
+          Axis = 2;
+        }
+        FVector3f Fallback = FVector3f::ZeroVector;
+        Fallback[Axis] = 1.0f;
+        Island.Direction = Fallback;
+      }
+      const FVector3f Normalized(
+          FMath::Clamp((Base.X - BoundsMin.X) / SafeMeshSize.X, 0.0f, 1.0f),
+          FMath::Clamp((Base.Y - BoundsMin.Y) / SafeMeshSize.Y, 0.0f, 1.0f),
+          FMath::Clamp((Base.Z - BoundsMin.Z) / SafeMeshSize.Z, 0.0f, 1.0f));
+      Island.PackedPosition = AssetHivePlantWind::PackPosition(Normalized);
+      Island.PackedDirection =
+          AssetHivePlantWind::PackDirection(Island.Direction, /*bQuantized=*/false);
+      Island.PositionCode = AssetHivePlantWind::ToUV3Code(
+          Island.PackedPosition, AssetHivePlantWind::PositionMin,
+          AssetHivePlantWind::PositionRange, AssetHivePlantWind::UV3CodeMax);
+      if (bWriteBranch2) {
+        // UV3 只能落在 10bit 档位：单独做一次量化最佳拟合。
+        Island.DirectionCode = AssetHivePlantWind::ToUV3Code(
+            AssetHivePlantWind::PackDirection(Island.Direction, /*bQuantized=*/true),
+            AssetHivePlantWind::DirectionMin,
+            AssetHivePlantWind::DirectionRange, AssetHivePlantWind::UV3CodeMax);
+      }
+    }
+
+    // 每片沿方向的最大投影，用于把权重归一化到 0..1。
+    for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+      const int32 IslandIndex = IslandOfVertex[VertexIndex];
+      FPlantWindIslandAccumulator &Accumulator = Accumulators[IslandIndex];
+      const FPlantWindIsland &Island = Islands[IslandIndex];
+      const float Projection = FVector3f::DotProduct(
+          Positions[FVertexID(VertexIndex)] - Island.BasePosition, Island.Direction);
+      Accumulator.MaxProjection = FMath::Max(Accumulator.MaxProjection, Projection);
+    }
+    for (int32 IslandIndex = 0; IslandIndex < Accumulators.Num(); ++IslandIndex) {
+      Islands[IslandIndex].MaxProjection = Accumulators[IslandIndex].MaxProjection;
+    }
+
+    if (UVs.GetNumChannels() < RequiredChannels) {
+      UVs.SetNumChannels(RequiredChannels);
+    }
+    for (const FVertexInstanceID VertexInstanceID :
+         Mesh->VertexInstances().GetElementIDs()) {
+      const FVertexID VertexID = Mesh->GetVertexInstanceVertex(VertexInstanceID);
+      const int32 VertexIndex = VertexID.GetValue();
+      if (!IslandOfVertex.IsValidIndex(VertexIndex)) {
+        continue;
+      }
+      const FPlantWindIsland &Island = Islands[IslandOfVertex[VertexIndex]];
+      const float Projection = FVector3f::DotProduct(
+          Positions[VertexID] - Island.BasePosition, Island.Direction);
+      const float Weight = Island.MaxProjection > KINDA_SMALL_NUMBER
+                               ? FMath::Clamp(Projection / Island.MaxProjection, 0.0f, 1.0f)
+                               : 1.0f;
+      UVs.Set(VertexInstanceID, 1,
+              FVector2f(Island.PackedPosition, Island.PackedDirection));
+      UVs.Set(VertexInstanceID, 2, FVector2f(Weight, 0.0f));
+      if (bWriteBranch2) {
+        const int32 WeightCode = FMath::Clamp(
+            FMath::RoundToInt(Weight * AssetHivePlantWind::UV3WeightCodeMax), 0,
+            AssetHivePlantWind::UV3WeightCodeMax);
+        UVs.Set(VertexInstanceID, 3,
+                AssetHivePlantWind::EncodeUV3(Island.PositionCode,
+                                              Island.DirectionCode, WeightCode));
+      }
+    }
+
+    StaticMesh->GetSourceModel(LodIndex).BuildSettings.bUseFullPrecisionUVs = true;
+    StaticMesh->CommitMeshDescription(LodIndex);
+    ProcessedLods += 1;
+    TotalIslands += Islands.Num();
+    TotalVertices += VertexCount;
+  }
+
+  if (ProcessedLods == 0) {
+    return false;
+  }
+  OutSummary = FString::Printf(
+      TEXT("%s: 合成 SpeedTree 风 (%s) LOD %d 个 / 连通片 %d 个 / 顶点 %d 个"),
+      *StaticMesh->GetName(),
+      bWriteBranch2 ? TEXT("branch1 + branch2->UV3") : TEXT("branch1"), ProcessedLods,
+      TotalIslands, TotalVertices);
   UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
   return true;
 }
@@ -2200,19 +2602,42 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
                             UTexture *OpacityMaskTexture,
                             UTexture *SubsurfaceTexture,
                             const FString &MaterialRole, bool bUseVT,
-                            bool bOpaque = false) {
+                            bool bOpaque = false,
+                            EPlantSyntheticWind SyntheticWind =
+                                EPlantSyntheticWind::None) {
   const bool bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
-  const FString ParentPath =
-      bOpaque ? UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bUseVT)
-              : UAssetHiveSettings::GetPlantParentMaterialPath(bBillboard);
-  UMaterialInterface *ParentMaterial =
-      bOpaque ? UAssetHiveSettings::GetPlantOpaqueParentMaterial(bUseVT)
-              : UAssetHiveSettings::GetPlantParentMaterial(bBillboard, bUseVT);
+  // 合成 SpeedTree 风（仅 Megascans Grass/Bush）：改用带 ST 风的母材质；
+  // billboard 与 OPAQUE 裁切变体保持原有母材质。
+  const EPlantSyntheticWind WindStyle =
+      (bBillboard || bOpaque) ? EPlantSyntheticWind::None : SyntheticWind;
+  const bool bSyntheticWind = WindStyle != EPlantSyntheticWind::None;
+  const bool bSyntheticWindBranch2 =
+      WindStyle == EPlantSyntheticWind::Branch1Branch2UV3;
+  FString ParentPath;
+  UMaterialInterface *ParentMaterial = nullptr;
+  if (bOpaque) {
+    ParentPath = UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bUseVT);
+    ParentMaterial = UAssetHiveSettings::GetPlantOpaqueParentMaterial(bUseVT);
+  } else if (bSyntheticWind) {
+    ParentPath = bSyntheticWindBranch2
+                     ? UAssetHiveSettings::GetPlantBushSTParentMaterialPath(bUseVT)
+                     : UAssetHiveSettings::GetPlantGrassSTParentMaterialPath(bUseVT);
+    ParentMaterial =
+        bSyntheticWindBranch2
+            ? UAssetHiveSettings::GetPlantBushSTParentMaterial(bUseVT)
+            : UAssetHiveSettings::GetPlantGrassSTParentMaterial(bUseVT);
+  } else {
+    ParentPath = UAssetHiveSettings::GetPlantParentMaterialPath(bBillboard);
+    ParentMaterial =
+        UAssetHiveSettings::GetPlantParentMaterial(bBillboard, bUseVT);
+  }
   if (!ParentMaterial) {
     GAssetHiveImportFailed = true;
     UE_LOG(LogTemp, Error, TEXT("AssetHive: missing Plant %s parent material: %s"),
            bOpaque ? TEXT("Opaque")
-                   : (bBillboard ? TEXT("Billboard") : TEXT("Atlas")),
+                   : (bSyntheticWind
+                          ? TEXT("SpeedTree Wind")
+                          : (bBillboard ? TEXT("Billboard") : TEXT("Atlas"))),
            *ParentPath);
     return nullptr;
   }
@@ -2298,6 +2723,34 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
   if (!OpacityMaskedSwitch.IsEmpty()) {
     MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
         FMaterialParameterInfo(FName(*OpacityMaskedSwitch)), bUseOpacityMasked);
+  }
+
+  if (bSyntheticWind) {
+    // 合成 SpeedTree 风参数（Megascans Grass/Bush）：branch1 恒定从 UV1/UV2 读；
+    // branch2 由 UV3 重映射读取（Use Remapped UV3）。母材质里 xMax/yMax/wMax 承载的是
+    // Range（范围）而不是最大值，与 ApplySyntheticSpeedTreeWind 的编码范围一一对应。
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(AssetHivePlantWind::SwitchBranch1Enable)), true);
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(AssetHivePlantWind::SwitchBranch2Enable)),
+        bSyntheticWindBranch2);
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(AssetHivePlantWind::SwitchHasBranch2Data)),
+        bSyntheticWindBranch2);
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(AssetHivePlantWind::SwitchUseRemappedUV3)),
+        bSyntheticWindBranch2);
+    const TPair<const TCHAR *, float> WindScalars[] = {
+        {AssetHivePlantWind::ScalarPositionMin, AssetHivePlantWind::PositionMin},
+        {AssetHivePlantWind::ScalarPositionRange, AssetHivePlantWind::PositionRange},
+        {AssetHivePlantWind::ScalarDirectionMin, AssetHivePlantWind::DirectionMin},
+        {AssetHivePlantWind::ScalarDirectionRange, AssetHivePlantWind::DirectionRange},
+        {AssetHivePlantWind::ScalarWeightMin, AssetHivePlantWind::WeightMin},
+        {AssetHivePlantWind::ScalarWeightRange, AssetHivePlantWind::WeightRange}};
+    for (const TPair<const TCHAR *, float> &WindScalar : WindScalars) {
+      MaterialInstance->SetScalarParameterValueEditorOnly(
+          FMaterialParameterInfo(FName(WindScalar.Key)), WindScalar.Value);
+    }
   }
 
   // Publish the complete parameter set once, after texture compilation.
@@ -3561,11 +4014,17 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 26, 0, 99)),
               FString::Printf(TEXT("创建植被材质实例: %s"), *AssetName), false);
+          // 合成 SpeedTree 风（Megascans 3D Plants）：只有 atlas 角色改用带 ST 风的
+          // 母材质（Grass→MI_Env_Grass_ST，Bush→MI_Env_Bush_ST），billboard 保持原样。
+          const EPlantSyntheticWind PlantWindStyle =
+              MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)
+                  ? EPlantSyntheticWind::None
+                  : PlantProfile.SyntheticWind;
           if (bHasMaskedModelVariant) {
             MaterialInstance = CreatePlantMaterialInstance(
                 AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
                 ORMTexture, OpacityMaskTexture, SubsurfaceTexture, MaterialRole,
-                bUseVT);
+                bUseVT, /*bOpaque=*/false, PlantWindStyle);
           }
           // md §5.2：OPAQUE 裁切变体不创建 billboard 材质实例。
           if (bHasOpaqueModelVariant &&
@@ -3664,6 +4123,19 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           ApplyGeneratedSmoothingGroups(
               StaticMesh, UAssetHiveSettings::GetAsset3DMissingSmoothingAngle(),
               SmoothingSummary);
+        }
+      }
+      // 合成 SpeedTree 风（Megascans 3D Plants）：写 branch1（UV1/UV2）；Bush 额外把
+      // branch2 重映射到 UV3。st9 等原生资产的 Asset Tag 不含 Megascans，不参与。
+      if (AssetType == TEXT("3dplant") &&
+          PlantProfile.SyntheticWind != EPlantSyntheticWind::None) {
+        const bool bWindBranch2 =
+            PlantProfile.SyntheticWind == EPlantSyntheticWind::Branch1Branch2UV3;
+        FString WindSummary;
+        if (!ApplySyntheticSpeedTreeWind(StaticMesh, bWindBranch2, WindSummary)) {
+          UE_LOG(LogTemp, Warning,
+                 TEXT("AssetHive import: %s 合成 SpeedTree 风数据写入失败（无可用 LOD）"),
+                 *StaticMesh->GetName());
         }
       }
       SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 30, 0, 99)),
@@ -4123,6 +4595,60 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
             1024);
   TestFalse(TEXT("Plant micro disables virtual textures"),
             MicroProfile.bAllowVirtualTexture);
+
+  // 合成 SpeedTree 风（Megascans 3D Plants，2026-10-07）：仅 Megascans 生效，
+  // Grass=branch1、Bush=branch1+branch2→UV3，其余资产类型保持不写风数据。
+  TestTrue(TEXT("Megascans grass uses branch1 synthetic wind"),
+           ResolvePlantAssetProfile({FString(TEXT("Megascans")), FString(TEXT("Grass"))})
+                   .SyntheticWind == EPlantSyntheticWind::Branch1);
+  TestTrue(TEXT("Megascans bush uses branch1 + branch2 UV3 wind"),
+           ResolvePlantAssetProfile({FString(TEXT("Megascans")), FString(TEXT("Bush"))})
+                   .SyntheticWind == EPlantSyntheticWind::Branch1Branch2UV3);
+  TestTrue(TEXT("Non-Megascans grass keeps no synthetic wind"),
+           GrassProfile.SyntheticWind == EPlantSyntheticWind::None);
+  TestTrue(TEXT("Non-Megascans bush keeps no synthetic wind"),
+           BushProfile.SyntheticWind == EPlantSyntheticWind::None);
+  TestTrue(TEXT("Megascans tree keeps no synthetic wind"),
+           ResolvePlantAssetProfile({FString(TEXT("Megascans")), FString(TEXT("Tree"))})
+                   .SyntheticWind == EPlantSyntheticWind::None);
+
+  {
+    // UV3 编码必须能被材质侧 HLSL 解码函数还原（10bit 位置 / 10bit 方向 / 8bit 权重）。
+    const float PackedPosition =
+        AssetHivePlantWind::PackPosition(FVector3f(0.4f, 0.7f, 1.0f));
+    const float PackedDirection =
+        AssetHivePlantWind::PackDirection(FVector3f(0.0f, 0.0f, 1.0f), true);
+    const FVector2f Encoded = AssetHivePlantWind::EncodeUV3(
+        AssetHivePlantWind::ToUV3Code(PackedPosition,
+                                      AssetHivePlantWind::PositionMin,
+                                      AssetHivePlantWind::PositionRange,
+                                      AssetHivePlantWind::UV3CodeMax),
+        AssetHivePlantWind::ToUV3Code(PackedDirection,
+                                      AssetHivePlantWind::DirectionMin,
+                                      AssetHivePlantWind::DirectionRange,
+                                      AssetHivePlantWind::UV3CodeMax),
+        AssetHivePlantWind::UV3WeightCodeMax);
+    const int32 Low = FMath::RoundToInt(Encoded.X * 16383.0f);
+    const int32 High = FMath::RoundToInt(Encoded.Y * 16383.0f);
+    const float DecodedPosition =
+        AssetHivePlantWind::PositionMin +
+        (static_cast<float>(High / 16) / 1023.0f) * AssetHivePlantWind::PositionRange;
+    const float DecodedDirection =
+        AssetHivePlantWind::DirectionMin +
+        (static_cast<float>((High % 16) * 64 + Low / 256) / 1023.0f) *
+            AssetHivePlantWind::DirectionRange;
+    const float DecodedWeight =
+        AssetHivePlantWind::WeightMin +
+        (static_cast<float>(Low % 256) / 255.0f) * AssetHivePlantWind::WeightRange;
+    TestTrue(TEXT("UV3 round-trips packed position"),
+             FMath::Abs(DecodedPosition - PackedPosition) < 0.002f);
+    TestTrue(TEXT("UV3 round-trips packed direction"),
+             FMath::Abs(DecodedDirection - PackedDirection) < 0.02f);
+    TestTrue(TEXT("UV3 round-trips weight"), FMath::Abs(DecodedWeight - 1.0f) < 0.001f);
+    TestTrue(TEXT("Packed direction decodes back to up vector"),
+             FVector3f::DotProduct(AssetHivePlantWind::DecodeDirection(DecodedDirection),
+                                   FVector3f(0.0f, 0.0f, 1.0f)) > 0.96f);
+  }
 
   const FPlantAssetProfile UnknownProfile =
       ResolvePlantAssetProfile({FString(TEXT("Kit"))});

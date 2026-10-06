@@ -376,6 +376,18 @@ FString UAssetHiveSettings::GetDefaultPlantBillboardParentMaterialPath()
     return GetDefaultPlantAtlasParentMaterialPath();
 }
 
+FString UAssetHiveSettings::GetDefaultPlantGrassSTParentMaterialPath()
+{
+    // 2026-10-07：Megascans 3D Plants 的 Grass 合成风（branch1）默认母材质。
+    return TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Grass_ST_VT.MI_Env_Grass_ST_VT");
+}
+
+FString UAssetHiveSettings::GetDefaultPlantBushSTParentMaterialPath()
+{
+    // 2026-10-07：Megascans 3D Plants 的 Bush 合成风（branch1 + branch2 UV3 remap）默认母材质。
+    return TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Bush_ST_VT.MI_Env_Bush_ST_VT");
+}
+
 FString UAssetHiveSettings::GetPlantParentMaterialPath(bool bBillboard)
 {
     const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
@@ -431,6 +443,51 @@ FString UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bool bUseVT)
 UMaterialInterface* UAssetHiveSettings::GetPlantOpaqueParentMaterial(bool bUseVT)
 {
     const FString Path = GetPlantOpaqueParentMaterialPath(bUseVT);
+    return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
+}
+
+// 2026-10-07：合成风母材质路径解析（与 GrassBend 系列一致，VT 时补 _VT 后缀）。
+static FString ResolvePlantSTParentMaterialPath(const TSoftObjectPtr<UMaterialInterface>& Configured, const FString& DefaultPath, bool bUseVT)
+{
+    FString Path = Configured.ToSoftObjectPath().ToString().TrimStartAndEnd();
+    if (Path.IsEmpty())
+    {
+        Path = DefaultPath;
+    }
+    if (bUseVT)
+    {
+        FString PackageName;
+        FString ObjectName;
+        if (Path.Split(TEXT("."), &PackageName, &ObjectName, ESearchCase::CaseSensitive, ESearchDir::FromEnd)
+            && !ObjectName.EndsWith(TEXT("_VT"), ESearchCase::CaseSensitive))
+        {
+            Path = FString::Printf(TEXT("%s_VT.%s_VT"), *PackageName, *ObjectName);
+        }
+    }
+    return Path;
+}
+
+FString UAssetHiveSettings::GetPlantGrassSTParentMaterialPath(bool bUseVT)
+{
+    const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
+    return ResolvePlantSTParentMaterialPath(Settings->PlantGrassSTParentMaterial, GetDefaultPlantGrassSTParentMaterialPath(), bUseVT);
+}
+
+FString UAssetHiveSettings::GetPlantBushSTParentMaterialPath(bool bUseVT)
+{
+    const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
+    return ResolvePlantSTParentMaterialPath(Settings->PlantBushSTParentMaterial, GetDefaultPlantBushSTParentMaterialPath(), bUseVT);
+}
+
+UMaterialInterface* UAssetHiveSettings::GetPlantGrassSTParentMaterial(bool bUseVT)
+{
+    const FString Path = GetPlantGrassSTParentMaterialPath(bUseVT);
+    return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
+}
+
+UMaterialInterface* UAssetHiveSettings::GetPlantBushSTParentMaterial(bool bUseVT)
+{
+    const FString Path = GetPlantBushSTParentMaterialPath(bUseVT);
     return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
 }
 
