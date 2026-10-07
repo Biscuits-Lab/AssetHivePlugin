@@ -2606,19 +2606,16 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
                             EPlantSyntheticWind SyntheticWind =
                                 EPlantSyntheticWind::None) {
   const bool bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
-  // 合成 SpeedTree 风（仅 Megascans Grass/Bush）：改用带 ST 风的母材质；
-  // billboard 与 OPAQUE 裁切变体保持原有母材质。
+  // 合成 SpeedTree 风（导入时选择 Grass/Bush）：改用带 ST 风的母材质；OPAQUE 裁切
+  // 变体同样使用 ST 风母材质（Blend=Opaque 覆盖保持不变），仅 billboard 不参与。
   const EPlantSyntheticWind WindStyle =
-      (bBillboard || bOpaque) ? EPlantSyntheticWind::None : SyntheticWind;
+      bBillboard ? EPlantSyntheticWind::None : SyntheticWind;
   const bool bSyntheticWind = WindStyle != EPlantSyntheticWind::None;
   const bool bSyntheticWindBranch2 =
       WindStyle == EPlantSyntheticWind::Branch1Branch2UV3;
   FString ParentPath;
   UMaterialInterface *ParentMaterial = nullptr;
-  if (bOpaque) {
-    ParentPath = UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bUseVT);
-    ParentMaterial = UAssetHiveSettings::GetPlantOpaqueParentMaterial(bUseVT);
-  } else if (bSyntheticWind) {
+  if (bSyntheticWind) {
     ParentPath = bSyntheticWindBranch2
                      ? UAssetHiveSettings::GetPlantBushSTParentMaterialPath(bUseVT)
                      : UAssetHiveSettings::GetPlantGrassSTParentMaterialPath(bUseVT);
@@ -2626,6 +2623,9 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
         bSyntheticWindBranch2
             ? UAssetHiveSettings::GetPlantBushSTParentMaterial(bUseVT)
             : UAssetHiveSettings::GetPlantGrassSTParentMaterial(bUseVT);
+  } else if (bOpaque) {
+    ParentPath = UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bUseVT);
+    ParentMaterial = UAssetHiveSettings::GetPlantOpaqueParentMaterial(bUseVT);
   } else {
     ParentPath = UAssetHiveSettings::GetPlantParentMaterialPath(bBillboard);
     ParentMaterial =
@@ -2634,9 +2634,9 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
   if (!ParentMaterial) {
     GAssetHiveImportFailed = true;
     UE_LOG(LogTemp, Error, TEXT("AssetHive: missing Plant %s parent material: %s"),
-           bOpaque ? TEXT("Opaque")
-                   : (bSyntheticWind
-                          ? TEXT("SpeedTree Wind")
+           bSyntheticWind
+               ? TEXT("SpeedTree Wind")
+               : (bOpaque ? TEXT("Opaque")
                           : (bBillboard ? TEXT("Billboard") : TEXT("Atlas"))),
            *ParentPath);
     return nullptr;
@@ -2955,11 +2955,18 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     } else if (AssetType == TEXT("3dplant")) {
       // 3D Plants（md §5.2）：按标准 Asset Tag 落到 Vegetation/<子类>/。
       PlantProfile = ResolvePlantAssetProfile(AssetStandardTags);
-      // 合成 SpeedTree 风是导入时的可选开关（软件导入对话框勾选，随 job 传入）：
-      // 未勾选（缺省）时不写风动 UV，也不切换到 ST 风母材质。
-      bool bSyntheticWindEnabled = false;
-      AssetObject->TryGetBoolField(TEXT("plantSyntheticWind"), bSyntheticWindEnabled);
-      if (!bSyntheticWindEnabled) {
+      // 合成 SpeedTree 风由导入时选择（grass / bush / 不选），随 job 传入：未选择时
+      // 不写风动 UV、也不切换 ST 风母材质；选择后写入的即导出到引擎的那个网格
+      // （勾选不透明剪切并导出裁切版本时，裁切资产同样处理）。
+      FString SyntheticWindMode;
+      AssetObject->TryGetStringField(TEXT("plantSyntheticWind"), SyntheticWindMode);
+      SyntheticWindMode.TrimStartAndEndInline();
+      SyntheticWindMode = SyntheticWindMode.ToLower();
+      if (SyntheticWindMode == TEXT("grass")) {
+        PlantProfile.SyntheticWind = EPlantSyntheticWind::Branch1;
+      } else if (SyntheticWindMode == TEXT("bush")) {
+        PlantProfile.SyntheticWind = EPlantSyntheticWind::Branch1Branch2UV3;
+      } else {
         PlantProfile.SyntheticWind = EPlantSyntheticWind::None;
       }
       CategoryFolder = PlantProfile.SubtypeFolder;
@@ -4021,8 +4028,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 26, 0, 99)),
               FString::Printf(TEXT("创建植被材质实例: %s"), *AssetName), false);
-          // 合成 SpeedTree 风（Megascans 3D Plants）：只有 atlas 角色改用带 ST 风的
-          // 母材质（Grass→MI_Env_Grass_ST，Bush→MI_Env_Bush_ST），billboard 保持原样。
+          // 合成 SpeedTree 风（导入时选择 Grass/Bush）：atlas 与 OPAQUE 裁切角色改用
+          // 带 ST 风的母材质（Grass→MI_Env_Grass_ST，Bush→MI_Env_Bush_ST；OPAQUE
+          // 保持 Blend=Opaque 覆盖），billboard 保持原样。
           const EPlantSyntheticWind PlantWindStyle =
               MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)
                   ? EPlantSyntheticWind::None
@@ -4036,10 +4044,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           // md §5.2：OPAQUE 裁切变体不创建 billboard 材质实例。
           if (bHasOpaqueModelVariant &&
               !MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
+            // 勾选不透明剪切 + 合成风时，裁切变体的材质同样使用 ST 风母材质
+            // （CreatePlantMaterialInstance 内部保持 Blend=Opaque 覆盖）。
             OpaqueMaterialInstance = CreatePlantMaterialInstance(
                 AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
                 ORMTexture, nullptr, SubsurfaceTexture, MaterialRole, bUseVT,
-                /*bOpaque=*/true);
+                /*bOpaque=*/true, PlantWindStyle);
           }
         } else {
           SetStageProgress(
@@ -4132,8 +4142,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               SmoothingSummary);
         }
       }
-      // 合成 SpeedTree 风（Megascans 3D Plants）：写 branch1（UV1/UV2）；Bush 额外把
-      // branch2 重映射到 UV3。st9 等原生资产的 Asset Tag 不含 Megascans，不参与。
+      // 合成 SpeedTree 风（导入时选择 grass/bush）：写 branch1（UV1/UV2）；Bush 额外
+      // 把 branch2 重映射到 UV3。此处对导出的网格生效——勾选不透明剪切并导出裁切
+      // 版本时，裁切资产同样被写入。
       if (AssetType == TEXT("3dplant") &&
           PlantProfile.SyntheticWind != EPlantSyntheticWind::None) {
         const bool bWindBranch2 =
