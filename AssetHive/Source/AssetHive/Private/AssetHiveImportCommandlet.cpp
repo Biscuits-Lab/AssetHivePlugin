@@ -2955,6 +2955,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     } else if (AssetType == TEXT("3dplant")) {
       // 3D Plants（md §5.2）：按标准 Asset Tag 落到 Vegetation/<子类>/。
       PlantProfile = ResolvePlantAssetProfile(AssetStandardTags);
+      // 合成 SpeedTree 风是导入时的可选开关（软件导入对话框勾选，随 job 传入）：
+      // 未勾选（缺省）时不写风动 UV，也不切换到 ST 风母材质。
+      bool bSyntheticWindEnabled = false;
+      AssetObject->TryGetBoolField(TEXT("plantSyntheticWind"), bSyntheticWindEnabled);
+      if (!bSyntheticWindEnabled) {
+        PlantProfile.SyntheticWind = EPlantSyntheticWind::None;
+      }
       CategoryFolder = PlantProfile.SubtypeFolder;
     }
     // Third party scans follow the Dressing triangle budget even when their
