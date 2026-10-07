@@ -388,6 +388,14 @@ FString UAssetHiveSettings::GetDefaultPlantBushSTParentMaterialPath()
     return TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Bush_ST_VT.MI_Env_Bush_ST_VT");
 }
 
+FString UAssetHiveSettings::GetDefaultPlantFernSTParentMaterialPath()
+{
+    // 2026-10-07：Megascans 3D Plants 的 Fern 合成风（接触连通簇合并，最多 branch1）。
+    // 数据格式与 Grass 一致（UV1/UV2），默认复用 Grass ST 母材质；专用 Fern 材质建立后
+    // 可在 Project Settings 指定，或替换这里的默认值。
+    return GetDefaultPlantGrassSTParentMaterialPath();
+}
+
 FString UAssetHiveSettings::GetPlantParentMaterialPath(bool bBillboard)
 {
     const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
@@ -479,6 +487,12 @@ FString UAssetHiveSettings::GetPlantBushSTParentMaterialPath(bool bUseVT)
     return ResolvePlantSTParentMaterialPath(Settings->PlantBushSTParentMaterial, GetDefaultPlantBushSTParentMaterialPath(), bUseVT);
 }
 
+FString UAssetHiveSettings::GetPlantFernSTParentMaterialPath(bool bUseVT)
+{
+    const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
+    return ResolvePlantSTParentMaterialPath(Settings->PlantFernSTParentMaterial, GetDefaultPlantFernSTParentMaterialPath(), bUseVT);
+}
+
 UMaterialInterface* UAssetHiveSettings::GetPlantGrassSTParentMaterial(bool bUseVT)
 {
     const FString Path = GetPlantGrassSTParentMaterialPath(bUseVT);
@@ -488,6 +502,12 @@ UMaterialInterface* UAssetHiveSettings::GetPlantGrassSTParentMaterial(bool bUseV
 UMaterialInterface* UAssetHiveSettings::GetPlantBushSTParentMaterial(bool bUseVT)
 {
     const FString Path = GetPlantBushSTParentMaterialPath(bUseVT);
+    return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
+}
+
+UMaterialInterface* UAssetHiveSettings::GetPlantFernSTParentMaterial(bool bUseVT)
+{
+    const FString Path = GetPlantFernSTParentMaterialPath(bUseVT);
     return IsValidPlantParentMaterialPath(Path) ? LoadObject<UMaterialInterface>(nullptr, *Path) : nullptr;
 }
 

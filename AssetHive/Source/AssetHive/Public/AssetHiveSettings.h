@@ -167,6 +167,9 @@ public:
     UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SpeedTree Bush Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant bush assets that carry synthetic SpeedTree wind data (branch1 + branch2 remapped to UV3). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Bush_ST_VT"))
     TSoftObjectPtr<UMaterialInterface> PlantBushSTParentMaterial;
 
+    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SpeedTree Fern Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant fern assets that carry synthetic SpeedTree wind data (contact-connected fronds merged, branch1 only). Defaults to the Grass ST parent until a dedicated fern MI is assigned here."))
+    TSoftObjectPtr<UMaterialInterface> PlantFernSTParentMaterial;
+
     static bool IsValidImportRootPath(const FString& Path);
     static FString GetDefaultImportRootPath();
     static FString GetImportRootPath();
@@ -215,10 +218,13 @@ public:
     static UMaterialInterface* GetPlantOpaqueParentMaterial(bool bUseVT);
     static FString GetDefaultPlantGrassSTParentMaterialPath();
     static FString GetDefaultPlantBushSTParentMaterialPath();
+    static FString GetDefaultPlantFernSTParentMaterialPath();
     static FString GetPlantGrassSTParentMaterialPath(bool bUseVT);
     static FString GetPlantBushSTParentMaterialPath(bool bUseVT);
+    static FString GetPlantFernSTParentMaterialPath(bool bUseVT);
     static UMaterialInterface* GetPlantGrassSTParentMaterial(bool bUseVT);
     static UMaterialInterface* GetPlantBushSTParentMaterial(bool bUseVT);
+    static UMaterialInterface* GetPlantFernSTParentMaterial(bool bUseVT);
     static FString GetPlantDiffuseParameter();
     static FString GetPlantNormalParameter();
     static FString GetPlantORMParameter();
