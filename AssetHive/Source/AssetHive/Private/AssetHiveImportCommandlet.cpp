@@ -100,6 +100,41 @@ static FString MakeSafeObjectName(const FString &Name) {
   return SafeName;
 }
 
+// Zion 资产的二级目录会被拼进 Unreal 包路径，因此在插件侧再净化一次：
+// 逐段去掉非法字符、丢弃空段与 "."/".."（防路径穿越），最多 4 段以免超出
+// Windows 路径长度限制。导出侧落盘前已净化，这里作为最后一道防线，
+// 保证即使 job 是手工构造的也不会写出越界路径。
+static FString SanitizeZionSubfolder(const FString &Value) {
+  TArray<FString> Segments;
+  FString Normalized = Value;
+  Normalized.ReplaceInline(TEXT("\\"), TEXT("/"));
+  Normalized.ParseIntoArray(Segments, TEXT("/"), true);
+  TArray<FString> SafeSegments;
+  for (const FString &Segment : Segments) {
+    FString Trimmed = Segment;
+    Trimmed.TrimStartAndEndInline();
+    if (Trimmed.IsEmpty() || Trimmed == TEXT(".") || Trimmed == TEXT("..")) {
+      continue;
+    }
+    FString Token;
+    Token.Reserve(Trimmed.Len());
+    for (const TCHAR Character : Trimmed) {
+      const bool bAllowed = FChar::IsAlnum(Character) || Character == TEXT('_') ||
+                            Character == TEXT('-');
+      if (bAllowed) {
+        Token.AppendChar(Character == TEXT('-') ? TEXT('_') : Character);
+      }
+    }
+    if (!Token.IsEmpty()) {
+      SafeSegments.Add(Token);
+    }
+    if (SafeSegments.Num() >= 4) {
+      break;
+    }
+  }
+  return FString::Join(SafeSegments, TEXT("/"));
+}
+
 static FString NormalizeAssetTagToken(const FString &Value) {
   FString Token = Value;
   Token.TrimStartAndEndInline();
@@ -6282,11 +6317,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     if (bIs3DAsset) {
       EnvironmentProfile = ResolveEnvironmentAssetProfile(AssetStandardTags);
-      // 导出侧的 categoryFolder 承载"目标分类目录"，可能已包含用户选定的二级目录
-      // （Zion 资产为 "Objects/<二级>"）。此时以导出侧为准：若再被
-      // EnvironmentProfile.FolderName（Dressing 资产固定为 "Objects"）覆盖，
-      // 二级目录就会丢失，资产会落到 Objects 根下。
-      // 仅在导出侧未给出分类时才回退到标签推导出的目录名。
+      // 导出侧的 categoryFolder 只承载"基础分类目录"。Zion 资产刻意传空串，
+      // 由这里按 Asset Tag 推导（Dressing/Megascans/PBRMAX → Objects、Kits → Kits、
+      // Props → Props、Destructible → Destructible、MEGA → MEGA），保持这份映射
+      // 只有一处权威定义；非 Zion 资产仍由导出侧给出分类。
+      // 用户选定的二级目录走独立的 zionSubfolder 字段，在下面单独拼接。
       if (CategoryFolder.TrimStartAndEnd().IsEmpty()) {
         CategoryFolder = EnvironmentProfile.FolderName;
       }
@@ -6405,10 +6440,27 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         bIs3DAsset ? BuildEnvironmentObjectStem(EnvironmentProfile, AssetName,
                                                 AssetId, SafeAssetFolderName)
                    : FString();
+    // Zion 资产的二级目录：基础分类目录之后、资产文件夹之前的那一层。
+    // 导出侧只负责给出用户填写的原始值，基础分类目录由本文件按 Asset Tag 推导
+    // （见 ResolveEnvironmentAssetProfile），保持这份映射只有一处权威定义。
+    // 空值表示不加这一层，资产文件夹直接落在基础分类目录下。
+    FString ZionSubfolder;
+    if (bIsZionAsset) {
+      FString RawZionSubfolder;
+      if (AssetObject->TryGetStringField(TEXT("zionSubfolder"), RawZionSubfolder)) {
+        ZionSubfolder = SanitizeZionSubfolder(RawZionSubfolder);
+      }
+    }
+    FString ZionCategoryFolder = SafeCategoryFolder;
+    if (bIsZionAsset && !ZionSubfolder.IsEmpty()) {
+      ZionCategoryFolder = ZionCategoryFolder.IsEmpty()
+                               ? ZionSubfolder
+                               : ZionCategoryFolder / ZionSubfolder;
+    }
     const FString AssetFolder =
-        SafeCategoryFolder.IsEmpty()
+        ZionCategoryFolder.IsEmpty()
             ? AssetDestinationPath / SafeAssetFolderName
-            : AssetDestinationPath / SafeCategoryFolder / SafeAssetFolderName;
+            : AssetDestinationPath / ZionCategoryFolder / SafeAssetFolderName;
     const bool bUsesMaterialFolders = bIsSurface || bIsDecal;
     // 植被（3dplant）：材质实例 / 纹理 / 静态网格体分目录存放，FoliageType 留在资产文件夹根。
     const bool bUsesFoliageFolders = AssetType == TEXT("3dplant");
