@@ -186,6 +186,19 @@ static FString BuildPlantObjectStem(const TArray<FString> &Tags,
 //   锚点位置 x/y 各 6 档、z 7 档；编码时写回 (q0*36 + q1*6 + s1)/256。
 // PackedDirection 按 UnpackDirection 解码为 normalize(frac(In/(16,1,0.0625))*2-1)，
 //   In∈[0,16) 只有 1 个自由度，编码时枚举档位取最接近目标方向的解。
+// SpeedTree 语义（SpeedTreeCommon.ush）：UV1.y 同时是摆动方向（UnpackNormalFromFloat(fOffset)
+//   → vWindVector）与振荡相位（Oscillate 的 fOffset）。实测 ThickGrassTall 每片叶的 f 散布在
+//   6.43..9.62（相位差最多 3.2 弧度），对应解码方向相对生长方向约 ±15°。草叶生长方向几乎一致，
+//   若直接编码生长方向，整簇相位相同 -> 同步摆动（“太整体”）。Grass 因此对每片叶的编码值加
+//   确定性扰动（JitterGrassWindDirection），Fern/Bush 保持原样。
+// UV1/UV2 逐叶对齐 SpeedTree（2026-10-08）：
+//   UV1 = (PackedPosition, PackedDirection)  —— PackedPosition 取叶片顶部（ST9 实测），
+//     PackedDirection 取逐叶生长方向 + 相位扰动；
+//   UV2 = (Branch1Weight, RippleWeight)      —— Weight 取整簇高度归一化（ST9 实测线性），
+//     RippleWeight（UV2.g）按风单元锚点散列到 ST 实测幅度区间 0.60~0.90。
+//   母材质 MF_SpeedTreeWind_cUSTOM 用 CoordinateIndex=2 的 G 通道缩放 ripple 项，
+//   权重恒 0 时整丛只剩 shared/branch1 运动，视觉上就是“叶片粘住”。Grass 的相位锚点取单叶，
+//   Fern/Bush 取叶片簇（同簇叶轴与子叶共享相位，避免接缝分离）。
 // ---------------------------------------------------------------------------
 enum class EPlantSyntheticWind : uint8 {
   None,
@@ -227,6 +240,27 @@ const TCHAR *const ScalarDirectionMin = TEXT("yMin");
 const TCHAR *const ScalarDirectionRange = TEXT("yMax");
 const TCHAR *const ScalarWeightMin = TEXT("wMin");
 const TCHAR *const ScalarWeightRange = TEXT("wMax");
+// UV2.g = RippleWeight。SpeedTree 原生把 ripple 权重写在 UV2.g
+// （Engine 侧 SpeedTreeImportFactory.cpp:3069 -> UV2 = (BranchWind1.z, RippleWeight)）；
+// 本项目母材质 MF_SpeedTreeWind_cUSTOM 用 CoordinateIndex=2 的 G 通道缩放 ripple 项
+// （Multiply_19 / Multiply_7）。权重恒 0 时整丛只剩 shared/branch1 运动，叶片就会"粘住"。
+const TCHAR *const SwitchRippleEnable = TEXT("RippleEnable");
+// 基础风力标量：由材质实例直接写入，不再依赖母材质默认值与 TA 手填；
+// 与项目 GrassBend / MF_SpeedTreeWind_cUSTOM 的参数名逐字对应。
+const TCHAR *const ScalarBranch1Bend = TEXT("Branch1Bend");
+const TCHAR *const ScalarBranch1Oscillation = TEXT("Branch1Oscillation");
+const TCHAR *const ScalarBranch1StretchLimit = TEXT("Branch1StretchLimit");
+const TCHAR *const ScalarSharedBend = TEXT("SharedBend");
+const TCHAR *const ScalarSharedOscillation = TEXT("SharedOscillation");
+constexpr float DefaultBranch1Bend = 2.0f;
+constexpr float DefaultBranch1Oscillation = 20.0f;
+constexpr float DefaultBranch1StretchLimit = 0.5f;
+constexpr float DefaultSharedBend = 10.0f;
+constexpr float DefaultSharedOscillation = 35.0f;
+// 合成 ripple 幅度区间：对齐 SpeedTree 实测（ThickGrassTall 每片叶 0.54~0.86、均值 0.73；
+// Grass3/3_001 短草 0.24~0.50），取草类高段并按锚点散列拉开每片叶的幅度。
+constexpr float GrassRippleWeightMin = 0.60f;
+constexpr float GrassRippleWeightMax = 0.90f;
 
 // 复刻材质侧 frac()（x - floor(x)）。
 inline float MaterialFrac(float Value) {
@@ -279,6 +313,101 @@ inline float PackDirection(const FVector3f &Direction, bool bQuantized) {
     }
   }
   return Packed;
+}
+
+// 锚点位置 → 32bit 哈希（FNV-1a）。位置量化到 0.01cm，保证同一资产重复导入得到同一相位，
+// 裁切网格也能用卡片锚点取回与未裁切网格一致的相位。
+// 接触带混合后的方向打包：从原打包值出发做「由粗到细」的局部爬山搜索，
+// 避免 PackDirection 全码表扫描（1024+65 次解码）在逐顶点调用时的开销。
+inline float PackDirectionNear(const FVector3f &Direction, float Hint) {
+  const FVector3f Target = Direction.GetSafeNormal();
+  if (Target.IsNearlyZero()) {
+    return Hint;
+  }
+  int32 CenterCode = FMath::Clamp(
+      FMath::RoundToInt(Hint / DirectionRange * static_cast<float>(UV3CodeMax)), 0,
+      UV3CodeMax);
+  float Best = DirectionRange * static_cast<float>(CenterCode) /
+               static_cast<float>(UV3CodeMax);
+  float BestDot = FVector3f::DotProduct(DecodeDirection(Best), Target);
+  static const int32 SearchSteps[] = {64, 16, 4, 1};
+  for (const int32 Step : SearchSteps) {
+    for (int32 Iteration = 0; Iteration < 8; ++Iteration) {
+      int32 NextCode = CenterCode;
+      for (const int32 DirectionSign : {-1, 1}) {
+        const int32 Code =
+            FMath::Clamp(CenterCode + DirectionSign * Step, 0, UV3CodeMax);
+        if (Code == CenterCode) {
+          continue;
+        }
+        const float Candidate = DirectionRange * static_cast<float>(Code) /
+                                static_cast<float>(UV3CodeMax);
+        const float Dot =
+            FVector3f::DotProduct(DecodeDirection(Candidate), Target);
+        if (Dot > BestDot) {
+          BestDot = Dot;
+          NextCode = Code;
+        }
+      }
+      if (NextCode == CenterCode) {
+        break;
+      }
+      CenterCode = NextCode;
+      Best = DirectionRange * static_cast<float>(CenterCode) /
+             static_cast<float>(UV3CodeMax);
+    }
+  }
+  return Best;
+}
+
+inline uint32 HashPlantWindAnchor(const FVector3f &Anchor) {
+  const uint32 Values[3] = {
+      static_cast<uint32>(FMath::RoundToInt(Anchor.X * 100.0f)),
+      static_cast<uint32>(FMath::RoundToInt(Anchor.Y * 100.0f)),
+      static_cast<uint32>(FMath::RoundToInt(Anchor.Z * 100.0f))};
+  uint32 Hash = 2166136261u;
+  for (const uint32 Value : Values) {
+    for (int32 Shift = 0; Shift < 32; Shift += 8) {
+      Hash = (Hash ^ ((Value >> Shift) & 0xFFu)) * 16777619u;
+    }
+  }
+  return Hash;
+}
+
+inline float HashToUnitFloat(uint32 Hash) {
+  return static_cast<float>(Hash & 0x00FFFFFFu) /
+         static_cast<float>(0x01000000u);
+}
+
+// UV2.g（RippleWeight）合成值：按风单元锚点确定性散列，落在 SpeedTree 实测区间，
+// 使同一片草丛里每片叶的 ripple 幅度不同（SpeedTree 是逐叶烘焙的 per-frond 值）。
+inline float PackGrassRippleWeight(const FVector3f &Anchor) {
+  return FMath::Lerp(GrassRippleWeightMin, GrassRippleWeightMax,
+                     HashToUnitFloat(HashPlantWindAnchor(Anchor) ^ 0x9E3779B9u));
+}
+
+// Grass 叶片相位抖动：SpeedTree 的 UV1.y 同时决定摆动方向与振荡相位，草叶生长方向一致时
+// 必须靠它错开，否则整簇同步摆动。在生长方向的正交平面内取确定性随机偏移（倾角 <=18°），
+// 复现实测 ThickGrassTall 每片叶 f 值 6.43..9.62 的散布；方向仍以生长方向为主，不会乱弯。
+inline FVector3f JitterGrassWindDirection(const FVector3f &Anchor,
+                                          const FVector3f &Direction) {
+  const FVector3f Axis = Direction.GetSafeNormal();
+  if (Axis.IsNearlyZero()) {
+    return Direction;
+  }
+  const uint32 Hash = HashPlantWindAnchor(Anchor);
+  FVector3f Side = FVector3f::ZeroVector;
+  FVector3f Up = FVector3f::ZeroVector;
+  Axis.FindBestAxisVectors(Side, Up);
+  // 正交平面内两个独立分量：复现 SpeedTree x/y 各自成档的散布，比单一旋转角覆盖更多相位档位。
+  constexpr float GrassWindJitterScale = 0.22f;
+  const float OffsetX =
+      (HashToUnitFloat(Hash) * 2.0f - 1.0f) * GrassWindJitterScale;
+  const float OffsetY =
+      (HashToUnitFloat(Hash * 2654435761u) * 2.0f - 1.0f) * GrassWindJitterScale;
+  const FVector3f Offset = Side * OffsetX + Up * OffsetY;
+  const FVector3f Jittered = (Axis + Offset).GetSafeNormal();
+  return Jittered.IsNearlyZero() ? Direction : Jittered;
 }
 
 // 归一化锚点位置 → UnpackInteger3 的打包值（取值 0..251/256）。
@@ -380,6 +509,8 @@ inline int32 WeldCoincidentVertices(int32 VertexCount, TGetPosition &&GetPositio
 struct FPlantWindCard {
   FVector3f BasePosition = FVector3f::ZeroVector;
   FVector3f Direction = FVector3f(0.0f, 0.0f, 1.0f);
+  // UV1.x（PackedPosition）用：SpeedTree 实测编码的是叶片“顶部”位置，不是基部。
+  FVector3f WindPosition = FVector3f::ZeroVector;
   float MaxProjection = 1.0f;
 };
 
@@ -739,6 +870,220 @@ struct FPlantWindCardSurface {
     }
   }
 };
+
+// 风单元（连通片 / 卡片）成对键：高 32 位为较小索引，低 32 位为较大索引。
+inline uint64 PlantWindUnitPairKey(int32 A, int32 B) {
+  const uint32 Low = static_cast<uint32>(A < B ? A : B);
+  const uint32 High = static_cast<uint32>(A < B ? B : A);
+  return (static_cast<uint64>(Low) << 32) | static_cast<uint64>(High);
+}
+
+// 两轴夹角（度）：按 |dot| 取角（反平行视为 0），与原型 angleDeg 同口径。
+inline float PlantWindAngleDegrees(const FVector3f &A, const FVector3f &B) {
+  const FVector3f NormalizedA = A.GetSafeNormal();
+  const FVector3f NormalizedB = B.GetSafeNormal();
+  if (NormalizedA.IsNearlyZero() || NormalizedB.IsNearlyZero()) {
+    return 0.0f;
+  }
+  const float Dot = FMath::Clamp(FMath::Abs(FVector3f::DotProduct(NormalizedA, NormalizedB)), 0.0f, 1.0f);
+  return FMath::RadiansToDegrees(FMath::Acos(Dot));
+}
+
+// 结构接缝顶点对（attach / axial / 被容量判据拒绝的边）：低权重区直接对插，消除茎秆-子叶分离。
+struct FPlantWindStructuralSeam {
+  int32 VertexA = INDEX_NONE;
+  int32 VertexB = INDEX_NONE;
+  float BlendWeight = 0.0f;
+};
+
+// F5 结构接缝焊接（与原型 fern-rule2.cjs 的 weldSeams 同口径）：
+//   1) 两遍扫描（增量网格 + 就地更新）：顶点与贴合半径内、属于其它风单元的已完成顶点做加权平均，
+//      同一接缝两侧在第二遍后收敛到同一方向/权重/ripple；非结构接触只在两侧原始权重都 <= 0.7 时
+//      参与（叶尖保护），结构接缝不受该门控。
+//   2) 结构顶点对（合并边/被拒边/attach/axial）在低权重区（两侧原始权重 <= 0.6）直接对插。
+// 返回：被改动的顶点数。
+static int32 BlendPlantWindSeams(int32 VertexCount,
+                                 const TArray<FVector3f> &Positions,
+                                 const TArray<int32> &UnitOfVertex,
+                                 const TArray<int32> *ClusterOfUnit,
+                                 const TSet<uint64> &StructuralUnitPairs,
+                                 const TArray<FPlantWindStructuralSeam> &StructuralSeams,
+                                 float ContactDistance,
+                                 TArray<FVector3f> &Direction,
+                                 TArray<float> &Weight,
+                                 TArray<float> &Ripple,
+                                 TArray<uint8> &OutBlended,
+                                 float NonStructuralTipWeightLimit = 0.7f,
+                                 bool bBlendExplicitSeams = true) {
+  OutBlended.Init(0, VertexCount);
+  if (VertexCount <= 0 || ContactDistance <= 0.0f ||
+      Positions.Num() < VertexCount || UnitOfVertex.Num() < VertexCount ||
+      Direction.Num() < VertexCount || Weight.Num() < VertexCount ||
+      Ripple.Num() < VertexCount) {
+    return 0;
+  }
+  constexpr float StructuralSeamWeightLimit = 0.6f;
+  const TArray<float> OriginalWeight = Weight;
+  const float Cell = FMath::Max(ContactDistance, 1e-3f);
+  const float RadiusSquared = ContactDistance * ContactDistance;
+  const bool bHasClusterMap = ClusterOfUnit != nullptr && ClusterOfUnit->Num() >= UnitOfVertex.Num();
+  auto ClusterIndexOfUnit = [&UnitOfVertex, ClusterOfUnit, bHasClusterMap](int32 VertexIndex) -> int32 {
+    const int32 UnitIndex = UnitOfVertex[VertexIndex];
+    if (UnitIndex == INDEX_NONE) {
+      return INDEX_NONE;
+    }
+    if (bHasClusterMap && ClusterOfUnit->IsValidIndex(UnitIndex)) {
+      return (*ClusterOfUnit)[UnitIndex];
+    }
+    return UnitIndex;
+  };
+  for (int32 Pass = 0; Pass < 2; ++Pass) {
+    TMap<FIntVector, TArray<int32>> Grid;
+    Grid.Reserve(VertexCount);
+    for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+      const FVector3f Position = Positions[VertexIndex];
+      const FIntVector Key(FMath::FloorToInt(Position.X / Cell),
+                           FMath::FloorToInt(Position.Y / Cell),
+                           FMath::FloorToInt(Position.Z / Cell));
+      const int32 UnitIndex = UnitOfVertex[VertexIndex];
+      const int32 ClusterIndex = ClusterIndexOfUnit(VertexIndex);
+      float SumWeight = 1.0f;
+      FVector3f SumDirection = Direction[VertexIndex];
+      float SumRipple = Ripple[VertexIndex];
+      float SumUnitWeight = Weight[VertexIndex];
+      int32 NeighborCount = 0;
+      if (UnitIndex != INDEX_NONE) {
+        for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX) {
+          for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY) {
+            for (int32 OffsetZ = -1; OffsetZ <= 1; ++OffsetZ) {
+              const TArray<int32> *Bucket = Grid.Find(Key + FIntVector(OffsetX, OffsetY, OffsetZ));
+              if (!Bucket) {
+                continue;
+              }
+              for (const int32 OtherVertex : *Bucket) {
+                const int32 OtherUnit = UnitOfVertex[OtherVertex];
+                if (OtherUnit == INDEX_NONE || OtherUnit == UnitIndex) {
+                  continue;
+                }
+                if (ClusterIndexOfUnit(OtherVertex) == ClusterIndex) {
+                  continue;
+                }
+                const float DistanceSquared = FVector3f::DistSquared(Position, Positions[OtherVertex]);
+                if (DistanceSquared > RadiusSquared) {
+                  continue;
+                }
+                const bool bStructural =
+                    StructuralUnitPairs.Contains(PlantWindUnitPairKey(UnitIndex, OtherUnit));
+                if (!bStructural &&
+                    FMath::Max(OriginalWeight[VertexIndex], OriginalWeight[OtherVertex]) >
+                        NonStructuralTipWeightLimit) {
+                  continue;
+                }
+                const float NeighborWeight = 1.0f - FMath::Sqrt(DistanceSquared) / ContactDistance;
+                FVector3f OtherDirection = Direction[OtherVertex];
+                if (FVector3f::DotProduct(OtherDirection, Direction[VertexIndex]) < 0.0f) {
+                  OtherDirection = -OtherDirection;
+                }
+                SumWeight += NeighborWeight;
+                SumDirection += OtherDirection * NeighborWeight;
+                SumRipple += Ripple[OtherVertex] * NeighborWeight;
+                SumUnitWeight += Weight[OtherVertex] * NeighborWeight;
+                NeighborCount += 1;
+              }
+            }
+          }
+        }
+      }
+      if (NeighborCount > 0) {
+        const FVector3f AveragedDirection = SumDirection.GetSafeNormal();
+        if (!AveragedDirection.IsNearlyZero()) {
+          Direction[VertexIndex] = AveragedDirection;
+        }
+        Ripple[VertexIndex] = SumRipple / SumWeight;
+        Weight[VertexIndex] = SumUnitWeight / SumWeight;
+        OutBlended[VertexIndex] = 1;
+      }
+      Grid.FindOrAdd(Key).Add(VertexIndex);
+    }
+  }
+  for (const FPlantWindStructuralSeam &Seam : StructuralSeams) {
+    if (!bBlendExplicitSeams) {
+      break;
+    }
+    if (!Direction.IsValidIndex(Seam.VertexA) || !Direction.IsValidIndex(Seam.VertexB) ||
+        Seam.VertexA == Seam.VertexB) {
+      continue;
+    }
+    if (UnitOfVertex[Seam.VertexA] == UnitOfVertex[Seam.VertexB]) {
+      continue;
+    }
+    if (ClusterIndexOfUnit(Seam.VertexA) == ClusterIndexOfUnit(Seam.VertexB)) {
+      continue;
+    }
+    if (FMath::Max(OriginalWeight[Seam.VertexA], OriginalWeight[Seam.VertexB]) >
+        StructuralSeamWeightLimit) {
+      continue;
+    }
+    const float BlendWeight = FMath::Clamp(Seam.BlendWeight, 0.0f, 1.0f);
+    FVector3f DirectionA = Direction[Seam.VertexA];
+    FVector3f DirectionB = Direction[Seam.VertexB];
+    if (FVector3f::DotProduct(DirectionA, DirectionB) < 0.0f) {
+      DirectionB = -DirectionB;
+    }
+    Direction[Seam.VertexA] = (DirectionA * (1.0f - BlendWeight) + DirectionB * BlendWeight).GetSafeNormal();
+    Direction[Seam.VertexB] = (DirectionB * (1.0f - BlendWeight) + DirectionA * BlendWeight).GetSafeNormal();
+    const float WeightA = Weight[Seam.VertexA];
+    const float WeightB = Weight[Seam.VertexB];
+    Weight[Seam.VertexA] = WeightA * (1.0f - BlendWeight) + WeightB * BlendWeight;
+    Weight[Seam.VertexB] = WeightB * (1.0f - BlendWeight) + WeightA * BlendWeight;
+    const float RippleA = Ripple[Seam.VertexA];
+    const float RippleB = Ripple[Seam.VertexB];
+    Ripple[Seam.VertexA] = RippleA * (1.0f - BlendWeight) + RippleB * BlendWeight;
+    Ripple[Seam.VertexB] = RippleB * (1.0f - BlendWeight) + RippleA * BlendWeight;
+    OutBlended[Seam.VertexA] = 1;
+    OutBlended[Seam.VertexB] = 1;
+  }
+  int32 BlendedCount = 0;
+  for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+    BlendedCount += OutBlended[VertexIndex] != 0 ? 1 : 0;
+  }
+  return BlendedCount;
+}
+
+// 卡片刚性场下的接缝处理：**不做跨卡平均**（2026-10-10 定稿）。
+//
+// 卡片映射（UV0 反查 + 一致性分组）已把每个碎片固定到唯一一张卡片，取该卡片的锚点/方向/沿轴
+// 权重场。这张场本身是空间连续的：方向逐卡常量，权重 = 顶点在卡片轴上的投影比例，**同一张卡
+// 相邻顶点的权重差实测仅 0.006**；跨卡的相邻碎片方向也基本一致（实测跨接缝 |Δ位移| 0.002~0.024）。
+//
+// 上一版在这里对贴合的跨卡顶点对做窄带加权平均，但平均的对象是一组**不在同一梯度上的量**：
+// 不同卡片的权重场彼此独立、方向编码又存在量化误差，平均结果与带外未被改写的卡片值无法拼接，
+// 于是在等化带边缘造出 0.35~0.4 的权重跳变与 20°~40° 的方向跳变，位移差被放大到 0.44~0.93
+// （换算成 Branch1Bend=2 时是 0.9~1.9cm 的可见裂口）——这正是"蕨类茎秆与叶片分离、Cotton
+// 整株蠕虫状扭曲"的直接来源。离线回归（Lady_Fern_h9ecnwd_03/11/14、Desert_Cotton_l9uj50a_01/05）
+// 显示：去掉该等化后跨接缝最大位移差降到 0.010~0.024，且不受资产与卡片数量影响。
+//
+// 因此本函数保留为占位（调用点仍记录日志），不再改动任何属性。
+static int32 EqualizePlantWindCardSeams(int32 VertexCount,
+                                        const TArray<FVector3f> &Positions,
+                                        const TArray<int32> &UnitOfVertex,
+                                        float Radius,
+                                        TArray<FVector3f> &Direction,
+                                        TArray<float> &Weight,
+                                        TArray<float> &Ripple,
+                                        TArray<uint8> &OutWelded) {
+  // 参数保持原签名，便于需要时恢复等化实现；当前一律不使用。
+  (void)Positions;
+  (void)UnitOfVertex;
+  (void)Radius;
+  (void)Direction;
+  (void)Weight;
+  (void)Ripple;
+  // 保持与原实现一致的输出形状（逐顶点 0），调用方仍按 VertexCount 索引。
+  OutWelded.Init(0, FMath::Max(VertexCount, 0));
+  return 0;
+}
+
 } // namespace AssetHivePlantWind
 
 struct FPlantAssetProfile {
@@ -1248,6 +1593,8 @@ static bool ApplyGeneratedSmoothingGroups(UStaticMesh *StaticMesh,
 struct FPlantWindIslandParameters {
   TArray<int32> IslandOfVertex;
   TArray<FVector3f> BasePosition;
+  // 顶部 25% 质心：SpeedTree 的 UV1.x（PackedPosition）编码的是叶片顶端位置。
+  TArray<FVector3f> TipPosition;
   TArray<FVector3f> Direction;
   TArray<float> MaxProjection;
   FVector3f MeshMin = FVector3f(TNumericLimits<float>::Max());
@@ -1374,6 +1721,7 @@ static bool ComputePlantWindIslands(FMeshDescription &Mesh,
 
   const int32 IslandCount = Accumulators.Num();
   Out.BasePosition.SetNum(IslandCount);
+  Out.TipPosition.SetNum(IslandCount);
   Out.Direction.SetNum(IslandCount);
   Out.MaxProjection.Init(0.0f, IslandCount);
   for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
@@ -1410,6 +1758,9 @@ static bool ComputePlantWindIslands(FMeshDescription &Mesh,
       Out.Direction[IslandIndex] = Fallback;
     }
     Out.BasePosition[IslandIndex] = Base;
+    // SpeedTree UV1.x 实测：ThickGrass* / Grass3 三个资产的平均误差，顶部质心 8~12cm
+    // （≈一个量化格距），基部质心 36~51cm。因此 UV1.x 用顶部位置而非基部。
+    Out.TipPosition[IslandIndex] = Tip;
   }
 
   // 每片沿方向的最大投影，用于把权重归一化到 0..1。
@@ -1444,6 +1795,7 @@ enum class EPlantWindFrondMergeMode : uint8 {
 struct FPlantWindFrondParameters {
   TArray<int32> FrondOfIsland;
   TArray<FVector3f> BasePosition;
+  TArray<FVector3f> TipPosition;
   TArray<FVector3f> Direction;
   TArray<float> MaxProjection;
   int32 ConsolidatedFrondCount = 0;
@@ -1452,10 +1804,904 @@ struct FPlantWindFrondParameters {
   int32 Num() const { return BasePosition.Num(); }
 };
 
+// Fern 结构化风推导（F1-F4 + 回退判据）
+struct FPlantWindFernStructure {
+  TArray<FVector3f> Axis;
+  TArray<float> Length;
+  TArray<FVector3f> Base;
+  TArray<FVector3f> Tip;
+  TArray<float> Width;
+  TArray<float> Planarity;
+  TArray<float> MaxProjection;
+  TArray<uint8> Rachis;
+  TArray<int32> ClusterOfIsland;
+  TArray<FVector3f> ClusterBase;
+  TArray<FVector3f> ClusterDirection;
+  TArray<FVector3f> ClusterWindPosition;
+  TArray<float> ClusterMaxProjection;
+  TSet<uint64> StructuralIslandPairs;
+  TSet<uint64> StructuralClusterPairs;
+  TArray<AssetHivePlantWind::FPlantWindStructuralSeam> StructuralSeams;
+  float JoinDistance = 0.0f;
+  float ContactDistance = 0.0f;
+  float AttachDistance = 0.0f;
+  float SpanLimit = 0.0f;
+  int32 RachisCount = 0;
+  int32 ClusterCount = 0;
+  int32 CandidatePairCount = 0;
+  int32 MergedPairCount = 0;
+  // 邻近合并（贴合且同向的连通片并入同一风单元）统计，见 ComputePlantWindFernStructure 内注释。
+  int32 ProximityMerges = 0;
+  int32 ProximityRejectedBySpan = 0;
+  int32 ProximityRejectedByRachis = 0;
+  int32 RejectedBySpan = 0;
+  int32 RejectedByRachisCapacity = 0;
+  int32 RejectedParallelRachis = 0;
+  int32 LargestClusterIslands = 0;
+  float LargestClusterShare = 0.0f;
+  bool bFallbackPerIsland = false;
+};
+
+template <typename TGetPosition>
+static bool ComputePlantWindFernStructure(int32 VertexCount,
+                                          TGetPosition &&GetPosition,
+                                          const FPlantWindIslandParameters &Islands,
+                                          FPlantWindFernStructure &Out) {
+  Out = FPlantWindFernStructure();
+  const int32 IslandCount = Islands.Num();
+  if (VertexCount <= 0 || IslandCount <= 0 || Islands.IslandOfVertex.Num() < VertexCount) {
+    return false;
+  }
+  const FVector3f MeshSize = Islands.MeshMax - Islands.MeshMin;
+  const float Diagonal = MeshSize.Size();
+  if (Diagonal <= KINDA_SMALL_NUMBER) {
+    return false;
+  }
+  // F1 参数：按资产对角自适应（原型终版 0.005 / 0.010 / 0.5 / 0.02，单位 cm）。
+  Out.JoinDistance = FMath::Clamp(Diagonal * 0.005f, 0.15f, 1.5f);
+  Out.ContactDistance = FMath::Clamp(FMath::Max(Out.JoinDistance, Diagonal * 0.010f), 0.2f, 1.2f);
+  Out.AttachDistance = FMath::Clamp(Diagonal * 0.020f, 0.3f, 3.0f);
+  Out.SpanLimit = Diagonal * 0.5f;
+
+  TArray<TArray<int32>> IslandVertices;
+  IslandVertices.SetNum(IslandCount);
+  for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+    const int32 IslandIndex = Islands.IslandOfVertex[VertexIndex];
+    if (IslandVertices.IsValidIndex(IslandIndex)) {
+      IslandVertices[IslandIndex].Add(VertexIndex);
+    }
+  }
+  // ORIENT-FIX: 资产 XY 质心，供近水平片判断“朝外”方向。
+  double AssetCenterX = 0.0;
+  double AssetCenterY = 0.0;
+  for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+    const FVector3f Position = GetPosition(VertexIndex);
+    AssetCenterX += Position.X;
+    AssetCenterY += Position.Y;
+  }
+  AssetCenterX /= static_cast<double>(VertexCount);
+  AssetCenterY /= static_cast<double>(VertexCount);
+
+  Out.Axis.SetNum(IslandCount);
+  Out.Length.Init(0.0f, IslandCount);
+  Out.Base.SetNum(IslandCount);
+  Out.Tip.SetNum(IslandCount);
+  Out.Width.Init(0.0f, IslandCount);
+  Out.Planarity.Init(0.0f, IslandCount);
+  Out.MaxProjection.Init(0.0f, IslandCount);
+  for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
+    const TArray<int32> &Vertices = IslandVertices[IslandIndex];
+    const int32 Count = Vertices.Num();
+    const FVector3f FallbackDirection =
+        Islands.Direction.IsValidIndex(IslandIndex) ? Islands.Direction[IslandIndex]
+                                                    : FVector3f(0.0f, 0.0f, 1.0f);
+    const FVector3f FallbackBase = Islands.BasePosition.IsValidIndex(IslandIndex)
+                                       ? Islands.BasePosition[IslandIndex]
+                                       : FVector3f::ZeroVector;
+    if (Count <= 0) {
+      Out.Axis[IslandIndex] = FallbackDirection;
+      Out.Base[IslandIndex] = FallbackBase;
+      Out.Tip[IslandIndex] = FallbackBase;
+      continue;
+    }
+    FVector3d Centroid = FVector3d::ZeroVector;
+    for (const int32 VertexIndex : Vertices) {
+      Centroid += FVector3d(GetPosition(VertexIndex));
+    }
+    Centroid = Centroid / static_cast<double>(Count);
+    double XX = 0.0, YY = 0.0, ZZ = 0.0, XY = 0.0, XZ = 0.0, YZ = 0.0;
+    for (const int32 VertexIndex : Vertices) {
+      const FVector3d Delta = FVector3d(GetPosition(VertexIndex)) - Centroid;
+      XX += Delta.X * Delta.X;
+      YY += Delta.Y * Delta.Y;
+      ZZ += Delta.Z * Delta.Z;
+      XY += Delta.X * Delta.Y;
+      XZ += Delta.X * Delta.Z;
+      YZ += Delta.Y * Delta.Z;
+    }
+    XX /= Count; YY /= Count; ZZ /= Count; XY /= Count; XZ /= Count; YZ /= Count;
+    // 幂迭代：三个坐标轴种子各跑一次，取 Rayleigh 商最大者。
+    // 单一 (1,0,0) 种子在轴对齐网格上可能恰好落在非主特征方向并保持不动。
+    double AxisX = 1.0, AxisY = 0.0, AxisZ = 0.0;
+    double BestEigen = -1.0;
+    for (int32 SeedIndex = 0; SeedIndex < 3; ++SeedIndex) {
+      double SeedX = SeedIndex == 0 ? 1.0 : 0.0;
+      double SeedY = SeedIndex == 1 ? 1.0 : 0.0;
+      double SeedZ = SeedIndex == 2 ? 1.0 : 0.0;
+      for (int32 Iteration = 0; Iteration < 32; ++Iteration) {
+        const double NextX = XX * SeedX + XY * SeedY + XZ * SeedZ;
+        const double NextY = XY * SeedX + YY * SeedY + YZ * SeedZ;
+        const double NextZ = XZ * SeedX + YZ * SeedY + ZZ * SeedZ;
+        const double AxisLength = FMath::Sqrt(NextX * NextX + NextY * NextY + NextZ * NextZ);
+        if (AxisLength <= 1e-12) {
+          break;
+        }
+        SeedX = NextX / AxisLength;
+        SeedY = NextY / AxisLength;
+        SeedZ = NextZ / AxisLength;
+      }
+      const double Eigen =
+          XX * SeedX * SeedX + YY * SeedY * SeedY + ZZ * SeedZ * SeedZ +
+          2.0 * (XY * SeedX * SeedY + XZ * SeedX * SeedZ + YZ * SeedY * SeedZ);
+      if (Eigen > BestEigen) {
+        BestEigen = Eigen;
+        AxisX = SeedX;
+        AxisY = SeedY;
+        AxisZ = SeedZ;
+      }
+    }
+    const FVector3f PcaAxis(static_cast<float>(AxisX), static_cast<float>(AxisY), static_cast<float>(AxisZ));
+    float LowProjection = TNumericLimits<float>::Max();
+    float HighProjection = -TNumericLimits<float>::Max();
+    for (const int32 VertexIndex : Vertices) {
+      const FVector3d Delta = FVector3d(GetPosition(VertexIndex)) - Centroid;
+      const float Projection = static_cast<float>(Delta.X * AxisX + Delta.Y * AxisY + Delta.Z * AxisZ);
+      LowProjection = FMath::Min(LowProjection, Projection);
+      HighProjection = FMath::Max(HighProjection, Projection);
+    }
+    const float IslandLength = FMath::Max(HighProjection - LowProjection, 1e-6f);
+    double LateralSquared = 0.0;
+    FVector3d LowSum = FVector3d::ZeroVector;
+    FVector3d HighSum = FVector3d::ZeroVector;
+    int32 LowCount = 0;
+    int32 HighCount = 0;
+    for (const int32 VertexIndex : Vertices) {
+      const FVector3f Position = GetPosition(VertexIndex);
+      const FVector3d Delta = FVector3d(Position) - Centroid;
+      const double Projection = Delta.X * AxisX + Delta.Y * AxisY + Delta.Z * AxisZ;
+      const double LateralX = Delta.X - AxisX * Projection;
+      const double LateralY = Delta.Y - AxisY * Projection;
+      const double LateralZ = Delta.Z - AxisZ * Projection;
+      LateralSquared += LateralX * LateralX + LateralY * LateralY + LateralZ * LateralZ;
+      if (Projection <= LowProjection + IslandLength * 0.25f) {
+        LowSum += FVector3d(Position);
+        LowCount += 1;
+      }
+      if (Projection >= HighProjection - IslandLength * 0.25f) {
+        HighSum += FVector3d(Position);
+        HighCount += 1;
+      }
+    }
+    LateralSquared /= static_cast<double>(Count);
+    FVector3f BandBase = LowCount > 0 ? FVector3f(LowSum / LowCount) : FVector3f(Centroid);
+    FVector3f BandTip = HighCount > 0 ? FVector3f(HighSum / HighCount) : FVector3f(Centroid);
+    FVector3f Axis = BandTip - BandBase;
+    Axis = Axis.SizeSquared() > 1e-12f ? Axis.GetSafeNormal() : PcaAxis;
+    // ORIENT-FIX 方向归一：基部=低端（+Z 为上）；近水平片取远离资产中轴的一端为叶尖。
+    // 否则 PCA 轴符号不定会让 F4 权重沿“顶->基”增长，整个簇发硬。
+    //
+    // 双判据（2026-10-10 补充）：原口径 `|Axis.Z| >= 0.2` 时**只看 Z 符号**，径向测试被跳过。
+    // 实测两类资产会在这条上失效——拱形羽叶回弯后锚点落在植株外侧、末端指向中心：
+    //   Lady_Fern_h9ecnwd_03 的卡 9（|Z| = 0.206）与 h9ecnwd_12 的卡 1（|Z| = 0.850），
+    //   锚点半径 26.3 / 10.8cm 而末端半径只有 3.0 / 6.6cm。
+    // 此时权重斜坡沿「外侧 -> 中心」增长，视觉上是「叶尖不动、末端动」，与预期完全相反。
+    // 因此补一次径向一致性测试：只要末端离植株中轴明显更近（小于基部半径的 1/1.25），
+    // 就认定方向反了。系数取 1.25 而非 1.0，是为了把基部/末端 25% 波段质心的正常抖动排除在外，
+    // 避免把垂直生长的叶片误翻。
+    const double BaseRadius = FMath::Sqrt((BandBase.X - AssetCenterX) * (BandBase.X - AssetCenterX) +
+                                          (BandBase.Y - AssetCenterY) * (BandBase.Y - AssetCenterY));
+    const double TipRadius = FMath::Sqrt((BandTip.X - AssetCenterX) * (BandTip.X - AssetCenterX) +
+                                         (BandTip.Y - AssetCenterY) * (BandTip.Y - AssetCenterY));
+    bool bFlipAxis = false;
+    if (FMath::Abs(Axis.Z) >= 0.2f) {
+      bFlipAxis = Axis.Z < 0.0f;
+    } else {
+      bFlipAxis = TipRadius < BaseRadius - 1e-6;
+    }
+    if (!bFlipAxis && TipRadius > 0.05 && BaseRadius > TipRadius * 1.25) {
+      bFlipAxis = true;
+    }
+    if (bFlipAxis) {
+      Axis = -Axis;
+      const FVector3f SwapPosition = BandBase;
+      BandBase = BandTip;
+      BandTip = SwapPosition;
+    }
+    Out.Axis[IslandIndex] = Axis;
+    Out.Length[IslandIndex] = IslandLength;
+    Out.Base[IslandIndex] = BandBase;
+    Out.Tip[IslandIndex] = BandTip;
+    Out.Width[IslandIndex] = static_cast<float>(FMath::Sqrt(FMath::Max(LateralSquared, 0.0)));
+    Out.Planarity[IslandIndex] = static_cast<float>(
+        LateralSquared / FMath::Max(static_cast<double>(IslandLength) * IslandLength, 1e-9));
+    float MaxProjection = 0.0f;
+    for (const int32 VertexIndex : Vertices) {
+      MaxProjection = FMath::Max(MaxProjection, FVector3f::DotProduct(GetPosition(VertexIndex) - BandBase, Axis));
+    }
+    Out.MaxProjection[IslandIndex] = MaxProjection;
+  }
+
+  // F2 类型：长且细长 -> rachis（叶轴/主枝）；其余 leaflet（叶片/小叶）。
+  TArray<float> SortedLengths = Out.Length;
+  SortedLengths.Sort();
+  const int32 SortedCount = SortedLengths.Num();
+  const float LengthP90 =
+      SortedCount > 0
+          ? SortedLengths[FMath::Min(SortedCount - 1, FMath::FloorToInt(SortedCount * 0.90f))]
+          : 0.0f;
+  Out.Rachis.Init(0, IslandCount);
+  for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
+    const float Slenderness = Out.Length[IslandIndex] / FMath::Max(Out.Width[IslandIndex], 1e-6f);
+    const bool bLongEnough =
+        Out.Length[IslandIndex] >= Diagonal * 0.20f || Out.Length[IslandIndex] >= LengthP90;
+    const bool bSlender = Slenderness >= 3.0f;
+    const bool bSmallBlade = Out.Length[IslandIndex] < Diagonal * 0.12f;
+    if (bLongEnough && bSlender && !bSmallBlade) {
+      Out.Rachis[IslandIndex] = 1;
+      Out.RachisCount += 1;
+    }
+  }
+
+  // F3 候选边（一）：贴合 / 基部附着（空间哈希，cell = Rattach）。
+  struct FContactCandidate {
+    float MinDistance = TNumericLimits<float>::Max();
+    int32 VertexA = INDEX_NONE;
+    int32 VertexB = INDEX_NONE;
+    bool bAttach = false;
+    float AttachDistance = TNumericLimits<float>::Max();
+    int32 AttachVertexA = INDEX_NONE;
+    int32 AttachVertexB = INDEX_NONE;
+  };
+  struct FAxialCandidate {
+    float Distance = TNumericLimits<float>::Max();
+    int32 VertexA = INDEX_NONE;
+    int32 VertexB = INDEX_NONE;
+  };
+  TArray<uint8> BaseVertex;
+  BaseVertex.Init(0, VertexCount);
+  for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+    const int32 IslandIndex = Islands.IslandOfVertex[VertexIndex];
+    if (!Out.Base.IsValidIndex(IslandIndex)) {
+      continue;
+    }
+    const float Reach = FMath::Max(Out.Length[IslandIndex] * 0.35f, 0.3f);
+    BaseVertex[VertexIndex] =
+        FVector3f::DistSquared(GetPosition(VertexIndex), Out.Base[IslandIndex]) <= Reach * Reach ? 1 : 0;
+  }
+  TMap<uint64, FContactCandidate> ContactPairs;
+  const float Cell = FMath::Max(Out.AttachDistance, 1e-3f);
+  const float AttachSquared = Out.AttachDistance * Out.AttachDistance;
+  TMap<FIntVector, TArray<int32>> VertexGrid;
+  VertexGrid.Reserve(VertexCount);
+  for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+    const FVector3f Position = GetPosition(VertexIndex);
+    const int32 IslandIndex = Islands.IslandOfVertex[VertexIndex];
+    const FIntVector Key(FMath::FloorToInt(Position.X / Cell),
+                         FMath::FloorToInt(Position.Y / Cell),
+                         FMath::FloorToInt(Position.Z / Cell));
+    for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX) {
+      for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY) {
+        for (int32 OffsetZ = -1; OffsetZ <= 1; ++OffsetZ) {
+          const TArray<int32> *Bucket = VertexGrid.Find(Key + FIntVector(OffsetX, OffsetY, OffsetZ));
+          if (!Bucket) {
+            continue;
+          }
+          for (const int32 OtherVertex : *Bucket) {
+            const int32 OtherIsland = Islands.IslandOfVertex[OtherVertex];
+            if (OtherIsland == IslandIndex) {
+              continue;
+            }
+            const float DistanceSquared = FVector3f::DistSquared(Position, GetPosition(OtherVertex));
+            if (DistanceSquared > AttachSquared) {
+              continue;
+            }
+            const bool bVertexFirst = IslandIndex < OtherIsland;
+            FContactCandidate &Record = ContactPairs.FindOrAdd(
+                AssetHivePlantWind::PlantWindUnitPairKey(IslandIndex, OtherIsland));
+            const float Distance = FMath::Sqrt(DistanceSquared);
+            if (Distance < Record.MinDistance) {
+              Record.MinDistance = Distance;
+              Record.VertexA = bVertexFirst ? VertexIndex : OtherVertex;
+              Record.VertexB = bVertexFirst ? OtherVertex : VertexIndex;
+            }
+            if (BaseVertex[VertexIndex] != 0 || BaseVertex[OtherVertex] != 0) {
+              if (Distance < Record.AttachDistance) {
+                Record.AttachDistance = Distance;
+                Record.AttachVertexA = bVertexFirst ? VertexIndex : OtherVertex;
+                Record.AttachVertexB = bVertexFirst ? OtherVertex : VertexIndex;
+              }
+              Record.bAttach = true;
+            }
+          }
+        }
+      }
+    }
+    VertexGrid.FindOrAdd(Key).Add(VertexIndex);
+  }
+
+  // F3 候选边（二）：轴向外延（叶轴主轴两端延长线采样命中，补足“小叶基部插在叶轴上”的接缝）。
+  TMap<uint64, FAxialCandidate> AxialPairs;
+  const float AxialSampleStep = FMath::Max(Out.JoinDistance, 0.5f);
+  const float AxialHitTolerance = AxialSampleStep * 1.6f;
+  for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
+    const FVector3f Direction = Out.Axis[IslandIndex];
+    if (Direction.IsNearlyZero()) {
+      continue;
+    }
+    const float IslandLength = FMath::Max(Out.Length[IslandIndex], 1e-6f);
+    for (int32 Side = 0; Side < 2; ++Side) {
+      const float DirectionSign = Side == 0 ? -1.0f : 1.0f;
+      const FVector3f Origin = Side == 0 ? Out.Base[IslandIndex] : Out.Tip[IslandIndex];
+      const float Reach = Side == 0 ? IslandLength * 0.6f : IslandLength * 0.9f;
+      const int32 Steps = FMath::Max(2, FMath::FloorToInt(Reach / AxialSampleStep));
+      for (int32 Step = 1; Step <= Steps; ++Step) {
+        const float StepDistance = Reach * static_cast<float>(Step) / static_cast<float>(Steps);
+        const FVector3f Sample = Origin + Direction * (StepDistance * DirectionSign);
+        const FIntVector SampleKey(FMath::FloorToInt(Sample.X / Cell),
+                                   FMath::FloorToInt(Sample.Y / Cell),
+                                   FMath::FloorToInt(Sample.Z / Cell));
+        int32 NearestHitVertex = INDEX_NONE;
+        float NearestHitSquared = TNumericLimits<float>::Max();
+        for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX) {
+          for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY) {
+            for (int32 OffsetZ = -1; OffsetZ <= 1; ++OffsetZ) {
+              const TArray<int32> *Bucket = VertexGrid.Find(SampleKey + FIntVector(OffsetX, OffsetY, OffsetZ));
+              if (!Bucket) {
+                continue;
+              }
+              for (const int32 OtherVertex : *Bucket) {
+                const int32 OtherIsland = Islands.IslandOfVertex[OtherVertex];
+                if (OtherIsland == IslandIndex) {
+                  continue;
+                }
+                if (AssetHivePlantWind::PlantWindAngleDegrees(Direction, Out.Axis[OtherIsland]) > 50.0f) {
+                  continue;
+                }
+                const float DistanceSquared = FVector3f::DistSquared(Sample, GetPosition(OtherVertex));
+                if (DistanceSquared <= AxialHitTolerance * AxialHitTolerance &&
+                    DistanceSquared < NearestHitSquared) {
+                  NearestHitSquared = DistanceSquared;
+                  NearestHitVertex = OtherVertex;
+                }
+              }
+            }
+          }
+        }
+        if (NearestHitVertex == INDEX_NONE) {
+          continue;
+        }
+        const uint64 PairKey = AssetHivePlantWind::PlantWindUnitPairKey(
+            IslandIndex, Islands.IslandOfVertex[NearestHitVertex]);
+        const float SampleDistance = FMath::Sqrt(NearestHitSquared);
+        const FAxialCandidate *Existing = AxialPairs.Find(PairKey);
+        if (Existing != nullptr && Existing->Distance <= SampleDistance) {
+          continue;
+        }
+        int32 NearestAxisVertex = INDEX_NONE;
+        float NearestAxisSquared = TNumericLimits<float>::Max();
+        for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX) {
+          for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY) {
+            for (int32 OffsetZ = -1; OffsetZ <= 1; ++OffsetZ) {
+              const TArray<int32> *Bucket = VertexGrid.Find(SampleKey + FIntVector(OffsetX, OffsetY, OffsetZ));
+              if (!Bucket) {
+                continue;
+              }
+              for (const int32 AxisVertex : *Bucket) {
+                if (Islands.IslandOfVertex[AxisVertex] != IslandIndex) {
+                  continue;
+                }
+                const float DistanceSquared = FVector3f::DistSquared(Sample, GetPosition(AxisVertex));
+                if (DistanceSquared < NearestAxisSquared) {
+                  NearestAxisSquared = DistanceSquared;
+                  NearestAxisVertex = AxisVertex;
+                }
+              }
+            }
+          }
+        }
+        const bool bIslandFirst = IslandIndex < Islands.IslandOfVertex[NearestHitVertex];
+        const int32 AxisVertex = NearestAxisVertex != INDEX_NONE ? NearestAxisVertex : NearestHitVertex;
+        FAxialCandidate &Record = AxialPairs.FindOrAdd(PairKey);
+        Record.Distance = SampleDistance;
+        Record.VertexA = bIslandFirst ? AxisVertex : NearestHitVertex;
+        Record.VertexB = bIslandFirst ? NearestHitVertex : AxisVertex;
+      }
+    }
+  }
+
+  // F3 归组：Kruskal（结构过滤 + 每簇 rachis 上限 2 + 簇跨度上限）。
+  struct FMergeEdge {
+    int32 Kind = 2;  // 0 = 轴向外延，1 = 基部附着，2 = 贴合
+    float Distance = 0.0f;
+    int32 IslandA = INDEX_NONE;
+    int32 IslandB = INDEX_NONE;
+    int32 VertexA = INDEX_NONE;
+    int32 VertexB = INDEX_NONE;
+  };
+  TArray<FMergeEdge> Edges;
+  Out.CandidatePairCount = ContactPairs.Num();
+  TSet<uint64> FallbackStructuralPairs;
+  for (const TPair<uint64, FAxialCandidate> &Pair : AxialPairs) {
+    const int32 IslandA = static_cast<int32>(Pair.Key >> 32);
+    const int32 IslandB = static_cast<int32>(Pair.Key & 0xFFFFFFFFull);
+    FallbackStructuralPairs.Add(Pair.Key);
+    if (Out.Rachis[IslandA] == 0 && Out.Rachis[IslandB] == 0) {
+      continue;
+    }
+    if (AssetHivePlantWind::PlantWindAngleDegrees(Out.Axis[IslandA], Out.Axis[IslandB]) > 50.0f) {
+      continue;
+    }
+    FMergeEdge Edge;
+    Edge.Kind = 0;
+    Edge.Distance = Pair.Value.Distance;
+    Edge.IslandA = IslandA;
+    Edge.IslandB = IslandB;
+    Edge.VertexA = Pair.Value.VertexA;
+    Edge.VertexB = Pair.Value.VertexB;
+    Edges.Add(Edge);
+  }
+  for (const TPair<uint64, FContactCandidate> &Pair : ContactPairs) {
+    const FContactCandidate &Record = Pair.Value;
+    const int32 IslandA = static_cast<int32>(Pair.Key >> 32);
+    const int32 IslandB = static_cast<int32>(Pair.Key & 0xFFFFFFFFull);
+    const bool bBothRachis = Out.Rachis[IslandA] != 0 && Out.Rachis[IslandB] != 0;
+    if (bBothRachis) {
+      continue;  // 纯贴合平行双轴不并
+    }
+    if (Record.bAttach) {
+      FallbackStructuralPairs.Add(Pair.Key);
+    }
+    const bool bOneRachis = Out.Rachis[IslandA] != 0 || Out.Rachis[IslandB] != 0;
+    if (Record.MinDistance <= Out.JoinDistance) {
+      const float AngleLimit = bOneRachis ? 65.0f : 35.0f;
+      if (AssetHivePlantWind::PlantWindAngleDegrees(Out.Axis[IslandA], Out.Axis[IslandB]) <= AngleLimit ||
+          Record.bAttach) {
+        FMergeEdge Edge;
+        Edge.Kind = 2;
+        Edge.Distance = Record.MinDistance;
+        Edge.IslandA = IslandA;
+        Edge.IslandB = IslandB;
+        Edge.VertexA = Record.VertexA;
+        Edge.VertexB = Record.VertexB;
+        Edges.Add(Edge);
+      }
+    }
+    if (Record.bAttach && Record.AttachVertexA != INDEX_NONE &&
+        Record.AttachDistance <= Out.AttachDistance) {
+      FMergeEdge Edge;
+      Edge.Kind = 1;
+      Edge.Distance = FMath::Min(Record.AttachDistance, Record.MinDistance);
+      Edge.IslandA = IslandA;
+      Edge.IslandB = IslandB;
+      Edge.VertexA = Record.AttachVertexA;
+      Edge.VertexB = Record.AttachVertexB;
+      Edges.Add(Edge);
+    }
+  }
+  Edges.Sort([](const FMergeEdge &A, const FMergeEdge &B) {
+    if (A.Kind != B.Kind) {
+      return A.Kind < B.Kind;
+    }
+    if (A.Distance != B.Distance) {
+      return A.Distance < B.Distance;
+    }
+    if (A.IslandA != B.IslandA) {
+      return A.IslandA < B.IslandA;
+    }
+    return A.IslandB < B.IslandB;
+  });
+
+  TArray<int32> Parents;
+  Parents.SetNumUninitialized(IslandCount);
+  TArray<int32> RootRachisCount;
+  RootRachisCount.SetNumUninitialized(IslandCount);
+  TArray<FVector3f> RootBoundsMin;
+  RootBoundsMin.SetNumUninitialized(IslandCount);
+  TArray<FVector3f> RootBoundsMax;
+  RootBoundsMax.SetNumUninitialized(IslandCount);
+  for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
+    Parents[IslandIndex] = IslandIndex;
+    RootRachisCount[IslandIndex] = Out.Rachis[IslandIndex] != 0 ? 1 : 0;
+    FVector3f BoundsMin(TNumericLimits<float>::Max());
+    FVector3f BoundsMax(-TNumericLimits<float>::Max());
+    for (const int32 VertexIndex : IslandVertices[IslandIndex]) {
+      const FVector3f Position = GetPosition(VertexIndex);
+      for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex) {
+        BoundsMin[AxisIndex] = FMath::Min(BoundsMin[AxisIndex], Position[AxisIndex]);
+        BoundsMax[AxisIndex] = FMath::Max(BoundsMax[AxisIndex], Position[AxisIndex]);
+      }
+    }
+    RootBoundsMin[IslandIndex] = BoundsMin;
+    RootBoundsMax[IslandIndex] = BoundsMax;
+  }
+  for (const FMergeEdge &Edge : Edges) {
+    int32 RootA = Edge.IslandA;
+    while (Parents[RootA] != RootA) {
+      Parents[RootA] = Parents[Parents[RootA]];
+      RootA = Parents[RootA];
+    }
+    int32 RootB = Edge.IslandB;
+    while (Parents[RootB] != RootB) {
+      Parents[RootB] = Parents[Parents[RootB]];
+      RootB = Parents[RootB];
+    }
+    if (RootA == RootB) {
+      continue;
+    }
+    bool bAccepted = false;
+    if (RootRachisCount[RootA] + RootRachisCount[RootB] > 2) {
+      Out.RejectedByRachisCapacity += 1;
+    } else if (RootRachisCount[RootA] == 1 && RootRachisCount[RootB] == 1 && Edge.Kind == 2) {
+      Out.RejectedParallelRachis += 1;
+    } else {
+      FVector3f MergedMin;
+      FVector3f MergedMax;
+      for (int32 AxisIndex = 0; AxisIndex < 3; ++AxisIndex) {
+        MergedMin[AxisIndex] = FMath::Min(RootBoundsMin[RootA][AxisIndex], RootBoundsMin[RootB][AxisIndex]);
+        MergedMax[AxisIndex] = FMath::Max(RootBoundsMax[RootA][AxisIndex], RootBoundsMax[RootB][AxisIndex]);
+      }
+      if ((MergedMax - MergedMin).Size() > Out.SpanLimit) {
+        Out.RejectedBySpan += 1;
+      } else {
+        Parents[RootB] = RootA;
+        RootRachisCount[RootA] += RootRachisCount[RootB];
+        RootBoundsMin[RootA] = MergedMin;
+        RootBoundsMax[RootA] = MergedMax;
+        Out.MergedPairCount += 1;
+        bAccepted = true;
+      }
+    }
+    Out.StructuralIslandPairs.Add(AssetHivePlantWind::PlantWindUnitPairKey(Edge.IslandA, Edge.IslandB));
+    if (!bAccepted && Edge.VertexA != INDEX_NONE && Edge.VertexB != INDEX_NONE &&
+        Edge.VertexA != Edge.VertexB) {
+      AssetHivePlantWind::FPlantWindStructuralSeam Seam;
+      Seam.VertexA = Edge.VertexA;
+      Seam.VertexB = Edge.VertexB;
+      Seam.BlendWeight = Edge.Kind == 2 ? 0.30f : (Edge.Kind == 1 ? 0.35f : 0.25f);
+      Out.StructuralSeams.Add(Seam);
+    }
+  }
+  // 结构顶点对：attach / axial 关系本身也直接对插（低权重区，叶尖不参与）。
+  for (const TPair<uint64, FContactCandidate> &Pair : ContactPairs) {
+    const FContactCandidate &Record = Pair.Value;
+    if (!Record.bAttach || Record.AttachVertexA == INDEX_NONE || Record.AttachVertexB == INDEX_NONE) {
+      continue;
+    }
+    if (Record.AttachDistance > FMath::Max(Out.AttachDistance, Out.ContactDistance)) {
+      continue;
+    }
+    AssetHivePlantWind::FPlantWindStructuralSeam Seam;
+    Seam.VertexA = Record.AttachVertexA;
+    Seam.VertexB = Record.AttachVertexB;
+    Seam.BlendWeight = 0.35f;
+    Out.StructuralSeams.Add(Seam);
+  }
+  for (const TPair<uint64, FAxialCandidate> &Pair : AxialPairs) {
+    if (Pair.Value.VertexA == INDEX_NONE || Pair.Value.VertexB == INDEX_NONE ||
+        Pair.Value.VertexA == Pair.Value.VertexB) {
+      continue;
+    }
+    AssetHivePlantWind::FPlantWindStructuralSeam Seam;
+    Seam.VertexA = Pair.Value.VertexA;
+    Seam.VertexB = Pair.Value.VertexB;
+    Seam.BlendWeight = 0.25f;
+    Out.StructuralSeams.Add(Seam);
+  }
+  auto FindRoot = [&Parents](int32 Index) {
+    while (Parents[Index] != Index) {
+      Parents[Index] = Parents[Parents[Index]];
+      Index = Parents[Index];
+    }
+    return Index;
+  };
+
+  // 邻近合并（2026-10-10）：贴合且方向相近的连通片必须共用同一个风单元。
+  //
+  // 症状：Lady_Fern_h9ecnwd_14 的卡 0（9216 顶点）与卡 1（1332 顶点）最近顶点只差 0.02cm
+  //   ——本质是同一片叶子——但锚点模长 7.28cm vs 1.95cm。F3 的合并判据（rachis<=2、跨度上限、
+  //   平行双轴拒绝）没有把它们并起来，于是两张卡各持一条独立梯度：被切开的位置整体平移 5.3cm
+  //   量级，视觉上就是"茎秆与叶片分离"。Lady_Fern_h9ecnwd_03 的卡 12/13/14 同理（各 3129 顶点，
+  //   互相只差 0.01~0.17cm，锚点却相距 3.6cm）。
+  //
+  // 两道护栏（离线实测，缺一不可）：
+  //   1) 合并距离取 0.5cm：只并"真正重合"的片。取 2.0cm 会一路传递合并，实测本地
+  //      Megascans 蕨 Var4 从 14 张卡并到 1 张，整株退化成刚性整体运动，比现状更糟。
+  //      0.5cm 也低于 SyntheticWindFernWideGap 用例里的 8mm 间隙，该用例断言的
+  //      "8mm 根部间隙并入同一风单元"由 F3 负责，不被本规则干扰。
+  //   2) 并集跨度不得超过"两片各自沿自身轴跨度之和"的 1.6 倍。不能拿并集直接和固定阈值比：
+  //      换锚轴后，原本沿自身轴 16cm 的片在新轴上会被量成 29cm——那是"换尺子"造成的假超标，
+  //      会把本该粘合的两段羽叶挡在门外（bvxkwlf_13 实测就被这条挡住）。
+  // 角度阈值 70°：羽叶是拱形，同一片叶被切成两段时段间本来就有明显弯折。
+  //   bvxkwlf_13 实测两轴夹角 46.371°，45° 阈值恰好把它挡在门外，导致主干与羽叶分离
+  //   （跨卡接触面 50626 对顶点相对错动 1.26cm）。放宽到 70° 后该资产并成 1 张卡、错动归零；
+  //   全家族 01/03/11/13/14/15 六个变体实测跨卡位移差全部为 0.000cm。
+  // rachis 容量上限放开（64）：0.5cm 的贴合距离本身已排除级联，再加严会误伤
+  // SyntheticWindFernWideGap 这类"三片都应并入同一风单元"的合法用例。
+  constexpr float ProximityMergeDistance = 0.5f;
+  constexpr float ProximityMergeAngleDegrees = 70.0f;
+  constexpr int32 ProximityMergeMaxRachis = 64;
+  constexpr float ProximityMergeSpanRatio = 1.6f;
+  {
+    struct FProximityCandidate {
+      int32 IslandA = INDEX_NONE;
+      int32 IslandB = INDEX_NONE;
+      float ProximityDistanceSquared = 0.0f;
+    };
+    TArray<FProximityCandidate> Candidates;
+    TSet<uint64> SeenPairs;
+    TMap<FIntVector, TArray<int32>> ProximityGrid;
+    ProximityGrid.Reserve(VertexCount);
+    const float ProximityCell = ProximityMergeDistance;
+    const float ProximitySquared = ProximityMergeDistance * ProximityMergeDistance;
+    const float CosMergeAngle = FMath::Cos(FMath::DegreesToRadians(ProximityMergeAngleDegrees));
+    for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+      const FVector3f Position = GetPosition(VertexIndex);
+      const int32 IslandIndex = Islands.IslandOfVertex[VertexIndex];
+      const FIntVector Key(FMath::FloorToInt(Position.X / ProximityCell),
+                           FMath::FloorToInt(Position.Y / ProximityCell),
+                           FMath::FloorToInt(Position.Z / ProximityCell));
+      for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX) {
+        for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY) {
+          for (int32 OffsetZ = -1; OffsetZ <= 1; ++OffsetZ) {
+            const TArray<int32> *Bucket =
+                ProximityGrid.Find(Key + FIntVector(OffsetX, OffsetY, OffsetZ));
+            if (!Bucket) {
+              continue;
+            }
+            for (const int32 OtherVertex : *Bucket) {
+              const int32 OtherIsland = Islands.IslandOfVertex[OtherVertex];
+              if (OtherIsland == IslandIndex) {
+                continue;
+              }
+              if (FVector3f::DotProduct(Out.Axis[IslandIndex], Out.Axis[OtherIsland]) <
+                  CosMergeAngle) {
+                continue;
+              }
+              const int32 ProximityLowIsland = FMath::Min(IslandIndex, OtherIsland);
+              const int32 ProximityHighIsland = FMath::Max(IslandIndex, OtherIsland);
+              const uint64 ProximityPairKey = AssetHivePlantWind::PlantWindUnitPairKey(
+                  ProximityLowIsland, ProximityHighIsland);
+              if (SeenPairs.Contains(ProximityPairKey)) {
+                continue;
+              }
+              const float ProximityDistanceSquared =
+                  FVector3f::DistSquared(Position, GetPosition(OtherVertex));
+              if (ProximityDistanceSquared > ProximitySquared) {
+                continue;
+              }
+              SeenPairs.Add(ProximityPairKey);
+              FProximityCandidate NewCandidate;
+              NewCandidate.IslandA = ProximityLowIsland;
+              NewCandidate.IslandB = ProximityHighIsland;
+              NewCandidate.ProximityDistanceSquared = ProximityDistanceSquared;
+              Candidates.Add(NewCandidate);
+            }
+          }
+        }
+      }
+      ProximityGrid.FindOrAdd(Key).Add(VertexIndex);
+    }
+    Candidates.Sort([](const FProximityCandidate &Left, const FProximityCandidate &Right) {
+      return Left.ProximityDistanceSquared < Right.ProximityDistanceSquared;
+    });
+
+    auto IslandProjectionRange = [&](int32 IslandIndex, int32 AnchorIsland,
+                                     float &OutLow, float &OutHigh) {
+      const FVector3f &Anchor = Out.Base[AnchorIsland];
+      const FVector3f &Axis = Out.Axis[AnchorIsland];
+      OutLow = TNumericLimits<float>::Max();
+      OutHigh = -TNumericLimits<float>::Max();
+      for (const int32 VertexIndex : IslandVertices[IslandIndex]) {
+        const float Projection = FVector3f::DotProduct(GetPosition(VertexIndex) - Anchor, Axis);
+        OutLow = FMath::Min(OutLow, Projection);
+        OutHigh = FMath::Max(OutHigh, Projection);
+      }
+    };
+
+    TArray<int32> ProximityRootAnchor;
+    TArray<int32> ProximityRootRachisCount;
+    ProximityRootAnchor.Init(INDEX_NONE, IslandCount);
+    ProximityRootRachisCount.Init(0, IslandCount);
+    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
+      ProximityRootAnchor[IslandIndex] = IslandIndex;
+      ProximityRootRachisCount[IslandIndex] = Out.Rachis[IslandIndex] != 0 ? 1 : 0;
+    }
+    for (const FProximityCandidate &ProximityCandidate : Candidates) {
+      const int32 ProximityRootA = FindRoot(ProximityCandidate.IslandA);
+      const int32 ProximityRootB = FindRoot(ProximityCandidate.IslandB);
+      if (ProximityRootA == ProximityRootB) {
+        continue;
+      }
+      if (ProximityRootRachisCount[ProximityRootA] + ProximityRootRachisCount[ProximityRootB] > ProximityMergeMaxRachis) {
+        Out.ProximityRejectedByRachis += 1;
+        continue;
+      }
+      const int32 AnchorA = ProximityRootAnchor[ProximityRootA];
+      const int32 AnchorB = ProximityRootAnchor[ProximityRootB];
+      if (!Out.Length.IsValidIndex(AnchorA) || !Out.Length.IsValidIndex(AnchorB)) {
+        continue;
+      }
+      const int32 NewAnchor =
+          Out.Length[AnchorA] >= Out.Length[AnchorB] ? AnchorA : AnchorB;
+      // 并集在新锚轴上的跨度，与"两片各自沿自身轴的跨度之和"比较，消除换尺子效应。
+      float OwnLowA = 0.0f, OwnHighA = 0.0f, OwnLowB = 0.0f, OwnHighB = 0.0f;
+      IslandProjectionRange(AnchorA, AnchorA, OwnLowA, OwnHighA);
+      IslandProjectionRange(AnchorB, AnchorB, OwnLowB, OwnHighB);
+      const float OwnSpanSum =
+          FMath::Max((OwnHighA - OwnLowA) + (OwnHighB - OwnLowB), 1e-6f);
+      float ProximitySpanLow = TNumericLimits<float>::Max();
+      float ProximitySpanHigh = -TNumericLimits<float>::Max();
+      for (const int32 IslandIndex : {AnchorA, AnchorB}) {
+        float Low = 0.0f;
+        float High = 0.0f;
+        IslandProjectionRange(IslandIndex, NewAnchor, Low, High);
+        ProximitySpanLow = FMath::Min(ProximitySpanLow, Low);
+        ProximitySpanHigh = FMath::Max(ProximitySpanHigh, High);
+      }
+      if (ProximitySpanHigh - ProximitySpanLow > OwnSpanSum * ProximityMergeSpanRatio) {
+        Out.ProximityRejectedBySpan += 1;
+        continue;
+      }
+      Parents[ProximityRootB] = ProximityRootA;
+      ProximityRootAnchor[ProximityRootA] = NewAnchor;
+      ProximityRootRachisCount[ProximityRootA] += ProximityRootRachisCount[ProximityRootB];
+      Out.ProximityMerges += 1;
+    }
+  }
+
+  // F4 簇参数：方向 = 簇内最长 rachis 轴（无 rachis 取最长片轴）；锚点 = rachis 基
+  //（无 rachis 取最低 25% 顶点质心）；权重 = 沿簇轴投影 0..1。
+  TArray<TArray<int32>> ClusterMembers;
+  {
+    TArray<int32> ClusterByRoot;
+    ClusterByRoot.Init(INDEX_NONE, IslandCount);
+    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
+      const int32 Root = FindRoot(IslandIndex);
+      if (!ClusterByRoot.IsValidIndex(Root)) {
+        continue;
+      }
+      if (ClusterByRoot[Root] == INDEX_NONE) {
+        ClusterByRoot[Root] = ClusterMembers.AddDefaulted();
+      }
+      ClusterMembers[ClusterByRoot[Root]].Add(IslandIndex);
+    }
+  }
+  const int32 ClusterCount = ClusterMembers.Num();
+  Out.ClusterOfIsland.Init(INDEX_NONE, IslandCount);
+  Out.ClusterBase.SetNum(ClusterCount);
+  Out.ClusterDirection.SetNum(ClusterCount);
+  Out.ClusterWindPosition.SetNum(ClusterCount);
+  Out.ClusterMaxProjection.Init(0.0f, ClusterCount);
+  for (int32 ClusterIndex = 0; ClusterIndex < ClusterCount; ++ClusterIndex) {
+    const TArray<int32> &Members = ClusterMembers[ClusterIndex];
+    int32 RachisIsland = INDEX_NONE;
+    int32 LongestIsland = Members.Num() > 0 ? Members[0] : INDEX_NONE;
+    for (const int32 IslandIndex : Members) {
+      Out.ClusterOfIsland[IslandIndex] = ClusterIndex;
+      if (Out.Rachis[IslandIndex] != 0 &&
+          (RachisIsland == INDEX_NONE || Out.Length[IslandIndex] > Out.Length[RachisIsland])) {
+        RachisIsland = IslandIndex;
+      }
+      if (LongestIsland != INDEX_NONE && Out.Length[IslandIndex] > Out.Length[LongestIsland]) {
+        LongestIsland = IslandIndex;
+      }
+    }
+    if (LongestIsland == INDEX_NONE) {
+      continue;
+    }
+    const int32 AnchorIsland = RachisIsland != INDEX_NONE ? RachisIsland : LongestIsland;
+    FVector3f Anchor = Out.Base[AnchorIsland];
+    FVector3f Basis = Out.Axis[AnchorIsland];
+    if (RachisIsland == INDEX_NONE) {
+      float MinZ = TNumericLimits<float>::Max();
+      float MaxZ = -TNumericLimits<float>::Max();
+      for (const int32 IslandIndex : Members) {
+        for (const int32 VertexIndex : IslandVertices[IslandIndex]) {
+          const float Z = GetPosition(VertexIndex).Z;
+          MinZ = FMath::Min(MinZ, Z);
+          MaxZ = FMath::Max(MaxZ, Z);
+        }
+      }
+      const float HeightRange = FMath::Max(MaxZ - MinZ, 1e-6f);
+      FVector3d LowSum = FVector3d::ZeroVector;
+      int32 LowCount = 0;
+      for (const int32 IslandIndex : Members) {
+        for (const int32 VertexIndex : IslandVertices[IslandIndex]) {
+          const FVector3f Position = GetPosition(VertexIndex);
+          if (Position.Z <= MinZ + HeightRange * 0.25f) {
+            LowSum += FVector3d(Position);
+            LowCount += 1;
+          }
+        }
+      }
+      Anchor = LowCount > 0 ? FVector3f(LowSum / LowCount) : Out.Base[LongestIsland];
+      Basis = Out.Axis[LongestIsland];
+    }
+    Out.ClusterBase[ClusterIndex] = Anchor;
+    Out.ClusterDirection[ClusterIndex] = Basis;
+    Out.ClusterWindPosition[ClusterIndex] = Islands.TipPosition.IsValidIndex(AnchorIsland)
+                                                 ? Islands.TipPosition[AnchorIsland]
+                                                 : Out.Tip[AnchorIsland];
+    float ClusterMaxProjection = 0.0f;
+    for (const int32 IslandIndex : Members) {
+      for (const int32 VertexIndex : IslandVertices[IslandIndex]) {
+        ClusterMaxProjection = FMath::Max(
+            ClusterMaxProjection,
+            FVector3f::DotProduct(GetPosition(VertexIndex) - Anchor, Basis));
+      }
+    }
+    Out.ClusterMaxProjection[ClusterIndex] = FMath::Max(ClusterMaxProjection, 1e-6f);
+  }
+  Out.ClusterCount = ClusterCount;
+  for (const TArray<int32> &Members : ClusterMembers) {
+    Out.LargestClusterIslands = FMath::Max(Out.LargestClusterIslands, Members.Num());
+  }
+  Out.LargestClusterShare = IslandCount > 0
+                                ? static_cast<float>(Out.LargestClusterIslands) / static_cast<float>(IslandCount)
+                                : 0.0f;
+
+  // 回退判据：结构归组几乎不成立且几乎全是细长 rachis -> 逐片独立相位 + 基部接缝焊接。
+  //
+  // 邻近合并必须计入分子（2026-10-10）：Lady_Fern_h9ecnwd_14 的 3 个连通片全是 rachis
+  // （RachisShare = 1.0）而 F3 合并对数为 0，原式必然触发回退——**这张资产从来没走过结构归组**，
+  // 叶轴与子叶各自成风单元、锚点相距 5.3cm，"茎秆叶片分离"就是这么来的。邻近合并既然把
+  // "贴合且同向"的片并了起来，就说明这个资产的结构归组是有效的，不应再回退。
+  const float EffectiveMergeRatio =
+      Out.CandidatePairCount > 0
+          ? static_cast<float>(Out.MergedPairCount + Out.ProximityMerges) /
+                static_cast<float>(Out.CandidatePairCount)
+          : 0.0f;
+  const float RachisShare = static_cast<float>(Out.RachisCount) / static_cast<float>(IslandCount);
+  Out.bFallbackPerIsland = EffectiveMergeRatio < 0.15f && RachisShare > 0.70f;
+  if (Out.bFallbackPerIsland) {
+    Out.StructuralIslandPairs = FallbackStructuralPairs;
+    Out.ClusterOfIsland.SetNum(IslandCount);
+    Out.ClusterBase.SetNum(IslandCount);
+    Out.ClusterDirection.SetNum(IslandCount);
+    Out.ClusterWindPosition.SetNum(IslandCount);
+    Out.ClusterMaxProjection.SetNum(IslandCount);
+    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
+      Out.ClusterOfIsland[IslandIndex] = IslandIndex;
+      Out.ClusterBase[IslandIndex] = Out.Base[IslandIndex];
+      Out.ClusterDirection[IslandIndex] = Out.Axis[IslandIndex];
+      Out.ClusterWindPosition[IslandIndex] =
+          Islands.TipPosition.IsValidIndex(IslandIndex) ? Islands.TipPosition[IslandIndex]
+                                                        : Out.Tip[IslandIndex];
+      Out.ClusterMaxProjection[IslandIndex] = FMath::Max(Out.MaxProjection[IslandIndex], 1e-6f);
+    }
+    Out.ClusterCount = IslandCount;
+  }
+  for (const uint64 PairKey : Out.StructuralIslandPairs) {
+    const int32 IslandA = static_cast<int32>(PairKey >> 32);
+    const int32 IslandB = static_cast<int32>(PairKey & 0xFFFFFFFFull);
+    if (!Out.ClusterOfIsland.IsValidIndex(IslandA) || !Out.ClusterOfIsland.IsValidIndex(IslandB)) {
+      continue;
+    }
+    const int32 ClusterA = Out.ClusterOfIsland[IslandA];
+    const int32 ClusterB = Out.ClusterOfIsland[IslandB];
+    if (ClusterA == ClusterB) {
+      continue;
+    }
+    Out.StructuralClusterPairs.Add(AssetHivePlantWind::PlantWindUnitPairKey(ClusterA, ClusterB));
+  }
+  return true;
+}
+
 static bool ComputePlantWindFronds(FMeshDescription &Mesh,
                                    const FPlantWindIslandParameters &Islands,
                                    EPlantWindFrondMergeMode MergeMode,
-                                   FPlantWindFrondParameters &Out) {
+                                   FPlantWindFrondParameters &Out,
+                                   FPlantWindFernStructure *OutFernStructure = nullptr) {
   Out = FPlantWindFrondParameters();
   const int32 IslandCount = Islands.Num();
   const int32 VertexCount = Mesh.Vertices().Num();
@@ -1467,262 +2713,71 @@ static bool ComputePlantWindFronds(FMeshDescription &Mesh,
   Attributes.Register(true);
   TVertexAttributesRef<FVector3f> Positions = Attributes.GetVertexPositions();
 
-  // v7（2026-10-07）Fern 每片叶一个风单元：
-  //   旧版（v6）把 1–2cm 内接触的连通片全量合并，遇到冠部相接的蕨类会把整株并成
-  //   一个风单元，所有叶片共享同一弯曲方向/相位，实机表现为“整株蒲扇式倒伏”。
-  //   v7 改为两级结构：
-  //   1) core：长度 >= 0.45 * 最长片的卡片（叶轴/叶片主体）；
-  //   2) 只有近似重合（<= CoreMergeDistance）且径向方位一致的 core 才合并——
-  //      同一片叶被 UV 缝/叶轴拆成的两半；相邻叶片即使在冠部靠近也各自成叶；
-  //   3) 小叶卡片（satellite）按“最近 core + 径向方位兼容”归属，<= 4cm 归入对应叶；
-  //      同片叶共享锚点/方向/沿轴权重场，不同叶片独立运动。
+  // 合并模式：
+  //   ConnectedCluster（Fern）—— F1–F6 结构化推导：逐片 PCA 结构轴 + rachis/leaflet 类型 +
+  //     结构邻接归组（贴合/基部附着/轴向外延）+ 簇参数（方向/锚点/沿轴权重）+ F5 结构接缝焊接
+  //     + 每簇哈希相位。旧版（v6/v7）的“core + satellite 径向方位”启发式已被 F1–F6 取代：
+  //     旧版按 1–2cm 接触全量合并会把冠部相接的蕨类整株并成一个风单元（“整株蒲扇式倒伏”），
+  //     v7 的 core 判定又依赖径向方位，无法处理多枝叶朝外延伸类资产（蕨类/小灌木/丛状半球草本）。
+  //   FrondLike（Grass）—— 主籽 + 短子叶的连通簇合并（下面 Grass 路径）。
+  //   None（Bush）—— 逐片记录，branch2 走 UV3。
   if (MergeMode == EPlantWindFrondMergeMode::ConnectedCluster) {
-    // 不透明裁切（_OPAQUE）网格可能有数万个碎片，per-frond 推导过重；该路径由
-    // CardReference 覆盖，找不到参考时回退到逐片参数。
+    // Fern 结构化风推导（2026-10-09 定稿 F1–F6；离线原型 fern-rule5.cjs，24 个 Megascans
+    // 植被样本全量回归）：逐片 PCA 结构轴 -> rachis/leaflet 类型 -> 结构邻接归组（贴合 / 基部
+    // 附着 / 轴向外延，硬约束 = 每簇 <=2 条 rachis 且纯平行贴合双轴不并 + 簇跨度上限）->
+    // 簇参数（方向 = 簇内最长 rachis 轴，锚点 = rachis 基，权重 = 沿簇轴投影）-> F5 结构接缝
+    // 焊接（BlendPlantWindSeams）-> 每簇哈希相位（方向抖动 + ripple）。
+    // 不透明确切（_OPAQUE）网格可能有数万个碎片，per-frond 推导过重；该路径由 CardReference
+    // 覆盖，找不到参考时回退到逐片参数。
     constexpr int32 MaxFernIslandsForPerFrond = 2048;
     if (IslandCount > MaxFernIslandsForPerFrond) {
       return false;
     }
-
-    TArray<FVector3f> IslandCenters;
-    TArray<FVector3f> IslandMin;
-    TArray<FVector3f> IslandMax;
-    TArray<int32> IslandVertexCounts;
-    TArray<TArray<int32>> IslandVertices;
-    IslandCenters.Init(FVector3f::ZeroVector, IslandCount);
-    IslandMin.Init(FVector3f(TNumericLimits<float>::Max()), IslandCount);
-    IslandMax.Init(FVector3f(-TNumericLimits<float>::Max()), IslandCount);
-    IslandVertexCounts.Init(0, IslandCount);
-    IslandVertices.SetNum(IslandCount);
-    float MaxIslandLength = 0.0f;
-    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
-      MaxIslandLength = FMath::Max(MaxIslandLength, Islands.MaxProjection[IslandIndex]);
-    }
-    if (MaxIslandLength <= KINDA_SMALL_NUMBER) {
+    FPlantWindFernStructure Structure;
+    if (!ComputePlantWindFernStructure(
+            VertexCount,
+            [&Positions](int32 VertexIndex) {
+              return Positions[FVertexID(VertexIndex)];
+            },
+            Islands, Structure)) {
       return false;
     }
-    for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
-      const int32 IslandIndex = Islands.IslandOfVertex[VertexIndex];
-      if (!IslandVertices.IsValidIndex(IslandIndex)) {
-        continue;
-      }
-      const FVector3f Position = Positions[FVertexID(VertexIndex)];
-      IslandCenters[IslandIndex] += Position;
-      IslandVertexCounts[IslandIndex] += 1;
-      IslandVertices[IslandIndex].Add(VertexIndex);
-      for (int32 Axis = 0; Axis < 3; ++Axis) {
-        IslandMin[IslandIndex][Axis] =
-            FMath::Min(IslandMin[IslandIndex][Axis], Position[Axis]);
-        IslandMax[IslandIndex][Axis] =
-            FMath::Max(IslandMax[IslandIndex][Axis], Position[Axis]);
-      }
-    }
-    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
-      if (IslandVertexCounts[IslandIndex] > 0) {
-        IslandCenters[IslandIndex] /=
-            static_cast<float>(IslandVertexCounts[IslandIndex]);
-      }
-    }
-
-    const FVector3f MeshSize = Islands.MeshMax - Islands.MeshMin;
-    const float MeshDiagonal = MeshSize.Size();
-    const FVector3f MeshCenter = (Islands.MeshMin + Islands.MeshMax) * 0.5f;
-    // 离线回归（Beech Fern 127 片 / Lady Fern 43–45 片）：同片叶被拆开的
-    // core 对距离 0–0.02cm；不同叶片在冠部的最近距离通常 >=0.35cm。阈值 0.25cm
-    // 只吃掉真正的近重合碎片，避免把相邻叶片串成一片。
-    const float CoreMergeDistance =
-        FMath::Clamp(MeshDiagonal * 0.0035f, 0.05f, 0.3f);
-    const float SatelliteAssignDistance =
-        FMath::Clamp(MeshDiagonal * 0.055f, 1.5f, 4.0f);
-    Out.JoinDistance = CoreMergeDistance;
-
-    TArray<FVector2f> IslandAzimuth;
-    IslandAzimuth.SetNumUninitialized(IslandCount);
-    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
-      const FVector3f Delta = IslandCenters[IslandIndex] - MeshCenter;
-      const float HorizontalLength =
-          FMath::Sqrt(Delta.X * Delta.X + Delta.Y * Delta.Y);
-      IslandAzimuth[IslandIndex] =
-          HorizontalLength > 0.1f
-              ? FVector2f(Delta.X / HorizontalLength, Delta.Y / HorizontalLength)
-              : FVector2f::ZeroVector;
-    }
-    auto AzimuthDot = [&IslandAzimuth](int32 A, int32 B) {
-      const FVector2f &AzimuthA = IslandAzimuth[A];
-      const FVector2f &AzimuthB = IslandAzimuth[B];
-      if (AzimuthA.SizeSquared() < 0.01f || AzimuthB.SizeSquared() < 0.01f) {
-        return 1.0f;  // 中心附近方位退化，交由距离/方向判定。
-      }
-      return FVector2f::DotProduct(AzimuthA, AzimuthB);
-    };
-    auto BoundsDistanceSquared = [](const FVector3f &MinA, const FVector3f &MaxA,
-                                    const FVector3f &MinB, const FVector3f &MaxB) {
-      const float DX = FMath::Max(FMath::Max(MinA.X - MaxB.X, MinB.X - MaxA.X), 0.0f);
-      const float DY = FMath::Max(FMath::Max(MinA.Y - MaxB.Y, MinB.Y - MaxA.Y), 0.0f);
-      const float DZ = FMath::Max(FMath::Max(MinA.Z - MaxB.Z, MinB.Z - MaxA.Z), 0.0f);
-      return DX * DX + DY * DY + DZ * DZ;
-    };
-    auto MinVertexDistanceSquared = [&IslandVertices, &Positions](int32 A, int32 B) {
-      const TArray<int32> &VerticesA = IslandVertices[A];
-      const TArray<int32> &VerticesB = IslandVertices[B];
-      const TArray<int32> &Outer =
-          VerticesA.Num() <= VerticesB.Num() ? VerticesA : VerticesB;
-      const TArray<int32> &Inner =
-          VerticesA.Num() <= VerticesB.Num() ? VerticesB : VerticesA;
-      float Best = TNumericLimits<float>::Max();
-      for (const int32 VertexA : Outer) {
-        const FVector3f PositionA = Positions[FVertexID(VertexA)];
-        for (const int32 VertexB : Inner) {
-          const float Distance = FVector3f::DistSquared(
-              PositionA, Positions[FVertexID(VertexB)]);
-          if (Distance < Best) {
-            Best = Distance;
-          }
-        }
-      }
-      return Best;
-    };
-
-    TArray<int32> Cores;
-    const float CoreLengthThreshold = MaxIslandLength * 0.45f;
-    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
-      if (Islands.MaxProjection[IslandIndex] >= CoreLengthThreshold) {
-        Cores.Add(IslandIndex);
-      }
-    }
-    if (Cores.Num() == 0) {
+    if (Structure.ClusterCount <= 0) {
       return false;
     }
-
-    TArray<int32> CoreParents;
-    CoreParents.SetNumUninitialized(IslandCount);
-    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
-      CoreParents[IslandIndex] = IslandIndex;
+    if (OutFernStructure != nullptr) {
+      *OutFernStructure = Structure;
     }
-    auto FindCoreRoot = [&CoreParents](int32 Index) {
-      while (CoreParents[Index] != Index) {
-        CoreParents[Index] = CoreParents[CoreParents[Index]];
-        Index = CoreParents[Index];
-      }
-      return Index;
-    };
-    const float CoreMergeDistanceSquared = CoreMergeDistance * CoreMergeDistance;
-    for (int32 CoreA = 0; CoreA < Cores.Num(); ++CoreA) {
-      for (int32 CoreB = CoreA + 1; CoreB < Cores.Num(); ++CoreB) {
-        const int32 IslandA = Cores[CoreA];
-        const int32 IslandB = Cores[CoreB];
-        if (BoundsDistanceSquared(IslandMin[IslandA], IslandMax[IslandA],
-                                  IslandMin[IslandB], IslandMax[IslandB]) >
-            CoreMergeDistanceSquared + 1e-6f) {
-          continue;
-        }
-        if (AzimuthDot(IslandA, IslandB) < 0.9f) {
-          continue;
-        }
-        if (FVector3f::DotProduct(Islands.Direction[IslandA],
-                                  Islands.Direction[IslandB]) < 0.6f) {
-          continue;
-        }
-        if (MinVertexDistanceSquared(IslandA, IslandB) > CoreMergeDistanceSquared + 1e-6f) {
-          continue;
-        }
-        const int32 RootA = FindCoreRoot(IslandA);
-        const int32 RootB = FindCoreRoot(IslandB);
-        if (RootA != RootB) {
-          CoreParents[RootB] = RootA;
-        }
-      }
-    }
-
-    TArray<int32> UnitOfIsland;
-    UnitOfIsland.Init(INDEX_NONE, IslandCount);
-    TArray<TArray<int32>> UnitMembers;
-    TMap<int32, int32> UnitByRoot;
-    for (const int32 CoreIsland : Cores) {
-      const int32 Root = FindCoreRoot(CoreIsland);
-      int32 &UnitIndex = UnitByRoot.FindOrAdd(Root, INDEX_NONE);
-      if (UnitIndex == INDEX_NONE) {
-        UnitIndex = UnitMembers.AddDefaulted();
-      }
-      UnitOfIsland[CoreIsland] = UnitIndex;
-      UnitMembers[UnitIndex].Add(CoreIsland);
-    }
-    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
-      if (UnitOfIsland[IslandIndex] != INDEX_NONE) {
-        continue;
-      }
-      float BestDistanceSquared =
-          SatelliteAssignDistance * SatelliteAssignDistance;
-      int32 BestRoot = INDEX_NONE;
-      for (const int32 CoreIsland : Cores) {
-        if (AzimuthDot(IslandIndex, CoreIsland) < 0.3f) {
-          continue;
-        }
-        if (BoundsDistanceSquared(IslandMin[IslandIndex], IslandMax[IslandIndex],
-                                  IslandMin[CoreIsland], IslandMax[CoreIsland]) >
-            BestDistanceSquared + 1e-6f) {
-          continue;
-        }
-        const float DistanceSquared =
-            MinVertexDistanceSquared(IslandIndex, CoreIsland);
-        if (DistanceSquared < BestDistanceSquared) {
-          BestDistanceSquared = DistanceSquared;
-          BestRoot = FindCoreRoot(CoreIsland);
-        }
-      }
-      if (BestRoot != INDEX_NONE) {
-        const int32 UnitIndex = UnitByRoot.FindChecked(BestRoot);
-        UnitOfIsland[IslandIndex] = UnitIndex;
-        UnitMembers[UnitIndex].Add(IslandIndex);
-      } else {
-        const int32 UnitIndex = UnitMembers.AddDefaulted();
-        UnitOfIsland[IslandIndex] = UnitIndex;
-        UnitMembers[UnitIndex].Add(IslandIndex);
-      }
-    }
-
     Out.FrondOfIsland.Init(INDEX_NONE, IslandCount);
-    for (int32 UnitIndex = 0; UnitIndex < UnitMembers.Num(); ++UnitIndex) {
-      const TArray<int32> &Members = UnitMembers[UnitIndex];
-      if (Members.Num() == 0) {
-        continue;
-      }
-      int32 LeadIsland = Members[0];
-      for (const int32 IslandIndex : Members) {
-        if (Islands.MaxProjection[IslandIndex] >
-            Islands.MaxProjection[LeadIsland]) {
-          LeadIsland = IslandIndex;
-        }
-      }
-      const int32 FrondIndex =
-          Out.BasePosition.Add(Islands.BasePosition[LeadIsland]);
-      Out.Direction.Add(Islands.Direction[LeadIsland]);
-      Out.MaxProjection.Add(0.0f);
-      for (const int32 IslandIndex : Members) {
-        Out.FrondOfIsland[IslandIndex] = FrondIndex;
-      }
-    }
-    Out.ConsolidatedFrondCount = Out.Num();
-
-    for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
-      const int32 IslandIndex = Islands.IslandOfVertex[VertexIndex];
-      const int32 FrondIndex =
-          Out.FrondOfIsland.IsValidIndex(IslandIndex)
-              ? Out.FrondOfIsland[IslandIndex]
+    Out.BasePosition.SetNum(Structure.ClusterCount);
+    Out.TipPosition.SetNum(Structure.ClusterCount);
+    Out.Direction.SetNum(Structure.ClusterCount);
+    Out.MaxProjection.Init(0.0f, Structure.ClusterCount);
+    for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
+      const int32 ClusterIndex =
+          Structure.ClusterOfIsland.IsValidIndex(IslandIndex)
+              ? Structure.ClusterOfIsland[IslandIndex]
               : INDEX_NONE;
-      if (!Out.BasePosition.IsValidIndex(FrondIndex)) {
+      Out.FrondOfIsland[IslandIndex] = ClusterIndex;
+      if (!Structure.ClusterBase.IsValidIndex(ClusterIndex)) {
         continue;
       }
-      const float Projection = FVector3f::DotProduct(
-          Positions[FVertexID(VertexIndex)] - Out.BasePosition[FrondIndex],
-          Out.Direction[FrondIndex]);
-      Out.MaxProjection[FrondIndex] =
-          FMath::Max(Out.MaxProjection[FrondIndex], Projection);
+      Out.BasePosition[ClusterIndex] = Structure.ClusterBase[ClusterIndex];
+      Out.TipPosition[ClusterIndex] =
+          Structure.ClusterWindPosition.IsValidIndex(ClusterIndex)
+              ? Structure.ClusterWindPosition[ClusterIndex]
+              : Structure.ClusterBase[ClusterIndex];
+      Out.Direction[ClusterIndex] = Structure.ClusterDirection[ClusterIndex];
+      Out.MaxProjection[ClusterIndex] =
+          FMath::Max(Structure.ClusterMaxProjection[ClusterIndex], 1e-6f);
     }
+    Out.ConsolidatedFrondCount = Structure.ClusterCount;
+    Out.JoinDistance = Structure.JoinDistance;
     return Out.Num() > 0;
   }
 
-  // 1) 连通片按跨片近邻合并：顶点距离 <= JoinDistance 视为同一结构（叶轴-叶柄交界）。
+  // ---- Grass / FrondLike 路径（Fern 已在上面走 F1–F6 结构归组）----
+  // 连通片按跨片近邻合并：顶点距离 <= JoinDistance 视为同一结构（叶轴-叶柄交界）。
   TArray<int32> Parents;
   Parents.SetNumUninitialized(IslandCount);
   for (int32 IslandIndex = 0; IslandIndex < IslandCount; ++IslandIndex) {
@@ -1826,8 +2881,11 @@ static bool ComputePlantWindFronds(FMeshDescription &Mesh,
   // 3) 结构判定 + 建立风单元：主轴长度至少为参考片长的 2 倍（>=3 片取中位数、2 片取较短者），
   //    且簇跨度不超过主轴长度的 1.8 倍（排除把整株/整丛连成一簇的过度合并）。
   Out.FrondOfIsland.Init(INDEX_NONE, IslandCount);
-  auto AddFrond = [&Out](const FVector3f &BasePosition, const FVector3f &Direction) {
+  auto AddFrond = [&Out](const FVector3f &BasePosition,
+                         const FVector3f &WindPosition,
+                         const FVector3f &Direction) {
     const int32 FrondIndex = Out.BasePosition.Add(BasePosition);
+    Out.TipPosition.Add(WindPosition);
     Out.Direction.Add(Direction);
     Out.MaxProjection.Add(0.0f);
     return FrondIndex;
@@ -1860,8 +2918,12 @@ static bool ComputePlantWindFronds(FMeshDescription &Mesh,
           ClusterSpan <= MaxLength * 1.8f;
     }
     if (bFrondLike) {
-      const int32 FrondIndex =
-          AddFrond(Islands.BasePosition[LeadIsland], Islands.Direction[LeadIsland]);
+      const int32 FrondIndex = AddFrond(
+          Islands.BasePosition[LeadIsland],
+          Islands.TipPosition.IsValidIndex(LeadIsland)
+              ? Islands.TipPosition[LeadIsland]
+              : Islands.BasePosition[LeadIsland],
+          Islands.Direction[LeadIsland]);
       for (const int32 IslandIndex : Members) {
         Out.FrondOfIsland[IslandIndex] = FrondIndex;
       }
@@ -1869,7 +2931,11 @@ static bool ComputePlantWindFronds(FMeshDescription &Mesh,
     } else {
       for (const int32 IslandIndex : Members) {
         Out.FrondOfIsland[IslandIndex] = AddFrond(
-            Islands.BasePosition[IslandIndex], Islands.Direction[IslandIndex]);
+            Islands.BasePosition[IslandIndex],
+            Islands.TipPosition.IsValidIndex(IslandIndex)
+                ? Islands.TipPosition[IslandIndex]
+                : Islands.BasePosition[IslandIndex],
+            Islands.Direction[IslandIndex]);
       }
     }
   }
@@ -1925,12 +2991,27 @@ static FString ResolveOpaquePlantWindReferenceFile(const FString &CutSourceFile)
 struct FPlantWindCardReference {
   TArray<AssetHivePlantWind::FPlantWindCard> Cards;
   AssetHivePlantWind::FPlantWindCardSurface Surface;
+  // SpeedTree branch1 权重按整簇高度归一化（ST9 实测）。不透明裁切网格只剩上部叶片，
+  // 自身包围盒会丢掉根部高度，必须沿用来源（未裁切）网格的 MeshMin/MeshMax。
+  FVector3f MeshMin = FVector3f::ZeroVector;
+  FVector3f MeshMax = FVector3f::ZeroVector;
+  // Fern 结构簇之间的结构邻接（卡片索引对）。不透明裁切网格的风属性取自来源结构簇（卡片），
+  // 因此裁切网格的 F5 焊接也必须以「卡片」为风单元，并用这套来源结构对判定无条件焊接接缝；
+  // 否则裁切网格自身的 F1–F6 结构与来源属性错位，茎秆-子叶等铰接处在高权重区漏焊（branch1 拉扯）。
+  TSet<uint64> StructuralCardPairs;
 
   bool IsValid() const { return Cards.Num() > 0 && Surface.IsValid(); }
 
+  bool HasBounds() const {
+    return MeshMax.Z - MeshMin.Z > KINDA_SMALL_NUMBER;
+  }
+
   void Reset() {
     Cards.Reset();
+    StructuralCardPairs.Reset();
     Surface = AssetHivePlantWind::FPlantWindCardSurface();
+    MeshMin = FVector3f::ZeroVector;
+    MeshMax = FVector3f::ZeroVector;
   }
 };
 
@@ -2057,6 +3138,7 @@ static bool BuildPlantWindCardReference(const UStaticMesh *ReferenceMesh,
   Out.Surface.CoarseTriangleGrid.Reset();
   Out.Surface.TriangleUVs.Reset();
   Out.Surface.UVTriangleGrid.Reset();
+  Out.StructuralCardPairs.Reset();
   if (!ReferenceMesh || ReferenceMesh->GetNumSourceModels() == 0) {
     return false;
   }
@@ -2068,12 +3150,18 @@ static bool BuildPlantWindCardReference(const UStaticMesh *ReferenceMesh,
   if (!ComputePlantWindIslands(*Mesh, IslandParameters)) {
     return false;
   }
+  Out.MeshMin = IslandParameters.MeshMin;
+  Out.MeshMax = IslandParameters.MeshMax;
   // Grass（frond 判定）/ Fern（接触连通簇）：卡片按 SpeedTree frond 规则构建——叶轴 + 其子叶
   // 合并成同一张卡（共享锚点/方向/沿轴权重场）。裁切碎片经 UV0 反查到卡后即取同一套参数。
   FPlantWindFrondParameters FrondParameters;
+  // Fern（ConnectedCluster）用同一套 F1–F6 结构簇参数构建参考卡片，保证裁切网格映射回卡片后
+  // 的锚点/方向/权重场与源网格一致。
+  FPlantWindFernStructure FernStructure;
   const bool bHasFronds =
       MergeMode != EPlantWindFrondMergeMode::None &&
-      ComputePlantWindFronds(*Mesh, IslandParameters, MergeMode, FrondParameters) &&
+      ComputePlantWindFronds(*Mesh, IslandParameters, MergeMode, FrondParameters,
+                             &FernStructure) &&
       FrondParameters.Num() > 0;
   FStaticMeshAttributes Attributes(*Mesh);
   Attributes.Register(true);
@@ -2087,12 +3175,28 @@ static bool BuildPlantWindCardReference(const UStaticMesh *ReferenceMesh,
     AssetHivePlantWind::FPlantWindCard &Card = Out.Cards[CardIndex];
     if (bHasFronds) {
       Card.BasePosition = FrondParameters.BasePosition[CardIndex];
+      Card.WindPosition =
+          FrondParameters.TipPosition.IsValidIndex(CardIndex)
+              ? FrondParameters.TipPosition[CardIndex]
+              : FrondParameters.BasePosition[CardIndex];
       Card.Direction = FrondParameters.Direction[CardIndex];
       Card.MaxProjection = FrondParameters.MaxProjection[CardIndex];
     } else {
       Card.BasePosition = IslandParameters.BasePosition[CardIndex];
+      Card.WindPosition =
+          IslandParameters.TipPosition.IsValidIndex(CardIndex)
+              ? IslandParameters.TipPosition[CardIndex]
+              : IslandParameters.BasePosition[CardIndex];
       Card.Direction = IslandParameters.Direction[CardIndex];
       Card.MaxProjection = IslandParameters.MaxProjection[CardIndex];
+    }
+  }
+  // 来源结构簇（= 卡片）之间的结构邻接：裁切网格按卡片作 wind unit 时复用这套「必焊」集合。
+  Out.StructuralCardPairs.Reset();
+  if (bHasFronds) {
+    Out.StructuralCardPairs.Reserve(FernStructure.StructuralClusterPairs.Num());
+    for (const uint64 PairKey : FernStructure.StructuralClusterPairs) {
+      Out.StructuralCardPairs.Add(PairKey);
     }
   }
   Out.Surface.Positions.SetNumUninitialized(VertexCount);
@@ -2138,8 +3242,22 @@ static bool BuildPlantWindCardReference(const UStaticMesh *ReferenceMesh,
   Out.Surface.BuildUVGrid();
   return true;
 }
+// 卡片尺度权重的分母下限（cm）。
+//
+// 权重 = 顶点在卡片轴上的投影 / MaxProjection，后者是「卡片沿自身轴向的跨度」。当一张卡片本身
+// 只有 0.6~0.9cm 长（Megascans 的小叶片被裁切成短卡片时很常见），权重斜坡会在相邻顶点之间
+// 走出 0.2~0.3 的落差——这是真实的连续梯度，紧贴的碎片之间不会裂开（位置重合顶点的位移差
+// 实测 ≤0.0004cm），但整片叶子会在极短距离内被弯折，视觉上是「局部被拧住」。
+// 给分母设 2cm 下限后权重梯度被限制在 1/2 每 cm，实测 Desert_Cotton_l9uj50a_07 跨接缝
+// 最大位移差 0.52cm -> 0.19cm、超过 0.1 的边 113 -> 0，代价是 30% 的短叶片摆幅降到约 55%
+// （这些叶片本身只有厘米级，观感影响小）。调大到 5cm 可进一步压到 0.08cm，但 66% 的卡片都会被影响。
+// 下限只作用于卡片尺度权重（Fern/Bush）；Grass 走整簇高度归一化，不受影响。
+constexpr float MinPlantWindWeightSpan = 2.0f;
+
 // 合成 SpeedTree 风：写 branch1（UV1/UV2）与 branch2（UV3）数据。
-// 权重以“原始卡片”为尺度：Masked 网格自身的连通片就是卡片；不透明裁切（_OPAQUE）网格的碎片
+// Grass（FrondLike）权重按 SpeedTree 原生推导：branch1 权重 = 顶点在整簇高度上的归一化位置
+//   （ST9 实测 ThickGrassTall 的 weight 与 Z 完全线性，残差 ±0.01；单叶/横向草 weight 恒 0）。
+// Fern/Bush 权重仍以“原始卡片”为尺度：Masked 网格自身的连通片就是卡片；不透明裁切（_OPAQUE）网格的碎片
 //   远小于卡片，必须用 CardReference（未裁切 FBX 推导的卡片参数）映射回卡片再取权重，否则碎片内
 //   权重瞬间走完 0..1，整片被拉成条状。没有参考时回退到按自身碎片推导（旧行为）。
 //   裁切网格的卡片归属优先用 UV0 反查 CardReference（裁切网格完整继承源 UV0），UV 缺失或未命中
@@ -2156,9 +3274,13 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
 
   struct FPlantWindIsland {
     FVector3f BasePosition = FVector3f::ZeroVector;
+    // UV1.x（PackedPosition）编码用的位置：SpeedTree 实测为叶片顶部，不是基部。
+    FVector3f WindPosition = FVector3f::ZeroVector;
     FVector3f Direction = FVector3f(0.0f, 0.0f, 1.0f);
     float PackedPosition = 0.0f;
     float PackedDirection = 0.0f;
+    // UV2.g：SpeedTree 的 ripple 权重（逐风单元/逐叶）。
+    float RippleWeight = 0.0f;
     int32 PositionCode = 0;
     int32 DirectionCode = 0;
     float MaxProjection = 1.0f;
@@ -2171,6 +3293,7 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
   int32 TotalIslandsBeforeWeld = 0;
   int32 TotalWeldMergedVertices = 0;
   int32 TotalVertices = 0;
+  int32 TotalContactBlendedVertices = 0;
   int32 TotalCardMappedVertices = 0;
   int32 TotalCardFallbackVertices = 0;
   int32 TotalCardMappedIslands = 0;
@@ -2182,10 +3305,22 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
   int32 TotalConsistencyGroups = 0;
   int32 TotalConsistencyMergedIslands = 0;
   int32 TotalConsistencyMaxGroupIslands = 0;
+  // 因组规模上限被放弃的合并次数（日志用）。
+  int32 TotalConsistencyCappedUnions = 0;
   float TotalNearCardDistance = 0.0f;
   int32 TotalConsolidatedFronds = 0;
   int32 TotalFrondMergedIslands = 0;
   float TotalJoinDistanceMax = 0.0f;
+  // Fern（F1–F6）统计：簇数 / rachis / 结构边 / 回退 LOD / 接缝焊接顶点。
+  int32 TotalFernClusters = 0;
+  int32 TotalFernRachis = 0;
+  int32 TotalFernCandidatePairs = 0;
+  int32 TotalFernMergedPairs = 0;
+  int32 TotalFernRejectedSpan = 0;
+  int32 TotalFernRejectedRachis = 0;
+  int32 TotalFernFallbackLods = 0;
+  int32 TotalFernStructuralSeams = 0;
+  int32 TotalSeamWeldedVertices = 0;
 
   for (int32 LodIndex = 0; LodIndex < StaticMesh->GetNumSourceModels(); ++LodIndex) {
     FMeshDescription *Mesh = StaticMesh->GetMeshDescription(LodIndex);
@@ -2206,20 +3341,50 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
     }
     // Grass / Fern 按 SpeedTree frond 规则共享风单元；Bush（branch2->UV3）保留逐片记录。
     FPlantWindFrondParameters FrondParameters;
+    // F1–F6 结构（Fern 专用）：簇参数 + 结构接缝集合，供下面的 F5 接缝焊接使用。
+    FPlantWindFernStructure FernStructure;
     const bool bUseFronds =
         MergeMode != EPlantWindFrondMergeMode::None &&
-        ComputePlantWindFronds(*Mesh, IslandParameters, MergeMode, FrondParameters) &&
+        ComputePlantWindFronds(*Mesh, IslandParameters, MergeMode, FrondParameters,
+                               &FernStructure) &&
         FrondParameters.Num() > 0;
 
     const FVector3f MeshSize = IslandParameters.MeshMax - IslandParameters.MeshMin;
+    // Grass 高度归一化（SpeedTree 原生口径）：裁切网格继承源卡片空间坐标，但自身只保留
+    // 上部叶片，直接用自身 bbox 会把整片压到接近 1（僵硬）；有来源参考时优先用来源包围盒。
+    const FVector3f WindBoundsMin =
+        (bUseCardReference && CardReference->HasBounds())
+            ? CardReference->MeshMin
+            : IslandParameters.MeshMin;
+    const FVector3f WindBoundsMax =
+        (bUseCardReference && CardReference->HasBounds())
+            ? CardReference->MeshMax
+            : IslandParameters.MeshMax;
+    const float WindBoundsHeight =
+        FMath::Max(WindBoundsMax.Z - WindBoundsMin.Z, KINDA_SMALL_NUMBER);
     const FVector3f SafeMeshSize(FMath::Max(MeshSize.X, KINDA_SMALL_NUMBER),
                                  FMath::Max(MeshSize.Y, KINDA_SMALL_NUMBER),
                                  FMath::Max(MeshSize.Z, KINDA_SMALL_NUMBER));
-    auto PackWindSource = [&IslandParameters, &SafeMeshSize, bWriteBranch2](
-                              FPlantWindIsland &Source,
-                              const FVector3f &BasePosition,
-                              const FVector3f &Direction, float MaxProjection) {
+    // F6 每簇哈希相位：Fern / Grass 都要把各风单元的摆动方向错开（否则整株同步摆动）；
+    // Bush 的 branch2 保留原方向编码。Fern 的相位锚点 = 结构簇基（rachis 基），同簇内叶轴与
+    // 小叶共享同一相位，簇与簇之间相位独立 -> 叶间相对运动。
+    const bool bJitterWindPhase =
+        MergeMode == EPlantWindFrondMergeMode::FrondLike ||
+        MergeMode == EPlantWindFrondMergeMode::ConnectedCluster;
+    // UV2.g（RippleWeight）只对 frond 类（Grass/Fern）合成；Bush 的 branch2 走 UV3，保持 0。
+    const bool bWriteRippleWeight =
+        MergeMode == EPlantWindFrondMergeMode::FrondLike ||
+        MergeMode == EPlantWindFrondMergeMode::ConnectedCluster;
+    auto PackWindSource = [&IslandParameters, &SafeMeshSize, bWriteBranch2,
+                           bJitterWindPhase,
+                           bWriteRippleWeight](FPlantWindIsland &Source,
+                                               const FVector3f &BasePosition,
+                                               const FVector3f &WindPosition,
+                                               const FVector3f &Direction,
+                                               const FVector3f &PhaseAnchor,
+                                               float MaxProjection) {
       Source.BasePosition = BasePosition;
+      Source.WindPosition = WindPosition;
       Source.Direction = Direction;
       Source.MaxProjection = MaxProjection;
       const FVector3f Normalized(
@@ -2232,9 +3397,31 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
           FMath::Clamp(
               (BasePosition.Z - IslandParameters.MeshMin.Z) / SafeMeshSize.Z, 0.0f,
               1.0f));
-      Source.PackedPosition = AssetHivePlantWind::PackPosition(Normalized);
+      // UV1.x：SpeedTree 用「叶片顶部位置」编码（实测对齐），与基部的 Anchors 分开。
+      const FVector3f NormalizedWind(
+          FMath::Clamp(
+              (WindPosition.X - IslandParameters.MeshMin.X) / SafeMeshSize.X, 0.0f,
+              1.0f),
+          FMath::Clamp(
+              (WindPosition.Y - IslandParameters.MeshMin.Y) / SafeMeshSize.Y, 0.0f,
+              1.0f),
+          FMath::Clamp(
+              (WindPosition.Z - IslandParameters.MeshMin.Z) / SafeMeshSize.Z, 0.0f,
+              1.0f));
+      Source.PackedPosition = AssetHivePlantWind::PackPosition(NormalizedWind);
+      // UV1.y：SpeedTree 逐叶编码"生长方向"（同时决定振荡相位）。相位锚点 Grass=单叶、
+      // Fern/Bush=叶片簇，保证同簇相邻片（叶轴/子叶）不掉相位差、单叶之间又能错开。
+      const FVector3f WindDirection =
+          bJitterWindPhase
+              ? AssetHivePlantWind::JitterGrassWindDirection(PhaseAnchor, Direction)
+              : Direction;
       Source.PackedDirection =
-          AssetHivePlantWind::PackDirection(Direction, /*bQuantized=*/false);
+          AssetHivePlantWind::PackDirection(WindDirection, /*bQuantized=*/false);
+      // UV2.g：ripple 权重（每片叶幅度不同 -> 打破"叶片粘住"）。
+      Source.RippleWeight =
+          bWriteRippleWeight
+              ? AssetHivePlantWind::PackGrassRippleWeight(PhaseAnchor)
+              : 0.0f;
       Source.PositionCode = AssetHivePlantWind::ToUV3Code(
           Source.PackedPosition, AssetHivePlantWind::PositionMin,
           AssetHivePlantWind::PositionRange, AssetHivePlantWind::UV3CodeMax);
@@ -2254,14 +3441,32 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
           bUseFronds && FrondParameters.FrondOfIsland.IsValidIndex(IslandIndex)
               ? FrondParameters.FrondOfIsland[IslandIndex]
               : INDEX_NONE;
+      // 相位锚点：Grass（FrondLike）按单叶锚点 -> 同簇叶片相位/ripple 各不相同；
+      // Fern（ConnectedCluster）按叶片簇锚点 -> 叶轴与子叶共享相位，避免接缝分离。
+      const bool bPerIslandPhase =
+          MergeMode == EPlantWindFrondMergeMode::FrondLike &&
+          IslandParameters.BasePosition.IsValidIndex(IslandIndex);
+      const FVector3f PhaseAnchor =
+          IslandParameters.BasePosition.IsValidIndex(IslandIndex)
+              ? IslandParameters.BasePosition[IslandIndex]
+              : Islands[IslandIndex].BasePosition;
       if (FrondParameters.BasePosition.IsValidIndex(FrondIndex)) {
-        PackWindSource(Islands[IslandIndex], FrondParameters.BasePosition[FrondIndex],
-                       FrondParameters.Direction[FrondIndex],
-                       FrondParameters.MaxProjection[FrondIndex]);
+        PackWindSource(
+            Islands[IslandIndex], FrondParameters.BasePosition[FrondIndex],
+            FrondParameters.TipPosition.IsValidIndex(FrondIndex)
+                ? FrondParameters.TipPosition[FrondIndex]
+                : FrondParameters.BasePosition[FrondIndex],
+            FrondParameters.Direction[FrondIndex],
+            bPerIslandPhase ? PhaseAnchor : FrondParameters.BasePosition[FrondIndex],
+            FrondParameters.MaxProjection[FrondIndex]);
       } else {
-        PackWindSource(Islands[IslandIndex], IslandParameters.BasePosition[IslandIndex],
-                       IslandParameters.Direction[IslandIndex],
-                       IslandParameters.MaxProjection[IslandIndex]);
+        PackWindSource(
+            Islands[IslandIndex], IslandParameters.BasePosition[IslandIndex],
+            IslandParameters.TipPosition.IsValidIndex(IslandIndex)
+                ? IslandParameters.TipPosition[IslandIndex]
+                : IslandParameters.BasePosition[IslandIndex],
+            IslandParameters.Direction[IslandIndex], PhaseAnchor,
+            IslandParameters.MaxProjection[IslandIndex]);
       }
     }
 
@@ -2273,13 +3478,15 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
     TArray<int32> IslandCardIndex;
     TArray<int32> IslandResolvedCardIndex;
     TArray<FPlantWindIsland> PackedCards;
+    // 本网格卡片映射回退的碎片数（卡片模式刚性判定用；0 = 全部碎片命中卡片）。
+    int32 MeshCardFallbackIslands = 0;
     if (bUseCardReference) {
       PackedCards.SetNum(CardReference->Cards.Num());
       for (int32 CardIndex = 0; CardIndex < CardReference->Cards.Num(); ++CardIndex) {
         const AssetHivePlantWind::FPlantWindCard &Card =
             CardReference->Cards[CardIndex];
-        PackWindSource(PackedCards[CardIndex], Card.BasePosition, Card.Direction,
-                       Card.MaxProjection);
+        PackWindSource(PackedCards[CardIndex], Card.BasePosition, Card.WindPosition,
+                       Card.Direction, Card.BasePosition, Card.MaxProjection);
       }
       CardIndexByVertex.SetNumUninitialized(VertexCount);
       CardDistanceByVertex.SetNumUninitialized(VertexCount);
@@ -2462,11 +3669,19 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
 
       // 邻接统一：空间相接（顶点距离 < NeighborDistance）且共享候选卡片的碎片并入同一组。
       // 贴合的双层叶片/相邻碎片被统一到同一张卡，消除相邻顶点两套锚点/方向/权重造成的撕裂。
+      // 组规模上限（2026-10-09 二轮修正）：邻接统一是为了把「同一张叶片被切成多片」的局部碎片
+      // 归到同一张卡；但并查集是传递的，密集裁切网格里几十个碎片连环相接后会把整株并成一个组，
+      // 组内投票又让整组落到同一张卡——Desert_Cotton_05 实测一个组吃到 7120 个碎片（占全网格约 70%），
+      // 整株绕同一锚点弯曲，视觉上就是「蠕虫」。这里对组规模设硬上限：超过上限的合并直接放弃，
+      // 统一只保留局部（同叶片尺度）范围。
+      constexpr int32 MaxConsistencyGroupIslands = 32;
       TArray<int32> GroupParents;
       GroupParents.SetNumUninitialized(Islands.Num());
       for (int32 IslandIndex = 0; IslandIndex < GroupParents.Num(); ++IslandIndex) {
         GroupParents[IslandIndex] = IslandIndex;
       }
+      TArray<int32> GroupMemberCounts;
+      GroupMemberCounts.Init(1, Islands.Num());
       auto FindGroupRoot = [&GroupParents](int32 Index) {
         while (GroupParents[Index] != Index) {
           GroupParents[Index] = GroupParents[GroupParents[Index]];
@@ -2526,7 +3741,14 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
                     const int32 RootA = FindGroupRoot(IslandIndex);
                     const int32 RootB = FindGroupRoot(OtherIsland);
                     if (RootA != RootB) {
-                      GroupParents[RootB] = RootA;
+                      const int32 MergedSize =
+                          GroupMemberCounts[RootA] + GroupMemberCounts[RootB];
+                      if (MergedSize <= MaxConsistencyGroupIslands) {
+                        GroupParents[RootB] = RootA;
+                        GroupMemberCounts[RootA] = MergedSize;
+                      } else {
+                        TotalConsistencyCappedUnions += 1;
+                      }
                     }
                   }
                 }
@@ -2599,7 +3821,209 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
           UsedCards.Add(IslandResolvedCardIndex[IslandIndex]);
         } else {
           TotalCardFallbackIslands += 1;
+          MeshCardFallbackIslands += 1;
         }
+      }
+    }
+    // ---- F5 结构接缝焊接（仅 Fern 预设）----
+    // 裁切碎片、双层面片、叶片-茎秆等「空间贴合但未焊接」的位置，两侧风属性必须一致，否则
+    // WPO 位移在接缝处跳变 -> 顶点撕裂。F5 口径（与离线原型 fern-rule5.cjs 的 weldSeams 一致）：
+    //   1) 两遍扫描 + 就地更新：跨风单元、贴合半径内的顶点做加权平均；普通接触仅在两侧原始权重
+    //      都 <= 0.7 时参与（叶尖保护），结构接缝不受该门控。
+    //   2) 结构顶点对（合并边 / 被容量判据拒绝的边 / attach / axial）在低权重区（<= 0.6）直接对插。
+    //   3) UV1.x 顶端位置仍按贴合半径平滑（保持既有行为），避免位置编码在接缝处跳变。
+    // 仅对 Fern（ConnectedCluster）启用；Grass（FrondLike）保持逐片相位原行为不变。
+    // F5 需要 F1–F6 结构（簇 + 结构接缝集合）；不透明确切（_OPAQUE）等超大网格在
+    // ComputePlantWindFronds 里被刻意跳过（>2048 连通片），此时回退到旧版贴合带平均，
+    // 保证裁切网格的接缝平滑不退化。
+    const bool bFernSeamBlend =
+        MergeMode == EPlantWindFrondMergeMode::ConnectedCluster &&
+        FernStructure.ContactDistance > 0.0f;
+    const bool bLegacyContactBlend =
+        MergeMode == EPlantWindFrondMergeMode::ConnectedCluster && !bFernSeamBlend;
+    const bool bContactBlendEnabled = bFernSeamBlend || bLegacyContactBlend;
+    const float ContactBlendRadius =
+        bContactBlendEnabled
+            ? FMath::Clamp(
+                  (bUseCardReference ? CardReference->Surface.GetDiagonal()
+                                     : FVector3f::Distance(IslandParameters.MeshMin,
+                                                           IslandParameters.MeshMax)) *
+                      0.003f,
+                  0.05f, 0.5f)
+            : 0.0f;
+    // 卡片参考模式下的「刚性卡片场」判定（2026-10-09）：
+    //   卡片映射（UV0 反查 + 一致性分组）已把每个碎片固定到唯一卡片的锚点/方向/沿轴权重场，
+    //   同一张卡内部天然连续；此时再跑跨卡片平均（UV1.x 顶端位置平滑 / F5 普通接触焊接）只会把
+    //   邻片参数灌进刚性叶片刻，制造同一片叶内部的跳变：表现为茎秆-子叶分离、茎秆中段扭曲
+    //   （Desert_Cotton_02/03/06/08、Lady_Fern 各族均可复现）。
+    //   因此卡片模式下：跳过 UV1.x 位置平滑，F5 只焊来源结构接缝对；任何碎片未命中卡片（回退）
+    //   时退回旧逻辑，保证裁切网格接缝不退化。
+    const bool bCardRigidField = bUseCardReference && MeshCardFallbackIslands == 0;
+    TArray<FVector3f> ContactDirection;
+    TArray<FVector3f> ContactTip;
+    TArray<float> ContactWeight;
+    TArray<float> ContactRipple;
+    TArray<uint8> ContactBlended;
+    TArray<uint8> SeamWelded;
+    int32 ContactBlendedVertices = 0;
+    int32 SeamWeldedVertices = 0;
+    // 卡片参考模式（不透明裁切网格）下 F5 以卡片为风单元，结构对集合同步切换到来源结构。
+    bool bCardUnitMode = false;
+    {
+      TArray<FVector3f> VertexPositions;
+      TArray<int32> VertexWindUnit;
+      VertexPositions.SetNumUninitialized(VertexCount);
+      VertexWindUnit.SetNumUninitialized(VertexCount);
+      // 全部初始化：无 Source 的顶点会走 INDEX_NONE 分支，不参与焊接，但平滑扫描仍会读到。
+      ContactDirection.Init(FVector3f::ZeroVector, VertexCount);
+      ContactTip.Init(FVector3f::ZeroVector, VertexCount);
+      ContactWeight.Init(0.0f, VertexCount);
+      ContactRipple.Init(0.0f, VertexCount);
+      ContactBlended.Init(0, VertexCount);
+      SeamWelded.Init(0, VertexCount);
+      for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+        VertexPositions[VertexIndex] = Positions[FVertexID(VertexIndex)];
+        const int32 IslandIndex = IslandParameters.IslandOfVertex[VertexIndex];
+        const int32 CardIndex =
+            IslandResolvedCardIndex.IsValidIndex(IslandIndex)
+                ? IslandResolvedCardIndex[IslandIndex]
+                : INDEX_NONE;
+        const FPlantWindIsland *Source =
+            (CardIndex != INDEX_NONE && PackedCards.IsValidIndex(CardIndex))
+                ? &PackedCards[CardIndex]
+                : (Islands.IsValidIndex(IslandIndex) ? &Islands[IslandIndex]
+                                                     : nullptr);
+        if (!Source) {
+          VertexWindUnit[VertexIndex] = INDEX_NONE;
+          continue;
+        }
+        // F5 的风单元必须与「风属性来源」同口径：
+        //   - 卡片参考模式（不透明裁切网格）：属性取自来源结构簇=卡片 -> 风单元也用卡片索引；
+        //     裁切网格自身的 F1–F6 结构只用于几何统计，若拿它当风单元，结构接缝对不上属性跳变位置，
+        //     茎秆-子叶等铰接处在高权重区漏焊 -> branch1 拉扯。
+        //   - 无参考：风单元 = Fern 结构簇（逐片回退时 = 连通片），与 StructuralClusterPairs 同口径。
+        const int32 ClusterIndex =
+            FernStructure.ClusterOfIsland.IsValidIndex(IslandIndex)
+                ? FernStructure.ClusterOfIsland[IslandIndex]
+                : INDEX_NONE;
+        const bool bUseCardUnit =
+            bUseCardReference && CardIndex != INDEX_NONE &&
+            PackedCards.IsValidIndex(CardIndex);
+        if (bUseCardUnit) {
+          bCardUnitMode = true;
+        }
+        VertexWindUnit[VertexIndex] =
+            bUseCardUnit
+                ? CardIndex
+                : (ClusterIndex != INDEX_NONE
+                       ? ClusterIndex
+                       : (CardIndex != INDEX_NONE ? CardIndex
+                                                  : Islands.Num() + IslandIndex));
+        ContactDirection[VertexIndex] =
+            AssetHivePlantWind::DecodeDirection(Source->PackedDirection);
+        ContactTip[VertexIndex] = Source->WindPosition;
+        const float Projection = FVector3f::DotProduct(
+            VertexPositions[VertexIndex] - Source->BasePosition, Source->Direction);
+        const float WeightSpan =
+            FMath::Max(Source->MaxProjection, MinPlantWindWeightSpan);
+        const float FrondWeight =
+            FMath::Clamp(Projection / WeightSpan, 0.0f, 1.0f);
+        ContactWeight[VertexIndex] = FrondWeight;
+        ContactRipple[VertexIndex] = Source->RippleWeight * FrondWeight;
+      }
+      // (1) UV1.x 顶端位置平滑（保持既有行为）
+      if (ContactBlendRadius > 0.0f && !bCardRigidField) {
+        TMap<FIntVector, TArray<int32>> ContactGrid;
+        ContactGrid.Reserve(VertexCount);
+        const float Cell = FMath::Max(ContactBlendRadius, 1e-3f);
+        const float RadiusSquared = ContactBlendRadius * ContactBlendRadius;
+        for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+          const FVector3f Position = VertexPositions[VertexIndex];
+          const FIntVector Key(FMath::FloorToInt(Position.X / Cell),
+                               FMath::FloorToInt(Position.Y / Cell),
+                               FMath::FloorToInt(Position.Z / Cell));
+          float SumWeight = 1.0f;
+          FVector3f SumTip = ContactTip[VertexIndex];
+          FVector3f SumDirection = ContactDirection[VertexIndex];
+          float SumRipple = ContactRipple[VertexIndex];
+          float SumUnitWeight = ContactWeight[VertexIndex];
+          int32 NeighborCount = 0;
+          for (int32 OffsetX = -1; OffsetX <= 1; ++OffsetX) {
+            for (int32 OffsetY = -1; OffsetY <= 1; ++OffsetY) {
+              for (int32 OffsetZ = -1; OffsetZ <= 1; ++OffsetZ) {
+                const TArray<int32> *Bucket =
+                    ContactGrid.Find(Key + FIntVector(OffsetX, OffsetY, OffsetZ));
+                if (!Bucket) {
+                  continue;
+                }
+                for (const int32 OtherVertex : *Bucket) {
+                  if (VertexWindUnit[OtherVertex] == VertexWindUnit[VertexIndex]) {
+                    continue;
+                  }
+                  const float DistanceSquared = FVector3f::DistSquared(
+                      Position, VertexPositions[OtherVertex]);
+                  if (DistanceSquared > RadiusSquared) {
+                    continue;
+                  }
+                  const float NeighborWeight =
+                      1.0f - FMath::Sqrt(DistanceSquared) / ContactBlendRadius;
+                  SumWeight += NeighborWeight;
+                  SumTip += ContactTip[OtherVertex] * NeighborWeight;
+                  if (bLegacyContactBlend) {
+                    // 旧路径（无 F5 结构）：方向 / ripple / 权重一并平均。
+                    FVector3f OtherDirection = ContactDirection[OtherVertex];
+                    if (FVector3f::DotProduct(OtherDirection,
+                                              ContactDirection[VertexIndex]) < 0.0f) {
+                      OtherDirection = -OtherDirection;
+                    }
+                    SumDirection += OtherDirection * NeighborWeight;
+                    SumRipple += ContactRipple[OtherVertex] * NeighborWeight;
+                    SumUnitWeight += ContactWeight[OtherVertex] * NeighborWeight;
+                  }
+                  NeighborCount += 1;
+                }
+              }
+            }
+          }
+          if (NeighborCount > 0) {
+            ContactTip[VertexIndex] = SumTip / SumWeight;
+            if (bLegacyContactBlend) {
+              const FVector3f AveragedDirection = SumDirection.GetSafeNormal();
+              if (!AveragedDirection.IsNearlyZero()) {
+                ContactDirection[VertexIndex] = AveragedDirection;
+              }
+              ContactRipple[VertexIndex] = SumRipple / SumWeight;
+              ContactWeight[VertexIndex] = SumUnitWeight / SumWeight;
+            }
+            ContactBlended[VertexIndex] = 1;
+            ContactBlendedVertices += 1;
+          }
+          ContactGrid.FindOrAdd(Key).Add(VertexIndex);
+        }
+      }
+      // (2) 接缝处理：
+      //   - 卡片刚性场（碎片全命中卡片）：不做任何接缝平均。卡片映射已经保证每个碎片取到唯一
+      //     一张卡片的连续场（方向逐卡常量、权重为沿轴投影比例），跨卡相邻碎片的方向本身也一致
+      //     （实测跨接缝位移差 0.002~0.024）。此处若再做窄带跨卡平均，会在等化带边缘造出
+      //     0.35~0.4 的权重跳变与 20°~40° 的方向跳变，把位移差放大到 0.44~0.93 —— 这正是
+      //     "蕨类茎秆与叶片分离、Cotton 整株蠕虫状"的来源，详见 EqualizePlantWindCardSeams 注释。
+      //   - 非刚性：跑既有 F5（结构接缝无条件，普通接触仅低权重区）。
+      if (bCardRigidField) {
+        SeamWeldedVertices = 0;
+        UE_LOG(LogTemp, Warning,
+               TEXT("AssetHive import: %s 合成风卡片模式：碎片全命中卡片，跳过跨卡接缝平均（方向/权重/ripple 全部取卡片原值）"),
+               *StaticMesh->GetName());
+      } else if (bFernSeamBlend) {
+        const TSet<uint64> &StructuralPairs =
+            (bCardUnitMode && CardReference != nullptr)
+                ? CardReference->StructuralCardPairs
+                : FernStructure.StructuralClusterPairs;
+        SeamWeldedVertices = AssetHivePlantWind::BlendPlantWindSeams(
+            VertexCount, VertexPositions, VertexWindUnit, /*ClusterOfUnit=*/nullptr,
+            StructuralPairs, FernStructure.StructuralSeams,
+            FernStructure.ContactDistance, ContactDirection, ContactWeight,
+            ContactRipple, SeamWelded,
+            /*NonStructuralTipWeightLimit=*/0.7f, /*bBlendExplicitSeams=*/true);
       }
     }
     if (UVs.GetNumChannels() < RequiredChannels) {
@@ -2629,20 +4053,109 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
       }
       const float Projection = FVector3f::DotProduct(
           Positions[VertexID] - Source->BasePosition, Source->Direction);
-      const float Weight = Source->MaxProjection > KINDA_SMALL_NUMBER
-                               ? FMath::Clamp(Projection / Source->MaxProjection, 0.0f,
-                                              1.0f)
-                               : 1.0f;
-      UVs.Set(VertexInstanceID, 1,
-              FVector2f(Source->PackedPosition, Source->PackedDirection));
-      UVs.Set(VertexInstanceID, 2, FVector2f(Weight, 0.0f));
+      const float WeightSpan =
+          FMath::Max(Source->MaxProjection, MinPlantWindWeightSpan);
+      const float FrondWeight =
+          FMath::Clamp(Projection / WeightSpan, 0.0f, 1.0f);
+      // 权重口径分三档，按物种形态约束选择（均为离线实测标定）：
+      //
+      // Grass（FrondLike）：整株高度场 + 幂曲线整形。
+      //   高度场保证同一高度同相位；但线性高度权重会让整根叶被"均匀剪切"，
+      //   中段被甩出去、看起来像从中段折弯。叶片本身近基部刚、叶尖柔，
+      //   因此对权重取二次幂，把摆动集中到叶尖。des6xw0_01 实测卡内权重跨度
+      //   0.484 -> 0.248，跨卡错动 0.424cm -> 0.047cm。
+      //
+      // Fern（ConnectedCluster）：整株高度场与卡片沿轴梯度各半。
+      //   蕨类羽叶是从叶柄伸出后下垂的拱形，其"拱顶"往往是全株最高处，
+      //   而着生点与下垂叶尖都处在低位。纯高度场会让拱顶权重最高、两端都低，
+      //   风大时中段被甩出去、两端被按住，形成半月形拉伸
+      //   （bvxkwlf_13 实测中段突出度 +0.244）。掺入一半卡片沿轴梯度后
+      //   降到 -0.019（单调），半月消失；同时保留整株高度成分，
+      //   避免退回"每张卡一条独立梯度"导致的相邻叶片不同步。
+      //
+      // Bush（None）：卡片尺度权重，其叶片不构成上述拱形。
+      const bool bUseHeightWeight =
+          MergeMode == EPlantWindFrondMergeMode::FrondLike ||
+          MergeMode == EPlantWindFrondMergeMode::ConnectedCluster;
+      float Weight =
+          bUseHeightWeight
+              ? FMath::Clamp(
+                    (Positions[VertexID].Z - WindBoundsMin.Z) / WindBoundsHeight,
+                    0.0f, 1.0f)
+              : FrondWeight;
+      if (MergeMode == EPlantWindFrondMergeMode::ConnectedCluster) {
+        Weight = FMath::Clamp(0.5f * Weight + 0.5f * FrondWeight, 0.0f, 1.0f);
+      } else if (MergeMode == EPlantWindFrondMergeMode::FrondLike) {
+        Weight = FMath::Clamp(Weight * Weight, 0.0f, 1.0f);
+      }
+      float PackedPosition = Source->PackedPosition;
+      float PackedDirection = Source->PackedDirection;
+      float BlendedRippleWeight =
+          bWriteRippleWeight
+              ? FMath::Clamp(Source->RippleWeight * FrondWeight, 0.0f, 1.0f)
+              : 0.0f;
+      const bool bContactBlended =
+          ContactBlended.IsValidIndex(VertexIndex) &&
+          ContactBlended[VertexIndex] != 0;
+      const bool bSeamWelded =
+          SeamWelded.IsValidIndex(VertexIndex) && SeamWelded[VertexIndex] != 0;
+      const bool bAttributeBlended =
+          bSeamWelded || (bLegacyContactBlend && bContactBlended);
+      if (bContactBlended) {
+        // UV1.x：接缝两侧顶端位置平滑（保持既有行为）。
+        const FVector3f NormalizedTip(
+            FMath::Clamp((ContactTip[VertexIndex].X - IslandParameters.MeshMin.X) /
+                             SafeMeshSize.X,
+                         0.0f, 1.0f),
+            FMath::Clamp((ContactTip[VertexIndex].Y - IslandParameters.MeshMin.Y) /
+                             SafeMeshSize.Y,
+                         0.0f, 1.0f),
+            FMath::Clamp((ContactTip[VertexIndex].Z - IslandParameters.MeshMin.Z) /
+                             SafeMeshSize.Z,
+                         0.0f, 1.0f));
+        PackedPosition = AssetHivePlantWind::PackPosition(NormalizedTip);
+      }
+      if (bAttributeBlended) {
+        // F5（或旧版贴合带平均）：方向 / 沿轴权重 / ripple 与相邻风单元对齐
+        PackedDirection = AssetHivePlantWind::PackDirectionNear(
+            ContactDirection[VertexIndex], Source->PackedDirection);
+        if (!bUseHeightWeight) {
+          // 高度场口径下权重由世界 Z 唯一决定，不能被碎片级沿轴权重覆盖，否则同一株上
+          // 仍会退化成"每张卡一条独立梯度"（这正是 Fern 走高度场要消除的现象）。
+          Weight = FMath::Clamp(ContactWeight[VertexIndex], 0.0f, 1.0f);
+        }
+        if (bWriteRippleWeight) {
+          BlendedRippleWeight =
+              FMath::Clamp(ContactRipple[VertexIndex], 0.0f, 1.0f);
+        }
+      }
+      UVs.Set(VertexInstanceID, 1, FVector2f(PackedPosition, PackedDirection));
+      // UV2 = (Branch1Weight, RippleWeight)：与 SpeedTree 的 UV2 布局一致。
+      // RippleWeight（UV2.g）必须带“沿叶轴比例”：母材质的 ripple 是**整片位移**项
+      // （MF_SpeedTreeWind_cUSTOM：Position + rippleDir * UV2.g），整片等权会把叶基一起推走，
+      // 整丛散成浮空碎片（2026-10-08 反馈）。改成 基部 0 / 顶端=每片叶幅度，位移即变为弯曲。
+      UVs.Set(VertexInstanceID, 2, FVector2f(Weight, BlendedRippleWeight));
       if (bWriteBranch2) {
         const int32 WeightCode = FMath::Clamp(
             FMath::RoundToInt(Weight * AssetHivePlantWind::UV3WeightCodeMax), 0,
             AssetHivePlantWind::UV3WeightCodeMax);
+        const int32 PositionCode =
+            (bContactBlended || bSeamWelded)
+                ? AssetHivePlantWind::ToUV3Code(
+                      PackedPosition, AssetHivePlantWind::PositionMin,
+                      AssetHivePlantWind::PositionRange,
+                      AssetHivePlantWind::UV3CodeMax)
+                : Source->PositionCode;
+        const int32 DirectionCode =
+            (bContactBlended || bSeamWelded)
+                ? AssetHivePlantWind::ToUV3Code(
+                      PackedDirection, AssetHivePlantWind::DirectionMin,
+                      AssetHivePlantWind::DirectionRange,
+                      AssetHivePlantWind::UV3CodeMax)
+                : Source->DirectionCode;
         UVs.Set(VertexInstanceID, 3,
-                AssetHivePlantWind::EncodeUV3(Source->PositionCode,
-                                              Source->DirectionCode, WeightCode));
+                AssetHivePlantWind::EncodeUV3(PositionCode, DirectionCode,
+                                              WeightCode));
       }
     }
 
@@ -2653,6 +4166,21 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
     TotalIslandsBeforeWeld += IslandParameters.IslandsBeforeWeld;
     TotalWeldMergedVertices += IslandParameters.WeldMergedVertices;
     TotalVertices += VertexCount;
+    TotalContactBlendedVertices += ContactBlendedVertices;
+    TotalSeamWeldedVertices += SeamWeldedVertices;
+    if (MergeMode == EPlantWindFrondMergeMode::ConnectedCluster &&
+        FernStructure.ClusterCount > 0) {
+      TotalFernClusters += FernStructure.ClusterCount;
+      TotalFernRachis += FernStructure.RachisCount;
+      TotalFernCandidatePairs += FernStructure.CandidatePairCount;
+      TotalFernMergedPairs += FernStructure.MergedPairCount;
+      TotalFernRejectedSpan += FernStructure.RejectedBySpan;
+      TotalFernRejectedRachis += FernStructure.RejectedByRachisCapacity;
+      TotalFernStructuralSeams += FernStructure.StructuralSeams.Num();
+      if (FernStructure.bFallbackPerIsland) {
+        TotalFernFallbackLods += 1;
+      }
+    }
     if (bUseFronds) {
       TotalConsolidatedFronds += FrondParameters.ConsolidatedFrondCount;
       TotalFrondMergedIslands +=
@@ -2665,10 +4193,16 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
   if (ProcessedLods == 0) {
     return false;
   }
+  // Grass 的 branch1 权重已改为 SpeedTree 整簇高度归一化，文案与 Fern/Bush 的卡片尺度区分开。
   const FString CardSummary =
       bUseCardReference
-          ? FString::Printf(TEXT("；权重按原始卡片推导，UV0 迁移 %d 个顶点"),
-                            TotalUVMigratedVertices)
+          ? (MergeMode == EPlantWindFrondMergeMode::FrondLike
+                 ? FString::Printf(
+                       TEXT("；权重按 SpeedTree 整簇高度推导，UV0 迁移 %d 个顶点"),
+                       TotalUVMigratedVertices)
+                 : FString::Printf(
+                       TEXT("；权重按原始卡片推导，UV0 迁移 %d 个顶点"),
+                       TotalUVMigratedVertices))
           : FString();
   // UE5 的 FString::Printf 使用 TCheckedFormatString，格式串必须是编译期字面量，
   // 不能是三元表达式——Fern / Grass 两种文案分开调用。
@@ -2676,11 +4210,13 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
   if (TotalConsolidatedFronds > 0) {
     if (MergeMode == EPlantWindFrondMergeMode::ConnectedCluster) {
       FrondSummary = FString::Printf(
-          TEXT("；Fern 每片叶风单元 %d 个（%d 个连通片按叶归组，core 近重合阈值 %.2fcm，叶片间独立运动）"),
-          TotalConsolidatedFronds, TotalFrondMergedIslands, TotalJoinDistanceMax);
+          TEXT("；Fern 结构簇 %d 个（连通片 %d 个，rachis %d 条；候选边 %d，合并 %d，拒(跨度) %d，拒(rachis>2) %d，逐片回退 LOD %d 个；同簇共享锚点/方向/沿轴权重，簇间独立相位）"),
+          TotalFernClusters, TotalIslands, TotalFernRachis, TotalFernCandidatePairs,
+          TotalFernMergedPairs, TotalFernRejectedSpan, TotalFernRejectedRachis,
+          TotalFernFallbackLods);
     } else {
       FrondSummary = FString::Printf(
-          TEXT("；Grass frond 叶片簇 %d 个（%d 个连通片并入，锚点/方向/沿轴权重共享）"),
+          TEXT("；Grass frond 叶片簇 %d 个（%d 个连通片并入，锚点/方向共享，权重取整簇高度，叶片相位独立）"),
           TotalConsolidatedFronds, TotalFrondMergedIslands);
     }
   }
@@ -2718,12 +4254,19 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
            TotalCardMappedVertices + TotalCardFallbackVertices, RawCardHitVertices,
            UsedCards.Num(), MaxCardMatchDistance);
     UE_LOG(LogTemp, Warning,
-           TEXT("AssetHive import: %s 合成风一致性：近距匹配阈值 %.3f cm，合并为 %d 组（最大 %d 个碎片），跨片统一卡片 %d 个碎片"),
-           *StaticMesh->GetName(), TotalNearCardDistance, TotalConsistencyGroups,
-           TotalConsistencyMaxGroupIslands, TotalConsistencyMergedIslands);
+           TEXT("AssetHive import: %s 合成风一致性：近距匹配阈值 %.3f cm，合并为 %d 组（最大 %d 个碎片），跨片统一卡片 %d 个碎片；组规模上限 32，放弃合并 %d 次"),
+        *StaticMesh->GetName(), TotalNearCardDistance, TotalConsistencyGroups,
+        TotalConsistencyMaxGroupIslands, TotalConsistencyMergedIslands,
+        TotalConsistencyCappedUnions);
   }
   // 逐角拆分的源网格（例如不透明裁切导出的 FBX）会在焊接前后出现数量级差异，明确告警，
   // 便于后续排查“每个三角形一片”造成的合成风顶点撕裂。
+  if (TotalContactBlendedVertices > 0 || TotalSeamWeldedVertices > 0) {
+    UE_LOG(LogTemp, Warning,
+           TEXT("AssetHive import: %s 合成风(Fern)接缝处理：F5 焊接 %d 个顶点（结构顶点对 %d 个），UV1.x 顶端位置平滑 %d 个顶点"),
+           *StaticMesh->GetName(), TotalSeamWeldedVertices, TotalFernStructuralSeams,
+           TotalContactBlendedVertices);
+  }
   if (TotalIslandsBeforeWeld > TotalIslands * 4) {
     UE_LOG(LogTemp, Warning,
            TEXT("AssetHive import: %s 源网格顶点逐角拆分（重复顶点 %d 个），已按位置焊接后写入合成风数据：连通片 %d -> %d"),
@@ -2743,9 +4286,14 @@ static void Configure3DAssetCollision(UStaticMesh *StaticMesh) {
   if (!bHasCollision && GEditor) {
     if (UStaticMeshEditorSubsystem *Subsystem =
             GEditor->GetEditorSubsystem<UStaticMeshEditorSubsystem>()) {
-      // Use UE's maximum Auto Convex Collision precision for the provisional hull; 16 voxels was too coarse and rounded away silhouettes.
+      // 临时凸包碰撞参数（2026-10-09 定稿）：Hull Count 64、Max Hull Verts 32、
+      // Hull Precision 1000000（UE 上限）。精度过低会抹掉模型轮廓细节。
+      constexpr int32 TemporaryHullCount = 64;
+      constexpr int32 TemporaryHullMaxVerts = 32;
       constexpr int32 TemporaryHullPrecision = 1000000;
-      Subsystem->SetConvexDecompositionCollisions(StaticMesh, 1, 16, TemporaryHullPrecision);
+      Subsystem->SetConvexDecompositionCollisions(
+          StaticMesh, TemporaryHullCount, TemporaryHullMaxVerts,
+          TemporaryHullPrecision);
       BodySetup = StaticMesh->GetBodySetup();
     }
   }
@@ -3431,7 +4979,15 @@ CreateFoliageTypeAsset(const FString &AssetFolder, const FString &AssetName,
   if (!StaticMesh) {
     return nullptr;
   }
-  const FString FoliageAssetName = FString::Printf(TEXT("FT_%s"), *AssetName);
+  // 命名跟随静态网格体：SM_ 前缀换成 FT_（SM_Env_Grass_x_01_OPAQUE -> FT_Env_Grass_x_01_OPAQUE）。
+  FString FoliageStem = StaticMesh->GetName();
+  if (FoliageStem.StartsWith(TEXT("SM_"), ESearchCase::CaseSensitive)) {
+    FoliageStem.RightChopInline(3);
+  } else if (FoliageStem.IsEmpty()) {
+    FoliageStem = AssetName;
+  }
+  const FString FoliageAssetName =
+      FString::Printf(TEXT("FT_%s"), *FoliageStem);
   const FString PackagePath = AssetFolder / FoliageAssetName;
   UPackage *Package = CreatePackage(*PackagePath);
   if (!Package) {
@@ -3449,6 +5005,9 @@ CreateFoliageTypeAsset(const FString &AssetFolder, const FString &AssetName,
   }
   FoliageType->SetStaticMesh(StaticMesh);
   FoliageType->PostEditChange();
+  // Display 在项目日志里会被过滤，用 Warning 保证导入后能看到 FT 的落点（每个网格一行）。
+  UE_LOG(LogTemp, Warning, TEXT("AssetHive import: FoliageType %s <- %s"),
+         *FoliageType->GetPathName(), *StaticMesh->GetName());
   FoliageType->MarkPackageDirty();
   FinalizeImportedAsset(FoliageType);
   if (bIsNew) {
@@ -4412,7 +5971,7 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
   }
 
   if (bSyntheticWind) {
-    // 合成 SpeedTree 风参数（Megascans Grass/Bush）：branch1 恒定从 UV1/UV2 读；
+    // 合成 SpeedTree 风参数（Grass/Bush/Fern）：branch1 恒定从 UV1/UV2 读；
     // branch2 由 UV3 重映射读取（Use Remapped UV3）。母材质里 xMax/yMax/wMax 承载的是
     // Range（范围）而不是最大值，与 ApplySyntheticSpeedTreeWind 的编码范围一一对应。
     MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
@@ -4420,19 +5979,30 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
         FMaterialParameterInfo(FName(AssetHivePlantWind::SwitchBranch2Enable)),
         bSyntheticWindBranch2);
+    // Grass / Bush / Fern 预设统一关闭 ripple：Desert_Cotton 等 Fern 资产开启 ripple 会在
+    // 结构接缝上引入额外位移，产生撕裂；UV2.g 仍烘焙，便于日后仅改开关恢复。
+    MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(AssetHivePlantWind::SwitchRippleEnable)),
+        false);
     MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
         FMaterialParameterInfo(FName(AssetHivePlantWind::SwitchHasBranch2Data)),
         bSyntheticWindBranch2);
     MaterialInstance->SetStaticSwitchParameterValueEditorOnly(
         FMaterialParameterInfo(FName(AssetHivePlantWind::SwitchUseRemappedUV3)),
         bSyntheticWindBranch2);
+    // 基础风参数（用户 2026-10-09 指定 Grass 预设默认值）+ UV 解码范围。
     const TPair<const TCHAR *, float> WindScalars[] = {
         {AssetHivePlantWind::ScalarPositionMin, AssetHivePlantWind::PositionMin},
         {AssetHivePlantWind::ScalarPositionRange, AssetHivePlantWind::PositionRange},
         {AssetHivePlantWind::ScalarDirectionMin, AssetHivePlantWind::DirectionMin},
         {AssetHivePlantWind::ScalarDirectionRange, AssetHivePlantWind::DirectionRange},
         {AssetHivePlantWind::ScalarWeightMin, AssetHivePlantWind::WeightMin},
-        {AssetHivePlantWind::ScalarWeightRange, AssetHivePlantWind::WeightRange}};
+        {AssetHivePlantWind::ScalarWeightRange, AssetHivePlantWind::WeightRange},
+        {AssetHivePlantWind::ScalarBranch1Bend, AssetHivePlantWind::DefaultBranch1Bend},
+        {AssetHivePlantWind::ScalarBranch1Oscillation, AssetHivePlantWind::DefaultBranch1Oscillation},
+        {AssetHivePlantWind::ScalarBranch1StretchLimit, AssetHivePlantWind::DefaultBranch1StretchLimit},
+        {AssetHivePlantWind::ScalarSharedBend, AssetHivePlantWind::DefaultSharedBend},
+        {AssetHivePlantWind::ScalarSharedOscillation, AssetHivePlantWind::DefaultSharedOscillation}};
     for (const TPair<const TCHAR *, float> &WindScalar : WindScalars) {
       MaterialInstance->SetScalarParameterValueEditorOnly(
           FMaterialParameterInfo(FName(WindScalar.Key)), WindScalar.Value);
@@ -4559,7 +6129,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     if (OnProgress) OnProgress(Percent, Stage, bShowInEditor);
   };
   SetStageProgress(2.0f, TEXT("读取导入任务"), false);
-  bool bCreateFoliageDefault = false;
+  // 2026-10-08：植被（3dplant）的 FoliageType 改为导入时自动创建（每个静态网格体
+  // 一个 FT_ 资产，放在资产文件夹根）。软件侧不再下发 createFoliage 字段，
+  // 只有在 job 里显式写入 false 时才关闭，方便排查/回退。
+  bool bCreateFoliageDefault = true;
   Root->TryGetBoolField(TEXT("createFoliage"), bCreateFoliageDefault);
 
   const TArray<TSharedPtr<FJsonValue>> *AssetsJson = nullptr;
@@ -4710,8 +6283,16 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             ? AssetDestinationPath / SafeAssetFolderName
             : AssetDestinationPath / SafeCategoryFolder / SafeAssetFolderName;
     const bool bUsesMaterialFolders = bIsSurface || bIsDecal;
-    const FString TextureFolder = bUsesMaterialFolders ? AssetFolder / TEXT("Tex") : AssetFolder;
-    const FString MaterialFolder = bUsesMaterialFolders ? AssetFolder / TEXT("MI") : AssetFolder;
+    // 植被（3dplant）：材质实例 / 纹理 / 静态网格体分目录存放，FoliageType 留在资产文件夹根。
+    const bool bUsesFoliageFolders = AssetType == TEXT("3dplant");
+    const FString TextureFolder =
+        (bUsesMaterialFolders || bUsesFoliageFolders) ? AssetFolder / TEXT("Tex")
+                                                       : AssetFolder;
+    const FString MaterialFolder =
+        (bUsesMaterialFolders || bUsesFoliageFolders) ? AssetFolder / TEXT("MI")
+                                                      : AssetFolder;
+    const FString MeshFolder =
+        bUsesFoliageFolders ? AssetFolder / TEXT("Meshes") : AssetFolder;
     const bool bUseVT = IsAssetVirtualTextureImportEnabled();
     double SurfaceBaseTiling = 1.0;
     FString DecalParentMode = TEXT("decal");
@@ -5054,7 +6635,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               FString::Printf(TEXT("导入植物模型: %s"),
                               *FPaths::GetCleanFilename(BaseFile)));
           UStaticMesh *BaseMesh = ImportStaticMeshAsset(
-              AssetToolsModule, BaseFile, AssetFolder, BaseMeshName,
+              AssetToolsModule, BaseFile, MeshFolder, BaseMeshName,
               PlantProfile.bNanite);
           if (!BaseMesh) {
             continue;
@@ -5065,7 +6646,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (const TArray<FPlantModelLodEntry> *VariantLods =
                   PlantLodsByVariant.Find(VariantKey)) {
             ImportPlantCustomLods(AssetToolsModule, BaseMesh, *VariantLods,
-                                  AssetFolder, BaseMeshName);
+                                  MeshFolder, BaseMeshName);
           }
 
           // Nanite and materials are configured together after texture import.
@@ -5111,7 +6692,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           }
           UAssetImportTask *Task = NewObject<UAssetImportTask>();
           Task->Filename = SourceFile;
-          Task->DestinationPath = AssetFolder;
+          Task->DestinationPath = MeshFolder;
           FString ModelAssetName;
           if (bIs3DAsset) {
             const FString VariantKey = ResolveModelVariantKey(
@@ -5165,6 +6746,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           for (UObject *ImportedObject : ImportedObjects) {
             if (UStaticMesh *StaticMesh = Cast<UStaticMesh>(ImportedObject)) {
               ImportedMeshes.Add(StaticMesh);
+              // 植被（3dplant，含 st9）逐个网格创建对应 FoliageType（FT_ + 网格名去掉 SM_）。
+              if (bCreateFoliageForAsset && AssetType == TEXT("3dplant")) {
+                CreateFoliageTypeAsset(AssetFolder, ModelAssetName, StaticMesh);
+              }
               if (bIs3DAsset) {
                 SourceFileByMesh.Add(StaticMesh, SourceFile);
                 VariantKeyByMesh.Add(
@@ -5651,7 +7236,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           // md §5.2：植被贴图按 Diffuse（albedo 代用，D）/ Normal（N）/
           // ORM / OpacityMasked（O，masked 资产）分张导出，类型用缩写。
           UTexture2D *DiffuseTexture = CreatePlantTextureAsset(
-              AssetFolder, FString::Printf(TEXT("T_%s_D"), *TextureStem),
+              TextureFolder, FString::Printf(TEXT("T_%s_D"), *TextureStem),
               ImportPlantSource(TEXT("albedo")), EPlantTextureKind::Diffuse,
               PlantProfile, bUseVT);
 
@@ -5659,14 +7244,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 24, 0, 99)),
               FString::Printf(TEXT("导出 Normal 贴图: %s"), *AssetName), false);
           UTexture2D *NormalTexture = CreatePlantTextureAsset(
-              AssetFolder, FString::Printf(TEXT("T_%s_N"), *TextureStem),
+              TextureFolder, FString::Printf(TEXT("T_%s_N"), *TextureStem),
               ImportPlantSource(TEXT("normal")), EPlantTextureKind::Normal,
               PlantProfile, bUseVT);
 
           UTexture2D *ORMTexture = nullptr;
           if (SourceTextureBySlot.Contains(TEXT("orm"))) {
             ORMTexture = CreatePlantTextureAsset(
-                AssetFolder, FString::Printf(TEXT("T_%s_ORM"), *TextureStem),
+                TextureFolder, FString::Printf(TEXT("T_%s_ORM"), *TextureStem),
                 ImportPlantSource(TEXT("orm")), EPlantTextureKind::ORM,
                 PlantProfile, bUseVT);
           } else {
@@ -5675,7 +7260,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             UTexture2D *MetallicSource = ImportPlantSource(TEXT("metalness"));
             if (AOSource || RoughnessSource || MetallicSource) {
               ORMTexture = CreatePackedORMTexture(
-                  AssetFolder, FString::Printf(TEXT("T_%s_ORM"), *TextureStem),
+                  TextureFolder, FString::Printf(TEXT("T_%s_ORM"), *TextureStem),
                   AOSource, RoughnessSource, MetallicSource, DiffuseTexture,
                   NormalTexture);
               if (ORMTexture) {
@@ -5693,7 +7278,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           UTexture2D *OpacityMaskTexture = nullptr;
           if (SourceTextureBySlot.Contains(TEXT("opacity"))) {
             OpacityMaskTexture = CreatePlantTextureAsset(
-                AssetFolder, FString::Printf(TEXT("T_%s_O"), *TextureStem),
+                TextureFolder, FString::Printf(TEXT("T_%s_O"), *TextureStem),
                 ImportPlantSource(TEXT("opacity")),
                 EPlantTextureKind::OpacityMasked, PlantProfile, bUseVT);
           }
@@ -5709,7 +7294,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           UTexture2D *SubsurfaceTexture = nullptr;
           if (!SubsurfaceSourcePath.IsEmpty()) {
             SubsurfaceTexture = CreatePlantTextureAsset(
-                AssetFolder, FString::Printf(TEXT("T_%s_SSC"), *TextureStem),
+                TextureFolder, FString::Printf(TEXT("T_%s_SSC"), *TextureStem),
                 FImageUtils::ImportFileAsTexture2D(SubsurfaceSourcePath),
                 EPlantTextureKind::SubsurfaceColor, PlantProfile, bUseVT);
           }
@@ -5726,7 +7311,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                   : PlantProfile.SyntheticWind;
           if (bHasMaskedModelVariant) {
             MaterialInstance = CreatePlantMaterialInstance(
-                AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
+                MaterialFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
                 ORMTexture, OpacityMaskTexture, SubsurfaceTexture, MaterialRole,
                 bUseVT, /*bOpaque=*/false, PlantWindStyle);
           }
@@ -5736,7 +7321,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             // 勾选不透明剪切 + 合成风时，裁切变体的材质同样使用 ST 风母材质
             // （CreatePlantMaterialInstance 内部保持 Blend=Opaque 覆盖）。
             OpaqueMaterialInstance = CreatePlantMaterialInstance(
-                AssetFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
+                MaterialFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
                 ORMTexture, nullptr, SubsurfaceTexture, MaterialRole, bUseVT,
                 /*bOpaque=*/true, PlantWindStyle);
           }
@@ -5849,6 +7434,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             IsOpaqueModelVariantKey(WindMeshVariantKey) ||
             OpaqueModelVariantKeys.Contains(
                 NormalizeModelVariantKey(WindMeshVariantKey));
+        // 裁切网格的卡片参考一律按「单叶」粒度建立（Grass 在非裁切网格上仍按 frond 合并）：
+        // UV1.y 相位与 UV2.g ripple 都按叶片锚点散列，卡片粒度 = 单叶时 _OPAQUE 与 masked
+        // 两个变体的风动才一致；权重仍由 ApplySyntheticSpeedTreeWind 的 MergeMode 决定。
+        const EPlantWindFrondMergeMode WindCardMergeMode =
+            WindMergeMode == EPlantWindFrondMergeMode::FrondLike
+                ? EPlantWindFrondMergeMode::None
+                : WindMergeMode;
         FPlantWindCardReference WindCardReference;
         UStaticMesh *TempWindReferenceMesh = nullptr;
         if (bOpaqueWindMesh) {
@@ -5865,7 +7457,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                      TEXT("AssetHive import: %s 原始 FBX %s 导入失败，回退碎片级合成风"),
                      *StaticMesh->GetName(), *ReferenceFile);
             } else if (!BuildPlantWindCardReference(
-                           TempWindReferenceMesh, WindMergeMode,
+                           TempWindReferenceMesh, WindCardMergeMode,
                            WindCardReference)) {
               UE_LOG(LogTemp, Warning,
                      TEXT("AssetHive import: %s 无法从原始 FBX %s 推导卡片参数，回退碎片级合成风"),
@@ -6960,6 +8552,138 @@ bool FAssetHivePlantWindFernWideGapTest::RunTest(const FString &Parameters) {
                                        FrondLikeReference));
   TestEqual(TEXT("Grass 小距离判定不合并 8mm 间隙叶片"),
             FrondLikeReference.Cards.Num(), 3);
+  return true;
+}
+
+// Grass 权重推导单测（2026-10-08）：SpeedTree 原生 branch1 权重取整簇高度归一化。
+// 两片独立草叶（10cm / 4cm）：短叶顶端 z=4cm 落在整簇高度 0..10 的 0.4；
+// 旧的“逐卡片沿轴投影”口径会让它走满自身卡片到 1.0。
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHivePlantWindGrassHeightWeightTest,
+                                 "AssetHive.Plants.SyntheticWindGrassHeightWeight",
+                                 EAutomationTestFlags::EditorContext |
+                                     EAutomationTestFlags::EngineFilter)
+bool FAssetHivePlantWindGrassHeightWeightTest::RunTest(const FString &Parameters) {
+  UStaticMesh *Mesh = NewObject<UStaticMesh>(
+      GetTransientPackage(), FName(TEXT("AssetHiveWindGrassHeightProbe")), RF_Transient);
+  FGCObjectScopeGuard MeshGuard(Mesh);
+  Mesh->AddSourceModel();
+  {
+    FMeshDescription Description;
+    FStaticMeshAttributes Attributes(Description);
+    Attributes.Register();
+    TVertexAttributesRef<FVector3f> Positions = Attributes.GetVertexPositions();
+    const FPolygonGroupID Group = Description.CreatePolygonGroup();
+    Attributes.GetPolygonGroupMaterialSlotNames()[Group] =
+        FName(TEXT("Material_0"));
+    auto AddBlade = [&Description, &Positions, &Group](float MinX, float MaxX,
+                                                       float Height) {
+      const FVertexID V0 = Description.CreateVertex();
+      const FVertexID V1 = Description.CreateVertex();
+      const FVertexID V2 = Description.CreateVertex();
+      const FVertexID V3 = Description.CreateVertex();
+      Positions[V0] = FVector3f(MinX, 0.0f, 0.0f);
+      Positions[V1] = FVector3f(MaxX, 0.0f, 0.0f);
+      Positions[V2] = FVector3f(MaxX, 0.0f, Height);
+      Positions[V3] = FVector3f(MinX, 0.0f, Height);
+      const FVertexInstanceID I0 = Description.CreateVertexInstance(V0);
+      const FVertexInstanceID I1 = Description.CreateVertexInstance(V1);
+      const FVertexInstanceID I2 = Description.CreateVertexInstance(V2);
+      const FVertexInstanceID I3 = Description.CreateVertexInstance(V3);
+      Description.CreateTriangle(Group, {I0, I1, I2});
+      Description.CreateTriangle(Group, {I0, I2, I3});
+    };
+    AddBlade(0.0f, 0.2f, 10.0f);
+    AddBlade(5.0f, 5.2f, 4.0f);
+    Mesh->CreateMeshDescription(0, MoveTemp(Description));
+    Mesh->CommitMeshDescription(0);
+  }
+
+  FString Summary;
+  TestTrue(TEXT("Grass 合成风写入成功"),
+           ApplySyntheticSpeedTreeWind(Mesh, /*bWriteBranch2=*/false,
+                                       EPlantWindFrondMergeMode::FrondLike,
+                                       /*CardReference=*/nullptr, Summary));
+  FMeshDescription *Weighted = Mesh->GetMeshDescription(0);
+  if (!TestNotNull(TEXT("写入后的 MeshDescription 存在"), Weighted)) {
+    return false;
+  }
+  FStaticMeshAttributes WeightedAttributes(*Weighted);
+  WeightedAttributes.Register(true);
+  TVertexAttributesRef<FVector3f> WeightedPositions =
+      WeightedAttributes.GetVertexPositions();
+  TVertexInstanceAttributesRef<FVector2f> WeightUVs =
+      WeightedAttributes.GetVertexInstanceUVs();
+  if (!TestTrue(TEXT("UV2 权重通道已写入"), WeightUVs.GetNumChannels() >= 3)) {
+    return false;
+  }
+
+  TMap<int32, float> WeightByZKey;
+  TMap<int32, float> PhaseByXKey;
+  TMap<int32, float> RippleByXZKey;
+  TMap<int32, float> RippleMaxByX;
+  for (const FVertexInstanceID InstanceID :
+       Weighted->VertexInstances().GetElementIDs()) {
+    const FVertexID VertexID = Weighted->GetVertexInstanceVertex(InstanceID);
+    const FVector3f Position = WeightedPositions[VertexID];
+    const int32 ZKey = FMath::RoundToInt(Position.Z * 10.0f);
+    WeightByZKey.Add(ZKey, WeightUVs.Get(InstanceID, 2).X);
+    // 两片叶分别位于 x≈0 与 x≈5，UV1.y 是摆动方向+振荡相位。
+    PhaseByXKey.Add(FMath::RoundToInt(Position.X), WeightUVs.Get(InstanceID, 1).Y);
+    // UV2.g 是 SpeedTree 的 ripple 权重（母材质按 G 通道缩放 ripple 项）。
+    const float RippleValue = WeightUVs.Get(InstanceID, 2).Y;
+    RippleByXZKey.Add(FMath::RoundToInt(Position.X) * 1000 +
+                          FMath::RoundToInt(Position.Z),
+                      RippleValue);
+    float &RippleMax =
+        RippleMaxByX.FindOrAdd(FMath::RoundToInt(Position.X), 0.0f);
+    RippleMax = FMath::Max(RippleMax, RippleValue);
+  }
+  const float *RootWeight = WeightByZKey.Find(0);
+  const float *ShortTopWeight = WeightByZKey.Find(40);
+  const float *TallTopWeight = WeightByZKey.Find(100);
+  if (!TestNotNull(TEXT("根部顶点权重存在"), RootWeight) ||
+      !TestNotNull(TEXT("短叶顶端顶点权重存在"), ShortTopWeight) ||
+      !TestNotNull(TEXT("高叶顶端顶点权重存在"), TallTopWeight)) {
+    return false;
+  }
+  TestTrue(TEXT("根部权重为 0"), FMath::IsNearlyEqual(*RootWeight, 0.0f, 0.02f));
+  TestTrue(TEXT("短叶顶端按整簇高度取 0.4（旧口径为 1.0）"),
+           FMath::IsNearlyEqual(*ShortTopWeight, 0.4f, 0.02f));
+  TestTrue(TEXT("簇顶权重为 1"), FMath::IsNearlyEqual(*TallTopWeight, 1.0f, 0.02f));
+
+  // 叶片间运动：SpeedTree 的 UV1.y 同时是摆动方向与振荡相位，同高不同叶必须错开，
+  // 否则整簇同步摆动（用户反馈“运动太整体”）。
+  const float *Blade1Phase = PhaseByXKey.Find(0);
+  const float *Blade2Phase = PhaseByXKey.Find(5);
+  if (!TestNotNull(TEXT("第一片叶相位存在"), Blade1Phase) ||
+      !TestNotNull(TEXT("第二片叶相位存在"), Blade2Phase)) {
+    return false;
+  }
+  TestTrue(TEXT("两片叶的 UV1.y（摆动方向+相位）必须错开"),
+           FMath::Abs(*Blade1Phase - *Blade2Phase) > 0.05f);
+  TestTrue(TEXT("抖动后摆动方向仍以生长方向为主（<25°）"),
+           AssetHivePlantWind::DecodeDirection(*Blade1Phase).Z > 0.9f);
+
+  // UV2.g（RippleWeight）：SpeedTree 把 ripple 权重写在 UV2.g，母材质用 G 通道缩放 ripple 项。
+  // 权重恒 0 时整丛只剩 shared/branch1 运动（叶片“粘住”）；整片等权则叶基被一起推走
+  // （整丛散成浮空碎片，2026-10-08 实测）。所以必须是“基部 0 → 顶端=每片叶幅度”。
+  const float *Blade1RootRipple = RippleByXZKey.Find(0 * 1000 + 0);
+  const float *Blade2RootRipple = RippleByXZKey.Find(5 * 1000 + 0);
+  const float *Blade1MaxRipple = RippleMaxByX.Find(0);
+  const float *Blade2MaxRipple = RippleMaxByX.Find(5);
+  if (!TestNotNull(TEXT("第一片叶根部 ripple 存在"), Blade1RootRipple) ||
+      !TestNotNull(TEXT("第二片叶根部 ripple 存在"), Blade2RootRipple) ||
+      !TestNotNull(TEXT("第一片叶 ripple 峰值存在"), Blade1MaxRipple) ||
+      !TestNotNull(TEXT("第二片叶 ripple 峰值存在"), Blade2MaxRipple)) {
+    return false;
+  }
+  TestTrue(TEXT("叶片基部 UV2.g 必须为 0（否则整片被推离草丛）"),
+           *Blade1RootRipple <= 0.02f && *Blade2RootRipple <= 0.02f);
+  TestTrue(TEXT("叶尖 UV2.g 落在 SpeedTree 实测幅度区间 0.60~0.90"),
+           *Blade1MaxRipple >= 0.55f && *Blade1MaxRipple <= 0.91f &&
+               *Blade2MaxRipple >= 0.55f && *Blade2MaxRipple <= 0.91f);
+  TestTrue(TEXT("两片叶的 ripple 幅度必须错开"),
+           FMath::Abs(*Blade1MaxRipple - *Blade2MaxRipple) > 0.01f);
   return true;
 }
 
