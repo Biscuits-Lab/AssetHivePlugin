@@ -99,6 +99,7 @@ static FString MakeSafeObjectName(const FString &Name) {
   SafeName.ReplaceInline(TEXT("."), TEXT("_"));
   return SafeName;
 }
+
 static FString NormalizeAssetTagToken(const FString &Value) {
   FString Token = Value;
   Token.TrimStartAndEndInline();
@@ -1210,71 +1211,142 @@ struct FEnvironmentAssetProfile {
   bool bBaseFamily = true;
   bool bHighResPreset = true;
   bool bMega = false;
+  // Temp 标记：临时/草稿资产。命中后资产文件夹加 Temp_ 前缀，
+  // 且对象名带上 Temp 段（SM_Env_Temp_* / T_Env_Temp_* / MI_Env_Temp_*），
+  // 便于在引擎里与正式资产一眼区分、后续整批清理。
+  bool bTemp = false;
 };
 
 static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
     const TArray<FString> &Tags) {
-  FEnvironmentAssetProfile Profile;
-  if (HasAssetTag(Tags, TEXT("MEGA"))) {
-    Profile.TypeKey = TEXT("MEGA");
-    Profile.TypePrefix = TEXT("MEGA");
-    Profile.FolderName = TEXT("MEGA");
+  // Temp 是叠加标记、不是互斥分类：带 Temp 的资产仍按其正式标签归类，
+  // 只是额外获得 Temp_ 文件夹前缀与 Temp 对象名段。
+  // 用内层 lambda 完成分类，最后统一套用 Temp，避免在每个提前 return 处重复处理。
+  const bool bTemp = HasAssetTag(Tags, TEXT("Temp"));
+  FEnvironmentAssetProfile Profile = [&Tags]() {
+    FEnvironmentAssetProfile Resolved;
+    if (HasAssetTag(Tags, TEXT("MEGA"))) {
+      Resolved.TypeKey = TEXT("MEGA");
+      Resolved.TypePrefix = TEXT("MEGA");
+      Resolved.FolderName = TEXT("MEGA");
+      Resolved.bBaseFamily = false;
+      Resolved.bHighResPreset = true;
+      Resolved.bMega = true;
+      return Resolved;
+    }
+    if (HasAssetTag(Tags, TEXT("Kits")) || HasAssetTag(Tags, TEXT("Kit"))) {
+      Resolved.TypeKey = TEXT("Kits");
+      Resolved.TypePrefix = TEXT("Kit");
+      Resolved.FolderName = TEXT("Kits");
+      Resolved.bBaseFamily = true;
+      Resolved.bHighResPreset = false;
+      return Resolved;
+    }
+    if (HasAssetTag(Tags, TEXT("Destructible"))) {
+      Resolved.TypeKey = TEXT("Destructible");
+      Resolved.TypePrefix = TEXT("Dest");
+      Resolved.FolderName = TEXT("Destructible");
+      Resolved.bBaseFamily = false;
+      Resolved.bHighResPreset = true;
+      return Resolved;
+    }
+    if (HasAssetTag(Tags, TEXT("Props"))) {
+      Resolved.TypeKey = TEXT("Props");
+      Resolved.TypePrefix = TEXT("Prop");
+      Resolved.FolderName = TEXT("Props");
+      Resolved.bBaseFamily = true;
+      Resolved.bHighResPreset = false;
+      return Resolved;
+    }
+    if (HasAssetTag(Tags, TEXT("Dressing"))) {
+      Resolved.TypeKey = TEXT("Dressing");
+    } else if (HasAssetTag(Tags, TEXT("Megascans"))) {
+      Resolved.TypeKey = TEXT("Megascans");
+      Resolved.bUseAssetIdOnly = true;
+    } else if (HasAssetTag(Tags, TEXT("PBRMAX"))) {
+      Resolved.TypeKey = TEXT("PBRMAX");
+    }
+    Resolved.FolderName = TEXT("Objects");
+    Resolved.bBaseFamily = true;
+    Resolved.bHighResPreset = true;
+    return Resolved;
+  }();
+  Profile.bTemp = bTemp;
+  if (bTemp) {
+    // 对象名段：SM_Env_Temp_<名>_<ID> / T_Env_Temp_<名>_<ID>_<槽位> /
+    //           MI_Env_Temp_<名>_<ID>_<变体>（TypePrefix 为空时即 Env_Temp_*）。
+    Profile.TypePrefix = Profile.TypePrefix.IsEmpty()
+                             ? FString(TEXT("Temp"))
+                             : FString::Printf(TEXT("Temp_%s"), *Profile.TypePrefix);
     Profile.bBaseFamily = false;
-    Profile.bHighResPreset = true;
-    Profile.bMega = true;
-    return Profile;
   }
-  if (HasAssetTag(Tags, TEXT("Kits")) || HasAssetTag(Tags, TEXT("Kit"))) {
-    Profile.TypeKey = TEXT("Kits");
-    Profile.TypePrefix = TEXT("Kit");
-    Profile.FolderName = TEXT("Kits");
-    Profile.bBaseFamily = true;
-    Profile.bHighResPreset = false;
-    return Profile;
-  }
-  if (HasAssetTag(Tags, TEXT("Destructible"))) {
-    Profile.TypeKey = TEXT("Destructible");
-    Profile.TypePrefix = TEXT("Dest");
-    Profile.FolderName = TEXT("Destructible");
-    Profile.bBaseFamily = false;
-    Profile.bHighResPreset = true;
-    return Profile;
-  }
-  if (HasAssetTag(Tags, TEXT("Props"))) {
-    Profile.TypeKey = TEXT("Props");
-    Profile.TypePrefix = TEXT("Prop");
-    Profile.FolderName = TEXT("Props");
-    Profile.bBaseFamily = true;
-    Profile.bHighResPreset = false;
-    return Profile;
-  }
-  if (HasAssetTag(Tags, TEXT("Dressing"))) {
-    Profile.TypeKey = TEXT("Dressing");
-  } else if (HasAssetTag(Tags, TEXT("Megascans"))) {
-    Profile.TypeKey = TEXT("Megascans");
-    Profile.bUseAssetIdOnly = true;
-  } else if (HasAssetTag(Tags, TEXT("PBRMAX"))) {
-    Profile.TypeKey = TEXT("PBRMAX");
-  }
-  Profile.FolderName = TEXT("Objects");
-  Profile.bBaseFamily = true;
-  Profile.bHighResPreset = true;
   return Profile;
 }
 
+// 3D Assets / Zion 资产目录里的名字可能自带 Env_ 前缀（例如 "Env_diaodeng"",
+// 标准 Asset Tag 也可能是 "Env_Prop"）。此时若再拼一次 Env_ 就会得到
+// Env_Env_diaodeng_<ID>，网格体/材质实例/贴图三处同时出现重复前缀。
+// 这里在拼接前剥掉名字里已有的 Env_（不区分大小写），保证导出名只有一个 Env_。
+// 只看名字，不看资产 ID：ID 是稳定的内部标识，不应被前缀规则影响。
+static FString StripEnvironmentNamePrefix(const FString &Name) {
+  const FString Prefix = TEXT("Env_");
+  return Name.StartsWith(Prefix, ESearchCase::IgnoreCase)
+             ? Name.RightChop(Prefix.Len())
+             : Name;
+}
+
+// FolderStem 非空时直接用它做对象名词干，不再按 "名字_ID" 重建。
+// 该值来自导出侧的 assetFolderName，已经包含 Zion 的"去 Env_ 前缀 / 不带 ID"规则；
+// 两边共用同一个词干，才能保证资产文件夹名与 SM_/T_/MI_ 对象名一致，
+// 避免 ID 重复或出现 "__"。
+//
+// Env_ / Temp_ 属于"对象名前缀层"，不参与词干本身：
+//   - 词干开头的 Env_ 一律剥掉，避免与下面的 Env_ 前缀叠成 Env_Env_；
+//   - 词干开头的 Temp_ 也剥掉，Temp 段改由 Profile.TypePrefix 统一插入，
+//     否则会出现 Temp_Temp_（文件夹的 Temp_ 前缀 + 对象名的 Temp 段各算一次）。
 static FString BuildEnvironmentObjectStem(const FEnvironmentAssetProfile &Profile,
                                           const FString &AssetName,
-                                          const FString &AssetId) {
-  const FString Name = MakeSafeObjectName(AssetName).TrimStartAndEnd();
+                                          const FString &AssetId,
+                                          const FString &FolderStem = FString()) {
   const FString Id = MakeSafeObjectName(AssetId).TrimStartAndEnd();
+  const auto StripObjectPrefix = [](const FString &Value) {
+    // Env_ / Temp_ 可以任意顺序叠加（Env_Temp_x 或 Temp_Env_x），
+    // 循环剥离直到都不匹配，避免只剥一层后仍残留前缀。
+    FString Result = Value;
+    for (int32 Guard = 0; Guard < 8; ++Guard) {
+      if (Result.StartsWith(TEXT("Temp_"), ESearchCase::IgnoreCase)) {
+        Result = Result.RightChop(5).TrimStartAndEnd();
+        continue;
+      }
+      const FString Stripped = StripEnvironmentNamePrefix(Result);
+      if (!Stripped.Equals(Result, ESearchCase::CaseSensitive)) {
+        Result = Stripped.TrimStartAndEnd();
+        continue;
+      }
+      break;
+    }
+    return Result;
+  };
+  const FString SafeFolderStem =
+      MakeSafeObjectName(StripObjectPrefix(FolderStem)).TrimStartAndEnd();
+  const FString Name = SafeFolderStem.IsEmpty()
+                           ? MakeSafeObjectName(StripEnvironmentNamePrefix(AssetName))
+                                 .TrimStartAndEnd()
+                           : FString();
   FString Stem;
-  if (Profile.bUseAssetIdOnly && !Id.IsEmpty()) {
+  if (!SafeFolderStem.IsEmpty()) {
+    Stem = SafeFolderStem;
+  } else if (Profile.bUseAssetIdOnly && !Id.IsEmpty()) {
     Stem = Id;
   } else if (!Id.IsEmpty()) {
     Stem = Name.IsEmpty() ? Id
                           : FString::Printf(TEXT("%s_%s"), *Name, *Id);
   } else {
     Stem = Name.IsEmpty() ? FString(TEXT("AssetHiveAsset")) : Name;
+  }
+  // 名字被剥成空时（资产名恰好就是 "Env_"）退化为只用 ID，避免出现 "Env__<ID>"。
+  if (Stem.IsEmpty()) {
+    Stem = Id.IsEmpty() ? FString(TEXT("AssetHiveAsset")) : Id;
   }
   return Profile.TypePrefix.IsEmpty()
              ? FString::Printf(TEXT("Env_%s"), *Stem)
@@ -6210,7 +6282,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     if (bIs3DAsset) {
       EnvironmentProfile = ResolveEnvironmentAssetProfile(AssetStandardTags);
-      CategoryFolder = EnvironmentProfile.FolderName;
+      // 导出侧的 categoryFolder 承载"目标分类目录"，可能已包含用户选定的二级目录
+      // （Zion 资产为 "Objects/<二级>"）。此时以导出侧为准：若再被
+      // EnvironmentProfile.FolderName（Dressing 资产固定为 "Objects"）覆盖，
+      // 二级目录就会丢失，资产会落到 Objects 根下。
+      // 仅在导出侧未给出分类时才回退到标签推导出的目录名。
+      if (CategoryFolder.TrimStartAndEnd().IsEmpty()) {
+        CategoryFolder = EnvironmentProfile.FolderName;
+      }
     } else if (AssetType == TEXT("3dplant")) {
       // 3D Plants（md §5.2）：按标准 Asset Tag 落到 Vegetation/<子类>/。
       PlantProfile = ResolvePlantAssetProfile(AssetStandardTags);
@@ -6255,15 +6334,60 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const FString SafeAssetName = MakeSafeObjectName(AssetName);
     const FString SafeAssetId = MakeSafeObjectName(AssetId);
     const FString SafeCategoryFolder = MakeSafeObjectName(CategoryFolder);
+    // Zion 资产（库元数据 zionTags 非空）走单独导出约定：资产文件夹不带 _<id> 后缀，
+    // 且材质实例 / 纹理 / 静态网格体各进独立子目录。第三方资产维持原有命名，
+    // 避免与已导入的同名资产互相覆盖。
+    bool bIsZionAsset = false;
+    {
+      const TArray<TSharedPtr<FJsonValue>> *ZionTagValues = nullptr;
+      if (AssetObject->TryGetArrayField(TEXT("zionTags"), ZionTagValues) &&
+          ZionTagValues) {
+        for (const TSharedPtr<FJsonValue> &Value : *ZionTagValues) {
+          FString Tag;
+          if (Value.IsValid() && Value->TryGetString(Tag) &&
+              !Tag.TrimStartAndEnd().IsEmpty()) {
+            bIsZionAsset = true;
+            break;
+          }
+        }
+      }
+    }
+    // Env_ 与 Temp_ 都属"前缀层"，不参与名字本身：先把资产名里已有的这两个前缀
+    // 按任意叠加顺序全部剥掉，再由下面的规则统一加回（Temp 由 bTemp 决定，
+    // Env_ 在对象名前缀处补）。否则 "Env_Temp_stone_rubble_pile" 这类源名
+    // 会叠成 Temp_Env_Temp_...。
+    // Zion 资产另有约定：落在 Objects/<用户选定二级目录>/ 下，分类信息由上级目录表达，
+    // 名字同样不带 Env_（Env_diaodeng -> diaodeng）。
+    FString FolderStemSource = MakeSafeObjectName(SafeAssetName);
+    for (int32 Guard = 0; Guard < 8; ++Guard) {
+      if (FolderStemSource.StartsWith(TEXT("Temp_"), ESearchCase::IgnoreCase)) {
+        FolderStemSource = FolderStemSource.RightChop(5).TrimStartAndEnd();
+        continue;
+      }
+      const FString Stripped = StripEnvironmentNamePrefix(FolderStemSource);
+      if (!Stripped.Equals(FolderStemSource, ESearchCase::CaseSensitive)) {
+        FolderStemSource = Stripped.TrimStartAndEnd();
+        continue;
+      }
+      break;
+    }
     FString SafeAssetFolderName = MakeSafeObjectName(
-        AssetFolderName.IsEmpty() ? SafeAssetName : AssetFolderName);
+        AssetFolderName.IsEmpty() ? FolderStemSource : AssetFolderName);
     // Keep the on-disk asset folder aligned with every other exported object:
     // the internal asset ID is part of the folder name as well.
-    if (!SafeAssetId.IsEmpty() &&
+    // Zion 资产例外：不带 ID 后缀（由用户选定的二级目录承担归类职责）。
+    if (!bIsZionAsset && !SafeAssetId.IsEmpty() &&
         !SafeAssetFolderName.EndsWith(
             FString::Printf(TEXT("_%s"), *SafeAssetId),
             ESearchCase::IgnoreCase)) {
       SafeAssetFolderName += TEXT("_") + SafeAssetId;
+    }
+    // Temp 标记（临时/草稿资产）在文件夹名上再加一层前缀，便于整批识别与清理。
+    // Temp 优先于 Zion：两者共存时仍保留 Zion 的"无 ID 后缀 / 去 Env_ 前缀"规则，
+    // 只额外叠加 Temp_ 前缀。
+    if (EnvironmentProfile.bTemp && !SafeAssetFolderName.IsEmpty() &&
+        !SafeAssetFolderName.StartsWith(TEXT("Temp_"), ESearchCase::IgnoreCase)) {
+      SafeAssetFolderName = TEXT("Temp_") + SafeAssetFolderName;
     }
     const FString AssetStem =
         FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
@@ -6274,9 +6398,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const FString PlantObjectStem =
         bFbxPlantNaming ? BuildPlantObjectStem(AssetStandardTags, SafeAssetId)
                         : FString();
+    // 对象名词干直接复用资产文件夹名：Zion 的"去 Env_ / 不带 ID"与 Temp 的
+    // "Temp_ 前缀"只在文件夹名这一处计算，SM_/T_/MI_ 与文件夹因此天然一致，
+    // 不会出现 ID 重复或 "__"。
     const FString EnvironmentStem =
         bIs3DAsset ? BuildEnvironmentObjectStem(EnvironmentProfile, AssetName,
-                                                AssetId)
+                                                AssetId, SafeAssetFolderName)
                    : FString();
     const FString AssetFolder =
         SafeCategoryFolder.IsEmpty()
@@ -6285,14 +6412,21 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const bool bUsesMaterialFolders = bIsSurface || bIsDecal;
     // 植被（3dplant）：材质实例 / 纹理 / 静态网格体分目录存放，FoliageType 留在资产文件夹根。
     const bool bUsesFoliageFolders = AssetType == TEXT("3dplant");
+    // Zion 3D 资产：三类产物同样分目录，目录名按项目约定为 Material / Tex / Mesh。
+    const bool bUsesZionFolders = bIs3DAsset && bIsZionAsset;
     const FString TextureFolder =
-        (bUsesMaterialFolders || bUsesFoliageFolders) ? AssetFolder / TEXT("Tex")
-                                                       : AssetFolder;
+        (bUsesMaterialFolders || bUsesFoliageFolders || bUsesZionFolders)
+            ? AssetFolder / TEXT("Tex")
+            : AssetFolder;
     const FString MaterialFolder =
-        (bUsesMaterialFolders || bUsesFoliageFolders) ? AssetFolder / TEXT("MI")
-                                                      : AssetFolder;
+        bUsesZionFolders ? AssetFolder / TEXT("Material")
+                         : ((bUsesMaterialFolders || bUsesFoliageFolders)
+                                ? AssetFolder / TEXT("MI")
+                                : AssetFolder);
     const FString MeshFolder =
-        bUsesFoliageFolders ? AssetFolder / TEXT("Meshes") : AssetFolder;
+        bUsesZionFolders ? AssetFolder / TEXT("Mesh")
+                         : (bUsesFoliageFolders ? AssetFolder / TEXT("Meshes")
+                                                : AssetFolder);
     const bool bUseVT = IsAssetVirtualTextureImportEnabled();
     double SurfaceBaseTiling = 1.0;
     FString DecalParentMode = TEXT("decal");
@@ -7214,7 +7348,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             EnvironmentStem, GroupId, GroupIds.Num() > 1,
             PrimaryModelVariantKey);
         MaterialInstance = CreateEnvironmentAssetMaterialInstance(
-            AssetFolder, MaterialName, EnvironmentProfile,
+            MaterialFolder, MaterialName, EnvironmentProfile,
             TextureBySlot.FindRef(TEXT("albedo")),
             TextureBySlot.FindRef(TEXT("normal")), ORMTexture, MegaMaskTexture,
             OpacityTexture, TextureBySlot.FindRef(TEXT("emissive")), bMasked);
@@ -7840,6 +7974,15 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   const FString MegascansStem = BuildStemForTag(TEXT("Megascans"));
   TestEqual(TEXT("Megascans uses tag and asset ID only"), MegascansStem,
             FString(TEXT("Env_abc123")));
+  // 资产名自带 Env_ 前缀时不得再拼一次（Zion 资产目录里常见 "Env_diaodeng"）。
+  TestEqual(TEXT("Asset name with Env_ prefix is not double-prefixed"),
+            BuildEnvironmentObjectStem(ResolveEnvironmentAssetProfile(TArray<FString>()),
+                                       TEXT("Env_diaodeng"), TEXT("y2nmajx")),
+            FString(TEXT("Env_diaodeng_y2nmajx")));
+  TestEqual(TEXT("Lowercase env_ prefix is also de-duplicated"),
+            BuildEnvironmentObjectStem(ResolveEnvironmentAssetProfile(TArray<FString>()),
+                                       TEXT("env_diaodeng"), TEXT("y2nmajx")),
+            FString(TEXT("Env_diaodeng_y2nmajx")));
   TestEqual(TEXT("Megascans mesh drops display name"),
             FString::Printf(TEXT("SM_%s_%s"), *MegascansStem, TEXT("01")),
             FString(TEXT("SM_Env_abc123_01")));
