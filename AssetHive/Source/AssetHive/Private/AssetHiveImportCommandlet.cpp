@@ -1135,10 +1135,37 @@ struct FPlantAssetProfile {
   EPlantSyntheticWind SyntheticWind = EPlantSyntheticWind::None;
 };
 
-static FPlantAssetProfile ResolvePlantAssetProfile(const TArray<FString> &Tags) {
+// PlantCategory 是库元数据里的 category 字段（Megascans 植被类别词表：Shrub / Grass /
+// Fern / Flowering Plant / Garden Plant …）。灌木类进 Vegetation/Bush，其余一律进
+// Vegetation/Grass —— 未识别的类别不再留空落到 Vegetation 根目录。
+static FPlantAssetProfile ResolvePlantAssetProfile(
+    const TArray<FString> &Tags, const FString &PlantCategory = FString()) {
   FPlantAssetProfile Profile;
   // 合成风只针对 Megascans 导入的 3D Plants；st9 等原生资产保持不动。
   const bool bMegascansPlant = HasAssetTag(Tags, TEXT("Megascans"));
+  // 类别判定的规范化：去掉空格与连字符后比较，容忍 "Flowering Plant" / "flowering-plant"
+  // 这类写法差异。
+  FString CategoryToken = PlantCategory;
+  CategoryToken.TrimStartAndEndInline();
+  CategoryToken.ReplaceInline(TEXT(" "), TEXT(""));
+  CategoryToken.ReplaceInline(TEXT("-"), TEXT(""));
+  CategoryToken.ReplaceInline(TEXT("_"), TEXT(""));
+  CategoryToken = CategoryToken.ToLower();
+  // 灌木：库里的类别词是 Shrub，插件与引擎目录约定用 Bush，两种写法都接受。
+  const bool bShrubCategory =
+      CategoryToken == TEXT("shrub") || CategoryToken == TEXT("bush") ||
+      CategoryToken == TEXT("shrubbery");
+  // 类别优先于 tag：Megascans 植被的 standardAssetTags 通常只有 "Megascans"，
+  // 分档信息只在 category 字段里，靠 tag 判断会全部落到默认分支。
+  if (bShrubCategory) {
+    Profile.SubtypeFolder = TEXT("Bush");
+    Profile.MaxLOD0Triangles = 35000;
+    Profile.bHandleCollision = true;
+    if (bMegascansPlant) {
+      Profile.SyntheticWind = EPlantSyntheticWind::Branch1Branch2UV3;
+    }
+    return Profile;
+  }
   if (HasAssetTag(Tags, TEXT("Tree"))) {
     Profile.SubtypeFolder = TEXT("Tree");
     Profile.MaxLOD0Triangles = 100000;
@@ -1181,8 +1208,21 @@ static FPlantAssetProfile ResolvePlantAssetProfile(const TArray<FString> &Tags) 
     Profile.TextureMaxSize = 4096;
     return Profile;
   }
-  // 未识别的植被不做子类分档，也不改写 Nanite / 碰撞设置。
-  Profile.MaxLOD0Triangles = 0;
+  // 其余植被一律进 Vegetation/Grass：不再留空落到 Vegetation 根目录，保证植被导出
+  // 位置是确定的。
+  Profile.SubtypeFolder = TEXT("Grass");
+  if (!PlantCategory.IsEmpty()) {
+    // 有库分类说明是带完整分类信息的植被（Megascans）：套用 Grass 档的面数与碰撞设置。
+    Profile.MaxLOD0Triangles = 10000;
+    Profile.bHandleCollision = true;
+    if (bMegascansPlant) {
+      Profile.SyntheticWind = EPlantSyntheticWind::Branch1;
+    }
+  } else {
+    // 无库分类的植被（st9 等原生资产）只补目录，不改写面数 / 碰撞 / Nanite 设置，
+    // 避免套用 Megascans 的分档预算。
+    Profile.MaxLOD0Triangles = 0;
+  }
   return Profile;
 }
 
@@ -6326,8 +6366,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         CategoryFolder = EnvironmentProfile.FolderName;
       }
     } else if (AssetType == TEXT("3dplant")) {
-      // 3D Plants（md §5.2）：按标准 Asset Tag 落到 Vegetation/<子类>/。
-      PlantProfile = ResolvePlantAssetProfile(AssetStandardTags);
+      // 3D Plants（md §5.2）：按库分类落到 Vegetation/<子类>/。
+      // 库分类（job 的 plantCategory，来自元数据 category 字段）先于 tag 判断：
+      // Megascans 植被的 standardAssetTags 通常只有 "Megascans"，分档信息只在
+      // category 里（Shrub / Grass / Fern …），靠 tag 会全部落到默认分支。
+      FString PlantCategory;
+      AssetObject->TryGetStringField(TEXT("plantCategory"), PlantCategory);
+      PlantProfile = ResolvePlantAssetProfile(AssetStandardTags, PlantCategory);
       // 合成 SpeedTree 风由导入时选择（grass / bush / fern / 不选），随 job 传入：未选择时
       // 不写风动 UV、也不切换 ST 风母材质；选择后写入的即导出到引擎的那个网格
       // （勾选不透明剪切并导出裁切版本时，裁切资产同样处理）。
@@ -8184,6 +8229,48 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("Megascans tree keeps no synthetic wind"),
            ResolvePlantAssetProfile({FString(TEXT("Megascans")), FString(TEXT("Tree"))})
                    .SyntheticWind == EPlantSyntheticWind::None);
+
+  // 库分类（category 字段）决定植被落在 Vegetation/Bush 还是 Vegetation/Grass：
+  // 灌木类（Shrub/Bush）进 Bush，其余一律进 Grass —— 未识别类别不再留空落到
+  // Vegetation 根目录。Megascans 植被的 standardAssetTags 通常只有 "Megascans"，
+  // 分档信息只在 category 里，因此类别必须优先于 tag 判断。
+  {
+    const FPlantAssetProfile ShrubProfile = ResolvePlantAssetProfile(
+        {FString(TEXT("Megascans"))}, FString(TEXT("Shrub")));
+    TestEqual(TEXT("Shrub category goes to Bush folder"),
+              ShrubProfile.SubtypeFolder, FString(TEXT("Bush")));
+    TestEqual(TEXT("Shrub category uses bush triangle budget"),
+              ShrubProfile.MaxLOD0Triangles, 35000);
+    TestTrue(TEXT("Shrub category uses branch1 + branch2 UV3 wind"),
+             ShrubProfile.SyntheticWind ==
+                 EPlantSyntheticWind::Branch1Branch2UV3);
+
+    // 大小写与连字符写法都要能识别。
+    TestEqual(TEXT("Lowercase shrub category also goes to Bush"),
+              ResolvePlantAssetProfile({FString(TEXT("Megascans"))},
+                                       FString(TEXT("shrub")))
+                  .SubtypeFolder,
+              FString(TEXT("Bush")));
+
+    // 其余类别一律进 Grass（Fern / Flowering Plant / Garden Plant … 都是非灌木）。
+    const TArray<FString> NonShrubCategories = {
+        TEXT("Grass"),  TEXT("Fern"),           TEXT("Flowering Plant"),
+        TEXT("Garden Plant"), TEXT("Aquatic"),  TEXT("Weed")};
+    for (const FString &Category : NonShrubCategories) {
+      const FPlantAssetProfile CategoryProfile = ResolvePlantAssetProfile(
+          {FString(TEXT("Megascans"))}, Category);
+      TestEqual(
+          FString::Printf(TEXT("Non-shrub category %s goes to Grass"), *Category),
+          CategoryProfile.SubtypeFolder, FString(TEXT("Grass")));
+    }
+
+    // 无库分类的植被（st9 等原生资产）只补目录，不套用 Megascans 的面数分档。
+    const FPlantAssetProfile UnclassifiedProfile = ResolvePlantAssetProfile({});
+    TestEqual(TEXT("Unclassified plant still lands under Grass"),
+              UnclassifiedProfile.SubtypeFolder, FString(TEXT("Grass")));
+    TestEqual(TEXT("Unclassified plant keeps no triangle budget"),
+              UnclassifiedProfile.MaxLOD0Triangles, 0);
+  }
 
   {
     // UV3 编码必须能被材质侧 HLSL 解码函数还原（10bit 位置 / 10bit 方向 / 8bit 权重）。
