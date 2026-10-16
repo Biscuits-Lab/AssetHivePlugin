@@ -247,6 +247,20 @@ enum class EPlantSyntheticWind : uint8 {
   Fern,
 };
 
+// 合成风预设的日志名（导入日志里回报"自动"最终选了什么，便于美术核对）。
+static const TCHAR *PlantSyntheticWindName(EPlantSyntheticWind Style) {
+  switch (Style) {
+    case EPlantSyntheticWind::Fern:
+      return TEXT("Fern");
+    case EPlantSyntheticWind::Branch1:
+      return TEXT("Grass/Branch1");
+    case EPlantSyntheticWind::Branch1Branch2UV3:
+      return TEXT("Bush/Branch1+2");
+    default:
+      return TEXT("无");
+  }
+}
+
 namespace AssetHivePlantWind {
 // 编码范围与材质实例参数一一对应（固定范围，跨资产共享，便于母材质复用）。
 constexpr float PositionMin = 0.0f;
@@ -937,6 +951,12 @@ struct FPlantWindStructuralSeam {
 //      同一接缝两侧在第二遍后收敛到同一方向/权重/ripple；非结构接触只在两侧原始权重都 <= 0.7 时
 //      参与（叶尖保护），结构接缝不受该门控。
 //   2) 结构顶点对（合并边/被拒边/attach/axial）在低权重区（两侧原始权重 <= 0.6）直接对插。
+//   3) 真贴合（距离 <= TouchDistance，即 Join 半径）的跨风单元对**不受叶尖权重门控**：两侧本来就
+//      在几何上贴着，权重门控只会造成"叶片贴着茎秆、茎秆在动、叶片不动"的可见缝隙。判据从
+//      "结构关系"换成"是否真的贴上"，与同一片叶内部的叶尖自由度（由沿轴权重场决定）无关。
+//      离线 A/B（原型 fern-rule7.cjs vs rule6，span=0.75）：真贴合对中"焊后顶点风向仍差 ≥15°"的数量
+//      由 388 降到 37（32 个跨类别样本）、71 降到 6（28 个蕨类变体），叶尖方向改动上升 ≤0.3pp /
+//      ≤2.1pp；`SM_..._04` 由 7 对降到 0 对（其目视症状即叶片与茎秆分离）。
 // 返回：被改动的顶点数。
 static int32 BlendPlantWindSeams(int32 VertexCount,
                                  const TArray<FVector3f> &Positions,
@@ -950,7 +970,8 @@ static int32 BlendPlantWindSeams(int32 VertexCount,
                                  TArray<float> &Ripple,
                                  TArray<uint8> &OutBlended,
                                  float NonStructuralTipWeightLimit = 0.7f,
-                                 bool bBlendExplicitSeams = true) {
+                                 bool bBlendExplicitSeams = true,
+                                 float TouchDistance = 0.0f) {
   OutBlended.Init(0, VertexCount);
   if (VertexCount <= 0 || ContactDistance <= 0.0f ||
       Positions.Num() < VertexCount || UnitOfVertex.Num() < VertexCount ||
@@ -962,6 +983,7 @@ static int32 BlendPlantWindSeams(int32 VertexCount,
   const TArray<float> OriginalWeight = Weight;
   const float Cell = FMath::Max(ContactDistance, 1e-3f);
   const float RadiusSquared = ContactDistance * ContactDistance;
+  const float TouchRadiusSquared = TouchDistance > 0.0f ? TouchDistance * TouchDistance : 0.0f;
   const bool bHasClusterMap = ClusterOfUnit != nullptr && ClusterOfUnit->Num() >= UnitOfVertex.Num();
   auto ClusterIndexOfUnit = [&UnitOfVertex, ClusterOfUnit, bHasClusterMap](int32 VertexIndex) -> int32 {
     const int32 UnitIndex = UnitOfVertex[VertexIndex];
@@ -1010,7 +1032,10 @@ static int32 BlendPlantWindSeams(int32 VertexCount,
                 }
                 const bool bStructural =
                     StructuralUnitPairs.Contains(PlantWindUnitPairKey(UnitIndex, OtherUnit));
-                if (!bStructural &&
+                // 真贴合（<= Join 半径）的跨风单元对接缝无条件参与：几何上贴着就不该被权重门控挡掉。
+                const bool bTouching =
+                    TouchRadiusSquared > 0.0f && DistanceSquared <= TouchRadiusSquared;
+                if (!bStructural && !bTouching &&
                     FMath::Max(OriginalWeight[VertexIndex], OriginalWeight[OtherVertex]) >
                         NonStructuralTipWeightLimit) {
                   continue;
@@ -1125,6 +1150,13 @@ static int32 EqualizePlantWindCardSeams(int32 VertexCount,
 struct FPlantAssetProfile {
   FString SubtypeFolder;  // Vegetation 下的子类目录，未识别时留空
   int32 MaxLOD0Triangles = 0;
+  // _OPAQUE 裁切变体的面数档。这里给的是**上限**（Nanite 保留百分比的预算基线），
+  // 不是分配值：生成侧（AssetHive）按下限..上限之间按结构复杂度分配，只要不超过
+  // 上限，这里的保留百分比就是 100% —— 生成多少渲染多少，既不裁剪也不浪费。
+  // 实测固定 10 万档时复杂资产（itx1dbp_01，4.73M 候选）减面比被推到 47:1，
+  // 轮廓边缘被压得不规整；生成侧放开到 15 万后减面比回到 31:1。
+  // 0 = 沿用 MaxLOD0Triangles（Tree / Micro / Hero 没有单独放宽）。
+  int32 MaxLOD0TrianglesOpaque = 0;
   bool bNanite = true;
   bool bHandleCollision = false;
   bool bTrunkCollision = false;
@@ -1155,11 +1187,21 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
   const bool bShrubCategory =
       CategoryToken == TEXT("shrub") || CategoryToken == TEXT("bush") ||
       CategoryToken == TEXT("shrubbery");
+  // 预设分类 v3（2026-10-16，落地自 275 资产元数据扫描 + 71 资产 F1–F6 实跑）：
+  //   这些类别实测适合 Fern 的结构归组（跨簇叶尖对中位：蕨类 1、杂草 6、室内植物 6、
+  //   花园植物 8、香草 10、地被 11），此前它们会落到默认分支拿 Grass(branch1)，叶片与叶轴
+  //   各成一个风单元，表现为"叶片和茎秆分离"。
+  //   仅影响"自动"预设（job 里 plantSyntheticWind=auto）；显式选 grass/bush/fern 仍照旧覆盖。
+  const bool bFernWindCategory =
+      CategoryToken == TEXT("fern") || CategoryToken == TEXT("herb") ||
+      CategoryToken == TEXT("gardenplant") || CategoryToken == TEXT("weed") ||
+      CategoryToken == TEXT("groundcover") || CategoryToken == TEXT("houseplant");
   // 类别优先于 tag：Megascans 植被的 standardAssetTags 通常只有 "Megascans"，
   // 分档信息只在 category 字段里，靠 tag 判断会全部落到默认分支。
   if (bShrubCategory) {
     Profile.SubtypeFolder = TEXT("Bush");
     Profile.MaxLOD0Triangles = 35000;
+    Profile.MaxLOD0TrianglesOpaque = 300000;
     Profile.bHandleCollision = true;
     if (bMegascansPlant) {
       Profile.SyntheticWind = EPlantSyntheticWind::Branch1Branch2UV3;
@@ -1176,6 +1218,7 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
   if (HasAssetTag(Tags, TEXT("Bush"))) {
     Profile.SubtypeFolder = TEXT("Bush");
     Profile.MaxLOD0Triangles = 35000;
+    Profile.MaxLOD0TrianglesOpaque = 300000;
     Profile.bHandleCollision = true;
     if (bMegascansPlant) {
       Profile.SyntheticWind = EPlantSyntheticWind::Branch1Branch2UV3;
@@ -1185,6 +1228,7 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
   if (HasAssetTag(Tags, TEXT("Grass"))) {
     Profile.SubtypeFolder = TEXT("Grass");
     Profile.MaxLOD0Triangles = 10000;
+    Profile.MaxLOD0TrianglesOpaque = 150000;
     Profile.bHandleCollision = true;
     if (bMegascansPlant) {
       Profile.SyntheticWind = EPlantSyntheticWind::Branch1;
@@ -1214,9 +1258,11 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
   if (!PlantCategory.IsEmpty()) {
     // 有库分类说明是带完整分类信息的植被（Megascans）：套用 Grass 档的面数与碰撞设置。
     Profile.MaxLOD0Triangles = 10000;
+    Profile.MaxLOD0TrianglesOpaque = 150000;
     Profile.bHandleCollision = true;
     if (bMegascansPlant) {
-      Profile.SyntheticWind = EPlantSyntheticWind::Branch1;
+      Profile.SyntheticWind = bFernWindCategory ? EPlantSyntheticWind::Fern
+                                                : EPlantSyntheticWind::Branch1;
     }
   } else {
     // 无库分类的植被（st9 等原生资产）只补目录，不改写面数 / 碰撞 / Nanite 设置，
@@ -1616,6 +1662,20 @@ static bool ApplyPlantNaniteTriangleBudget(UStaticMesh *StaticMesh,
   return true;
 }
 
+// _OPAQUE 裁切变体的面数档：裁切网格用几何表达遮罩本来免费提供的外轮廓，
+// 面数需求跟轮廓长度走，与被裁切（masked）变体的表面预算不是同一个量。
+// 实测（Beech Fern 4096² 遮罩）：不透明区 4.47M 纹素、轮廓 46.6 万纹素，
+// 若只给 masked 档的 1 万面，轮廓步长约 21 纹素，叶缘必然是台阶状；
+// 反过来生成侧按 20 万面产出而保留百分比只有 5% 时，绝大部分几何存进资产却不参与渲染
+// （实测 keepPercentTriangles 0.05002：20 万面只渲染 10,692 面，18 MB FBX / 12 MB uasset）。
+// 因此裁切档必须写进子类档案，并与生成侧的面数上限取同一个数。
+// 未设裁切档的子类（Tree / Micro / Hero）沿用 masked 档；未分类植被两边都不分档。
+static int32 ResolveOpaquePlantTriangleBudget(const FPlantAssetProfile &Profile) {
+  return Profile.MaxLOD0TrianglesOpaque > 0
+             ? Profile.MaxLOD0TrianglesOpaque
+             : Profile.MaxLOD0Triangles;
+}
+
 static bool FbxHasSmoothingGroupLayer(const FString &SourceFile) {
   TArray<uint8> FileData;
   if (!FFileHelper::LoadFileToArray(FileData, *SourceFile)) {
@@ -2004,11 +2064,19 @@ static bool ComputePlantWindFernStructure(int32 VertexCount,
   if (Diagonal <= KINDA_SMALL_NUMBER) {
     return false;
   }
-  // F1 参数：按资产对角自适应（原型终版 0.005 / 0.010 / 0.5 / 0.02，单位 cm）。
+  // F1 参数：按资产对角自适应（原型终版 0.005 / 0.010 / 0.02，单位 cm）。
+  // 跨度上限由 0.5 提到 0.75（2026-10-16，275 资产 /2566 变体实测标定）：
+  //   · 库内「单片长度 / 全网对角」中位 0.40~0.65，单张叶片本身就接近 0.5·diag，
+  //     0.5 的跨度上限会把「叶片 + 其所属叶轴碎片」这类合法合并挡掉（实测
+  //     SM_..._04 一张网里有 48 对合并被跨度拒绝）；
+  //   · 离线 A/B（fern-rule6.cjs，跨簇贴合对 = 会动出可见缝隙的接触对）：
+  //     该资产真贴合跨簇对 55 → 22、含叶尖者 36 → 11；结构撕裂 52 → 0 的资产亦有；
+  //   · 安全性：32 个跨类别样本中最大簇占比上限 60%，未出现整株并簇；
+  //     0.75 与 1.5 结果相同（约束已转移到每簇 rachis 上限），故取 0.75 留余量。
   Out.JoinDistance = FMath::Clamp(Diagonal * 0.005f, 0.15f, 1.5f);
   Out.ContactDistance = FMath::Clamp(FMath::Max(Out.JoinDistance, Diagonal * 0.010f), 0.2f, 1.2f);
   Out.AttachDistance = FMath::Clamp(Diagonal * 0.020f, 0.3f, 3.0f);
-  Out.SpanLimit = Diagonal * 0.5f;
+  Out.SpanLimit = Diagonal * 0.75f;
 
   TArray<TArray<int32>> IslandVertices;
   IslandVertices.SetNum(IslandCount);
@@ -2155,7 +2223,14 @@ static bool ComputePlantWindFernStructure(int32 VertexCount,
     } else {
       bFlipAxis = TipRadius < BaseRadius - 1e-6;
     }
-    if (!bFlipAxis && TipRadius > 0.05 && BaseRadius > TipRadius * 1.25) {
+    // 竖直护栏：径向测试只在「末端不高于基端」时才有发言权。末端明显高于基端 =
+    // 叶片明确向上生长（蕨类叶从冠部向外上长），此时"基端近中心"的径向特征不可信：
+    // 回弯叶与外斜叶的径向特征相同而正确方向相反，只有竖直方向能区分。
+    // 实测 itx1dbp 的中央立柱簇（band 低端离中心 3.63cm、高端只离 1.42cm、
+    // Z 0.31→4.03 向上）被径向测试翻反：簇锚点落到高处、方向朝下，整根立柱
+    // 上半段权重钳 0 不动、基部满幅摆动——茎秆/叶片分离。
+    const bool bTipAboveBase = BandTip.Z > BandBase.Z + 1e-6;
+    if (!bFlipAxis && TipRadius > 0.05 && BaseRadius > TipRadius * 1.25 && !bTipAboveBase) {
       bFlipAxis = true;
     }
     if (bFlipAxis) {
@@ -2561,10 +2636,17 @@ static bool ComputePlantWindFernStructure(int32 VertexCount,
   //   互相只差 0.01~0.17cm，锚点却相距 3.6cm）。
   //
   // 两道护栏（离线实测，缺一不可）：
-  //   1) 合并距离取 0.5cm：只并"真正重合"的片。取 2.0cm 会一路传递合并，实测本地
-  //      Megascans 蕨 Var4 从 14 张卡并到 1 张，整株退化成刚性整体运动，比现状更糟。
-  //      0.5cm 也低于 SyntheticWindFernWideGap 用例里的 8mm 间隙，该用例断言的
-  //      "8mm 根部间隙并入同一风单元"由 F3 负责，不被本规则干扰。
+  //   1) 合并距离（2026-10-15 由 0.5cm 重标定为 1.2cm）：只并"根部相接"的片，不能传递
+  //      级联。取 2.0cm 会一路传递合并，实测本地 Megascans 蕨 Var4 从 14 张卡并到 1 张，
+  //      整株退化成刚性整体运动，比现状更糟；1.2cm 是覆盖"蕨类叶轴-子叶根部间隙"所需的下限。
+  //      Beech_Fern_axz0tqu_09（整条羽叶 = 叶轴 + 全部子叶）实测：源网格在 0.5cm 下仍是
+  //      4 个风单元（24 片 → 19/2/2/1），裁切网格按 UV0 回查后 22 片落卡 3、片 6 落卡 2、
+  //      片 3 落卡 1，三张卡的 tip 相距 6~9cm —— 同一片叶子被切成三条独立梯度，视觉上就是
+  //      "茎秆与叶片分离"。逐距扫描（源网格，MergeMode=ConnectedCluster）：
+  //      axz0tqu 09：0.5→4 簇、1.0→2、1.2→1；同族 01：6→2→2；03：12→6→5；04：7→4→2；
+  //      06：2→1→1。即 1.2cm 只把"本就是一条羽叶"的碎片收回一个风单元，不会把多羽叶整株并成一张。
+  //      SyntheticWindFernWideGap 用例的 8mm 间隙在 1.2cm 下仍只并该并的两片（3.8cm 外的
+  //      独立叶片照旧独立，卡片数断言 2 不变）；FernMerge 用例断言 1 张同样不变。
   //   2) 并集跨度不得超过"两片各自沿自身轴跨度之和"的 1.6 倍。不能拿并集直接和固定阈值比：
   //      换锚轴后，原本沿自身轴 16cm 的片在新轴上会被量成 29cm——那是"换尺子"造成的假超标，
   //      会把本该粘合的两段羽叶挡在门外（bvxkwlf_13 实测就被这条挡住）。
@@ -2572,9 +2654,10 @@ static bool ComputePlantWindFernStructure(int32 VertexCount,
   //   bvxkwlf_13 实测两轴夹角 46.371°，45° 阈值恰好把它挡在门外，导致主干与羽叶分离
   //   （跨卡接触面 50626 对顶点相对错动 1.26cm）。放宽到 70° 后该资产并成 1 张卡、错动归零；
   //   全家族 01/03/11/13/14/15 六个变体实测跨卡位移差全部为 0.000cm。
-  // rachis 容量上限放开（64）：0.5cm 的贴合距离本身已排除级联，再加严会误伤
-  // SyntheticWindFernWideGap 这类"三片都应并入同一风单元"的合法用例。
-  constexpr float ProximityMergeDistance = 0.5f;
+  // rachis 容量上限放开（64）：1.2cm 的根部贴合距离配合"并集跨度 ≤ 各自跨度之和×1.6"已足以
+  //   挡住级联（离线扫距里 100+ 片的多羽叶资产在 1.2cm 下仍保留 2~5 个风单元），再加严会误伤
+  //   SyntheticWindFernWideGap 这类"三片都应并入同一风单元"的合法用例。
+  constexpr float ProximityMergeDistance = 1.2f;
   constexpr float ProximityMergeAngleDegrees = 70.0f;
   constexpr int32 ProximityMergeMaxRachis = 64;
   constexpr float ProximityMergeSpanRatio = 1.6f;
@@ -3409,6 +3492,18 @@ constexpr float MinPlantWindWeightSpan = 2.0f;
 //   权重瞬间走完 0..1，整片被拉成条状。没有参考时回退到按自身碎片推导（旧行为）。
 //   裁切网格的卡片归属优先用 UV0 反查 CardReference（裁切网格完整继承源 UV0），UV 缺失或未命中
 //   时回退 3D 最近三角形；两种路径都会再经下面的“近距一致性”分组统一到同一张卡。
+// 近距一致性分组的碎片数上限。
+//
+// 上限的作用是防止并查集传递把整株并成一个组（Desert_Cotton_05 实测单组吞掉 7120 个碎片，
+// 整株绕同一锚点弯曲，视觉上就是「蠕虫」）。但 Fern 的叶片形态使这个数字必须放宽：同一条
+// 羽叶在裁切（_OPAQUE）网格里会被切成数百个碎片 —— 实测 Beech_Fern_axz0tqu：_01 297 片、
+// _02 231 片、_04 172 片。32 的硬上限必然把一条羽叶拆成十几组，各组投票后落到不同卡片，
+// 于是「茎秆与叶片分离」。Fern 放到 512（覆盖一条羽叶的全部碎片，仍比整株量级小一个数量级，
+// 蠕虫场景依旧被挡住）；其余预设保持 32，行为不变。
+static int32 PlantWindConsistencyGroupCap(EPlantWindFrondMergeMode MergeMode) {
+  return MergeMode == EPlantWindFrondMergeMode::ConnectedCluster ? 512 : 32;
+}
+
 // UV3 是 16383 进制编码，必须 32bit UV 精度，因此同时把该 LOD 的 UV 精度设为全精度。
 static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBranch2,
                                         EPlantWindFrondMergeMode MergeMode,
@@ -3819,9 +3914,12 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
       // 组规模上限（2026-10-09 二轮修正）：邻接统一是为了把「同一张叶片被切成多片」的局部碎片
       // 归到同一张卡；但并查集是传递的，密集裁切网格里几十个碎片连环相接后会把整株并成一个组，
       // 组内投票又让整组落到同一张卡——Desert_Cotton_05 实测一个组吃到 7120 个碎片（占全网格约 70%），
-      // 整株绕同一锚点弯曲，视觉上就是「蠕虫」。这里对组规模设硬上限：超过上限的合并直接放弃，
+      // 整株绕同一锚点弯曲，视觉上就是「蠕虫」。这里对组规模设上限：超过上限的合并直接放弃，
       // 统一只保留局部（同叶片尺度）范围。
-      constexpr int32 MaxConsistencyGroupIslands = 32;
+      // 2026-10-15 三轮修正：上限按预设取值（Fern 的羽叶碎片数远大于 32，见
+      // PlantWindConsistencyGroupCap 的说明）。
+      const int32 MaxConsistencyGroupIslands =
+          PlantWindConsistencyGroupCap(MergeMode);
       TArray<int32> GroupParents;
       GroupParents.SetNumUninitialized(Islands.Num());
       for (int32 IslandIndex = 0; IslandIndex < GroupParents.Num(); ++IslandIndex) {
@@ -3837,6 +3935,39 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
         return Index;
       };
       const float NeighborDistance = FMath::Clamp(NearCardDistance * 2.7f, 0.3f, 0.6f);
+      // Fern（ConnectedCluster）的邻接统一放宽（2026-10-15 三轮修正）：不再要求两片
+      // **共享候选卡片**，只按几何贴合并组，并用"合并后组跨度"挡住整株并成一组。
+      //
+      // 为什么必须放宽：裁切网格的碎片在 UV0 上可能落到不同源卡片（实测
+      // Beech_Fern_axz0tqu_04 有 3 片与主组不共享候选卡），旧前提让它们**永远**并不到
+      // 一起 —— 同一条羽叶落在 2 张卡上，叶片与茎秆各持一条梯度，表现就是"叶片和茎秆分离"。
+      // 跨度上限 30cm：覆盖一条羽叶（实测羽叶对角线约 20cm），远小于整株尺度，传递式
+      // 合并还没走到整株就会被挡住（对照 Desert_Cotton_05 的"蠕虫"案例）。
+      // Grass / Bush 保持原行为：仍要求共享候选卡片，跨度不参与判定。
+      const bool bFernGrouping = (MergeMode == EPlantWindFrondMergeMode::ConnectedCluster);
+      constexpr float FernGroupSpanLimit = 30.0f;
+      // 组包围盒：初值取各碎片自身的包围盒，并组时做并集，用于上面的跨度判据。
+      TArray<FVector3f> GroupBoundsMin;
+      TArray<FVector3f> GroupBoundsMax;
+      GroupBoundsMin.SetNum(Islands.Num());
+      GroupBoundsMax.SetNum(Islands.Num());
+      for (int32 IslandIndex = 0; IslandIndex < Islands.Num(); ++IslandIndex) {
+        GroupBoundsMin[IslandIndex] = FVector3f(MAX_flt, MAX_flt, MAX_flt);
+        GroupBoundsMax[IslandIndex] = FVector3f(-MAX_flt, -MAX_flt, -MAX_flt);
+      }
+      for (int32 VertexIndex = 0; VertexIndex < VertexCount; ++VertexIndex) {
+        const int32 IslandIndex = IslandParameters.IslandOfVertex[VertexIndex];
+        if (!GroupBoundsMin.IsValidIndex(IslandIndex)) {
+          continue;
+        }
+        const FVector3f P = Positions[FVertexID(VertexIndex)];
+        FVector3f &BoundsMin = GroupBoundsMin[IslandIndex];
+        FVector3f &BoundsMax = GroupBoundsMax[IslandIndex];
+        BoundsMin = FVector3f(FMath::Min(BoundsMin.X, P.X), FMath::Min(BoundsMin.Y, P.Y),
+                              FMath::Min(BoundsMin.Z, P.Z));
+        BoundsMax = FVector3f(FMath::Max(BoundsMax.X, P.X), FMath::Max(BoundsMax.Y, P.Y),
+                              FMath::Max(BoundsMax.Z, P.Z));
+      }
       {
         TMap<FIntVector, TArray<int32>> VertexGrid;
         VertexGrid.Reserve(VertexCount);
@@ -3884,15 +4015,29 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
                       break;
                     }
                   }
-                  if (bSharedCard) {
+                  if (bSharedCard || bFernGrouping) {
                     const int32 RootA = FindGroupRoot(IslandIndex);
                     const int32 RootB = FindGroupRoot(OtherIsland);
                     if (RootA != RootB) {
                       const int32 MergedSize =
                           GroupMemberCounts[RootA] + GroupMemberCounts[RootB];
-                      if (MergedSize <= MaxConsistencyGroupIslands) {
+                      const FVector3f MergedMin(
+                          FMath::Min(GroupBoundsMin[RootA].X, GroupBoundsMin[RootB].X),
+                          FMath::Min(GroupBoundsMin[RootA].Y, GroupBoundsMin[RootB].Y),
+                          FMath::Min(GroupBoundsMin[RootA].Z, GroupBoundsMin[RootB].Z));
+                      const FVector3f MergedMax(
+                          FMath::Max(GroupBoundsMax[RootA].X, GroupBoundsMax[RootB].X),
+                          FMath::Max(GroupBoundsMax[RootA].Y, GroupBoundsMax[RootB].Y),
+                          FMath::Max(GroupBoundsMax[RootA].Z, GroupBoundsMax[RootB].Z));
+                      // Fern 额外的尺度闸门：组跨度超过 FernGroupSpanLimit 就放弃合并，
+                      // 避免传递式合并把整株串成一个组（整株绕同一锚点弯曲）。
+                      const bool bSpanOk = !bFernGrouping ||
+                          (MergedMax - MergedMin).Size() <= FernGroupSpanLimit;
+                      if (MergedSize <= MaxConsistencyGroupIslands && bSpanOk) {
                         GroupParents[RootB] = RootA;
                         GroupMemberCounts[RootA] = MergedSize;
+                        GroupBoundsMin[RootA] = MergedMin;
+                        GroupBoundsMax[RootA] = MergedMax;
                       } else {
                         TotalConsistencyCappedUnions += 1;
                       }
@@ -4170,7 +4315,8 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
             StructuralPairs, FernStructure.StructuralSeams,
             FernStructure.ContactDistance, ContactDirection, ContactWeight,
             ContactRipple, SeamWelded,
-            /*NonStructuralTipWeightLimit=*/0.7f, /*bBlendExplicitSeams=*/true);
+            /*NonStructuralTipWeightLimit=*/0.7f, /*bBlendExplicitSeams=*/true,
+            /*TouchDistance=*/FernStructure.JoinDistance);
       }
     }
     if (UVs.GetNumChannels() < RequiredChannels) {
@@ -4401,10 +4547,10 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, bool bWriteBran
            TotalCardMappedVertices + TotalCardFallbackVertices, RawCardHitVertices,
            UsedCards.Num(), MaxCardMatchDistance);
     UE_LOG(LogTemp, Warning,
-           TEXT("AssetHive import: %s 合成风一致性：近距匹配阈值 %.3f cm，合并为 %d 组（最大 %d 个碎片），跨片统一卡片 %d 个碎片；组规模上限 32，放弃合并 %d 次"),
+           TEXT("AssetHive import: %s 合成风一致性：近距匹配阈值 %.3f cm，合并为 %d 组（最大 %d 个碎片），跨片统一卡片 %d 个碎片；组规模上限 %d（按预设），放弃合并 %d 次"),
         *StaticMesh->GetName(), TotalNearCardDistance, TotalConsistencyGroups,
         TotalConsistencyMaxGroupIslands, TotalConsistencyMergedIslands,
-        TotalConsistencyCappedUnions);
+        PlantWindConsistencyGroupCap(MergeMode), TotalConsistencyCappedUnions);
   }
   // 逐角拆分的源网格（例如不透明裁切导出的 FBX）会在焊接前后出现数量级差异，明确告警，
   // 便于后续排查“每个三角形一片”造成的合成风顶点撕裂。
@@ -6331,6 +6477,20 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     AssetObject->TryGetStringField(TEXT("categoryFolder"), CategoryFolder);
     FString AssetFolderName = TEXT("");
     AssetObject->TryGetStringField(TEXT("assetFolderName"), AssetFolderName);
+    // 裁切变体的面数预设：App 侧「面数预设」随导入 job 下发（metadata 的
+    // foliageOpaque.faceBudget）。> 0 时覆盖植被档位表的 _OPAQUE 面数上限；
+    // 0 / 未下发 = 沿用档位表（Grass 15 万 / Bush 30 万）。
+    // 没有这条通路时，界面上改面数对 UE 侧完全无效 —— 生成的 FBX 是全密度，
+    // 而 Nanite 保留百分比仍按档位表算，看起来就是"改了面数还是 15 万"。
+    int32 OpaqueFaceBudgetOverride = 0;
+    {
+      double OpaqueFaceBudgetRaw = 0.0;
+      if (AssetObject->TryGetNumberField(TEXT("opaqueFaceBudget"), OpaqueFaceBudgetRaw)
+          && OpaqueFaceBudgetRaw > 0.0) {
+        OpaqueFaceBudgetOverride =
+            static_cast<int32>(FMath::Clamp(OpaqueFaceBudgetRaw, 1.0, 5000000.0));
+      }
+    }
     AssetType = AssetType.ToLower();
     AssetSource = AssetSource.ToLower();
     bool bCreateFoliageForAsset = false;
@@ -6373,9 +6533,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       FString PlantCategory;
       AssetObject->TryGetStringField(TEXT("plantCategory"), PlantCategory);
       PlantProfile = ResolvePlantAssetProfile(AssetStandardTags, PlantCategory);
-      // 合成 SpeedTree 风由导入时选择（grass / bush / fern / 不选），随 job 传入：未选择时
+      // 合成 SpeedTree 风由导入时选择（grass / bush / fern / auto / 不选），随 job 传入：未选择时
       // 不写风动 UV、也不切换 ST 风母材质；选择后写入的即导出到引擎的那个网格
       // （勾选不透明剪切并导出裁切版本时，裁切资产同样处理）。
+      // "auto" = 预设分类 v3：不覆盖，保留 ResolvePlantAssetProfile 按库类别给出的预设
+      // （蕨类/草本类 → Fern，灌木 → Bush，草类 → Grass），并把最终选择打进导入日志，
+      // 便于美术按资产核对，无需逐个人工挑选。
       FString SyntheticWindMode;
       AssetObject->TryGetStringField(TEXT("plantSyntheticWind"), SyntheticWindMode);
       SyntheticWindMode.TrimStartAndEndInline();
@@ -6386,6 +6549,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         PlantProfile.SyntheticWind = EPlantSyntheticWind::Branch1Branch2UV3;
       } else if (SyntheticWindMode == TEXT("fern")) {
         PlantProfile.SyntheticWind = EPlantSyntheticWind::Fern;
+      } else if (SyntheticWindMode == TEXT("auto")) {
+        UE_LOG(LogTemp, Log,
+               TEXT("AssetHive import: 合成风预设=自动 → %s（库类别 \"%s\"）"),
+               PlantSyntheticWindName(PlantProfile.SyntheticWind), *PlantCategory);
       } else {
         PlantProfile.SyntheticWind = EPlantSyntheticWind::None;
       }
@@ -7742,28 +7909,41 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // SetMaterial calls Pre/PostEditChange and rebuilds the mesh for EVERY slot.
       // Perform one balanced edit so a high-poly mesh is only rebuilt once here.
       StaticMesh->PreEditChange(nullptr);
+      // Cut _OPAQUE variants use the opaque material set of the same group.
+      // The library export flags them on the variant entry instead of the key.
+      // 面数档同样按变体判定：裁切变体走裁切档（见 ResolveOpaquePlantTriangleBudget）。
+      const FString MeshVariantKey = VariantKeyByMesh.FindRef(StaticMesh);
+      const bool bOpaqueMesh =
+          IsOpaqueModelVariantKey(MeshVariantKey) ||
+          OpaqueModelVariantKeys.Contains(
+              NormalizeModelVariantKey(MeshVariantKey));
       if (bScanSourceAsset) {
         FString TriangleBudgetSummary;
         ApplyNaniteTriangleBudget(StaticMesh, TriangleBudgetSummary);
       }
       if (AssetType == TEXT("3dplant")) {
         // 3D Plants（md §5.2）：Nanite 按子类开关（Micro 不使用），面数按子类
-        // 规范压到上限内，并保留面积。
-        if (PlantProfile.bNanite && PlantProfile.MaxLOD0Triangles > 0) {
+        // 规范压到上限内，并保留面积。裁切变体改用裁切档：它的面数需求由轮廓
+        // 精度决定，与 masked 变体的表面预算不是同一个量。
+        const int32 PlantTriangleBudget =
+            bOpaqueMesh
+                ? (OpaqueFaceBudgetOverride > 0
+                       ? OpaqueFaceBudgetOverride
+                       : ResolveOpaquePlantTriangleBudget(PlantProfile))
+                : PlantProfile.MaxLOD0Triangles;
+        if (PlantProfile.bNanite && PlantTriangleBudget > 0) {
           FString PlantBudgetSummary;
-          ApplyPlantNaniteTriangleBudget(StaticMesh,
-                                         PlantProfile.MaxLOD0Triangles,
+          ApplyPlantNaniteTriangleBudget(StaticMesh, PlantTriangleBudget,
                                          PlantBudgetSummary);
-        } else if (PlantProfile.MaxLOD0Triangles > 0) {
+        } else if (PlantTriangleBudget > 0) {
           // Micro 不使用 Nanite：面数只能提示，无法靠保留百分比自动收敛。
           const FMeshDescription *BudgetMesh = StaticMesh->GetMeshDescription(0);
           const int32 PlantTriangles =
               BudgetMesh ? BudgetMesh->Triangles().Num() : 0;
-          if (PlantTriangles > PlantProfile.MaxLOD0Triangles) {
+          if (PlantTriangles > PlantTriangleBudget) {
             UE_LOG(LogTemp, Warning,
                    TEXT("AssetHive import: %s 面数 %d 超出植被规范 %d（Micro 不使用 Nanite，未自动收敛）"),
-                   *StaticMesh->GetName(), PlantTriangles,
-                   PlantProfile.MaxLOD0Triangles);
+                   *StaticMesh->GetName(), PlantTriangles, PlantTriangleBudget);
           }
         }
         FMeshNaniteSettings *NaniteSettings =
@@ -7775,13 +7955,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         GetMutableNaniteSettings(StaticMesh)->bEnabled = true;
       }
       TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
-      // Cut _OPAQUE variants use the opaque material set of the same group.
-      // The library export flags them on the variant entry instead of the key.
-      const FString MeshVariantKey = VariantKeyByMesh.FindRef(StaticMesh);
-      const bool bOpaqueMesh =
-          IsOpaqueModelVariantKey(MeshVariantKey) ||
-          OpaqueModelVariantKeys.Contains(
-              NormalizeModelVariantKey(MeshVariantKey));
       const bool bUseOpaqueMaterialSet =
           OpaqueMaterialInstances.Num() > 0 &&
           (bOpaqueMesh || MaterialInstances.Num() == 0);
@@ -8264,6 +8437,35 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
           CategoryProfile.SubtypeFolder, FString(TEXT("Grass")));
     }
 
+    // 预设分类 v3（2026-10-16 落地）：蕨类/草本/地被类的合成风预设由 Grass(branch1) 改为
+    // Fern —— 判据来自 275 资产元数据扫描 + 71 资产 F1–F6 实跑（这些类别"跨簇叶尖对"中位
+    // 1~11，结构归组才是对的；此前默认给 Grass，叶片与叶轴各成一个风单元会出现分离）。
+    // 目录与面数档不变，仍然是 Vegetation/Grass 与 Grass 档预算。
+    const TArray<FString> FernWindCategories = {
+        TEXT("Fern"),      TEXT("Herb"),         TEXT("Garden Plant"),
+        TEXT("Weed"),      TEXT("Ground Cover"), TEXT("Houseplant")};
+    for (const FString &Category : FernWindCategories) {
+      const FPlantAssetProfile FernWindProfile = ResolvePlantAssetProfile(
+          {FString(TEXT("Megascans"))}, Category);
+      TestTrue(
+          FString::Printf(TEXT("Category %s uses Fern synthetic wind"), *Category),
+          FernWindProfile.SyntheticWind == EPlantSyntheticWind::Fern);
+      TestEqual(
+          FString::Printf(TEXT("Category %s still lands under Grass"), *Category),
+          FernWindProfile.SubtypeFolder, FString(TEXT("Grass")));
+    }
+    // 未做过实跑验证的类别保持原行为（Grass=branch1），不跟着一起改。
+    const TArray<FString> KeepGrassWindCategories = {
+        TEXT("Flowering Plant"), TEXT("Aquatic"), TEXT("Climber"),
+        TEXT("Succulent"),       TEXT("Crop")};
+    for (const FString &Category : KeepGrassWindCategories) {
+      const FPlantAssetProfile KeepProfile = ResolvePlantAssetProfile(
+          {FString(TEXT("Megascans"))}, Category);
+      TestTrue(
+          FString::Printf(TEXT("Category %s keeps grass branch1 wind"), *Category),
+          KeepProfile.SyntheticWind == EPlantSyntheticWind::Branch1);
+    }
+
     // 无库分类的植被（st9 等原生资产）只补目录，不套用 Megascans 的面数分档。
     const FPlantAssetProfile UnclassifiedProfile = ResolvePlantAssetProfile({});
     TestEqual(TEXT("Unclassified plant still lands under Grass"),
@@ -8444,6 +8646,56 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
   Settings->Asset3DMaxLOD0Triangles = SavedMaxTriangles;
   Settings->Asset3DLargeMaxLOD0Triangles = SavedLargeTriangles;
   Settings->Asset3DLargeSizeThresholdCm = SavedThreshold;
+  return true;
+}
+
+// _OPAQUE 裁切档（2026-10-14）：裁切网格用几何表达遮罩本来免费提供的外轮廓，
+// 面数需求由轮廓精度决定，与 masked 档不是同一个量，因此单独成档。
+// 这里锁定各子类的裁切档数值，以及"未设裁切档的子类沿用 masked 档、未分类植被不分档"
+// 两条契约。回归意义在于——若裁切变体退回 masked 档，Nanite 保留百分比会掉到 5%
+// （20 万面只渲染 1 万），表现是"文件很大但精度很低"，且不报任何错。
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHivePlantOpaqueBudgetTest,
+    "AssetHive.Plants.OpaqueTriangleBudget",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHivePlantOpaqueBudgetTest::RunTest(const FString &Parameters) {
+  const FPlantAssetProfile GrassProfile =
+      ResolvePlantAssetProfile({FString(TEXT("Grass"))});
+  TestEqual(TEXT("Grass cutout tier"), GrassProfile.MaxLOD0TrianglesOpaque, 150000);
+  TestEqual(TEXT("Grass cutout budget resolves to its own tier"),
+            ResolveOpaquePlantTriangleBudget(GrassProfile), 150000);
+
+  const FPlantAssetProfile BushProfile =
+      ResolvePlantAssetProfile({FString(TEXT("Bush"))});
+  TestEqual(TEXT("Bush cutout tier"), BushProfile.MaxLOD0TrianglesOpaque, 300000);
+  TestEqual(TEXT("Bush cutout budget resolves to its own tier"),
+            ResolveOpaquePlantTriangleBudget(BushProfile), 300000);
+
+  // 灌木类别（Megascans 的 Shrub 词）与 Bush tag 同档。
+  const FPlantAssetProfile ShrubProfile = ResolvePlantAssetProfile(
+      {FString(TEXT("Megascans"))}, FString(TEXT("Shrub")));
+  TestEqual(TEXT("Shrub category shares the Bush cutout tier"),
+            ShrubProfile.MaxLOD0TrianglesOpaque, 300000);
+
+  // Megascans 无细分 tag 时落 Grass 档（Fern 等），裁切档同样生效。
+  const FPlantAssetProfile CategoryProfile = ResolvePlantAssetProfile(
+      {FString(TEXT("Megascans"))}, FString(TEXT("Fern")));
+  TestEqual(TEXT("Megascans fallback uses the Grass cutout tier"),
+            CategoryProfile.MaxLOD0TrianglesOpaque, 150000);
+  TestEqual(TEXT("Megascans fallback cutout budget resolves"),
+            ResolveOpaquePlantTriangleBudget(CategoryProfile), 150000);
+
+  // 未设裁切档的子类沿用 masked 档，不额外放宽。
+  const FPlantAssetProfile TreeProfile =
+      ResolvePlantAssetProfile({FString(TEXT("Tree"))});
+  TestEqual(TEXT("Tree has no dedicated cutout tier"),
+            TreeProfile.MaxLOD0TrianglesOpaque, 0);
+  TestEqual(TEXT("Tree cutout budget inherits the masked tier"),
+            ResolveOpaquePlantTriangleBudget(TreeProfile), 100000);
+
+  // 未分类植被（无库分类的 st9）：两边都不分档，保持不干预面数。
+  const FPlantAssetProfile UnclassifiedProfile = ResolvePlantAssetProfile({});
+  TestEqual(TEXT("Unclassified plants stay unbudgeted"),
+            ResolveOpaquePlantTriangleBudget(UnclassifiedProfile), 0);
   return true;
 }
 
