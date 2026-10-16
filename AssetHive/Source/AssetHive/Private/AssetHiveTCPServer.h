@@ -15,11 +15,13 @@ public:
     bool Start();
     void Shutdown();
     void SendMessage(const FString& Message);
+    int32 GetListenPort() const { return ListenPort; }
     TFunction<void(const FString&)> OnMessageReceived;
 private:
     void ProcessMessage(const FString& Message);
     FSocket* ListenerSocket = nullptr;
     FRunnableThread* Thread = nullptr;
+    int32 ListenPort = 0;
     TAtomic<bool> bRunThread { false };
     TQueue<TArray<uint8>, EQueueMode::Mpsc> Outgoing;
 };

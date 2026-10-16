@@ -7,7 +7,10 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
-namespace { constexpr int32 MaxMessageBytes = 32 * 1024 * 1024; }
+namespace {
+    constexpr int32 MaxMessageBytes = 32 * 1024 * 1024;
+    bool bReportedListenFailure = false;
+}
 FAssetHiveTCPServer::~FAssetHiveTCPServer() { Shutdown(); }
 
 bool FAssetHiveTCPServer::Init()
@@ -19,19 +22,29 @@ bool FAssetHiveTCPServer::Init()
     auto Address = Subsystem->CreateInternetAddr();
     bool bValid = false;
     Address->SetIp(TEXT("127.0.0.1"), bValid);
-    Address->SetPort(13430);
-    ListenerSocket = Subsystem->CreateSocket(NAME_Stream, TEXT("AssetHiveListener"), false);
-    if (!ListenerSocket) return false;
-    ListenerSocket->SetNonBlocking(true);
-    if (!bValid || !ListenerSocket->Bind(*Address) || !ListenerSocket->Listen(8))
+    if (!bValid) return false;
+    // Keep 13430 for old desktop versions. Each additional editor uses its own
+    // exclusive listener; never steal an existing editor's project connection.
+    for (int32 Port = 13430; Port <= 13439; ++Port)
     {
+        Address->SetPort(Port);
+        ListenerSocket = Subsystem->CreateSocket(NAME_Stream, TEXT("AssetHiveListener"), false);
+        if (!ListenerSocket) continue;
+        ListenerSocket->SetNonBlocking(true);
+        if (ListenerSocket->Bind(*Address) && ListenerSocket->Listen(8))
+        {
+            ListenPort = Port;
+            bReportedListenFailure = false;
+            UE_LOG(LogTemp, Log, TEXT("AssetHive: listening on 127.0.0.1:%d (protocol 2)"), Port);
+            return true;
+        }
         Subsystem->DestroySocket(ListenerSocket);
         ListenerSocket = nullptr;
-        UE_LOG(LogTemp, Warning, TEXT("AssetHive: cannot listen on 127.0.0.1:13430 (another editor may own it)."));
-        return false;
     }
-    UE_LOG(LogTemp, Log, TEXT("AssetHive: listening on 127.0.0.1:13430 (protocol 2)"));
-    return true;
+    if (!bReportedListenFailure)
+        UE_LOG(LogTemp, Warning, TEXT("AssetHive: cannot listen on 127.0.0.1:13430-13439; retrying automatically."));
+    bReportedListenFailure = true;
+    return false;
 }
 
 bool FAssetHiveTCPServer::Start()

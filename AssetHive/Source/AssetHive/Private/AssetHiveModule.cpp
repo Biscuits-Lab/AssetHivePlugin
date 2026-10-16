@@ -20,15 +20,18 @@ void FAssetHiveModule::StartupModule()
     LifetimeToken = MakeShared<TAtomic<bool>>(true);
     SessionId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
     TryStartEditorIntegration();
-    if (!bEditorIntegrationStarted && !IsRunningCommandlet())
+    if (!TCPServer.IsValid() && !IsRunningCommandlet())
         TickHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateRaw(this, &FAssetHiveModule::TickConnection), 2.0f);
 }
 
 void FAssetHiveModule::TryStartEditorIntegration()
 {
-    if (bEditorIntegrationStarted || IsRunningCommandlet() || !FPaths::IsProjectFilePathSet()) return;
-    bEditorIntegrationStarted = true;
-    AssetHiveEditorToolbar::Register();
+    if (TCPServer.IsValid() || IsRunningCommandlet() || !FPaths::IsProjectFilePathSet()) return;
+    if (!bEditorIntegrationStarted)
+    {
+        bEditorIntegrationStarted = true;
+        AssetHiveEditorToolbar::Register();
+    }
     TCPServer = MakeUnique<FAssetHiveTCPServer>();
     const TWeakPtr<TAtomic<bool>> WeakLifetime = LifetimeToken;
     TCPServer->OnMessageReceived = [this, WeakLifetime](const FString& Message)
@@ -46,7 +49,7 @@ void FAssetHiveModule::TryStartEditorIntegration()
 bool FAssetHiveModule::TickConnection(float DeltaTime)
 {
     TryStartEditorIntegration();
-    return !bEditorIntegrationStarted; // No recurring game-thread work after startup.
+    return !TCPServer.IsValid(); // Stop retrying after success; no idle game-thread polling.
 }
 
 void FAssetHiveModule::ShutdownModule()
