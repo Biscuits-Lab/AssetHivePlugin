@@ -8382,8 +8382,8 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
     auto OpaqueVariant = MakeShared<FJsonObject>();
     OpaqueVariant->SetStringField(TEXT("file"), TEXT("D:/Plant/fern_01_OPAQUE.fbx"));
     OpaqueVariant->SetStringField(TEXT("variantKey"), TEXT("01OPAQUE"));
-    OpaqueSet->SetArrayField(TEXT("modelVariants"),
-                             {MakeShared<FJsonValueObject>(OpaqueVariant)});
+    OpaqueOnlySet->SetArrayField(TEXT("modelVariants"),
+                                 {MakeShared<FJsonValueObject>(OpaqueVariant)});
     TestTrue(TEXT("All-cut plant set puts _OPAQUE on the asset folder"),
              IsOpaquePlantModelSet(OpaqueOnlySet));
 
