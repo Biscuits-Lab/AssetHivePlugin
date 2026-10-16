@@ -170,10 +170,12 @@ static void CollectAssetTags(const TSharedPtr<FJsonObject> &AssetObject,
   }
 }
 
-// 3D Plants 命名（用户口头 P0，2026-09-30 定稿）：
-// SM_Env_<标准AssetTag>_<资产ID>_<变体编号>[_OPAQUE] /
+// 3D Plants 命名（用户口头 P0，2026-09-30 定稿；_OPAQUE 位置 2026-10-16 修订）：
+// SM_Env_<标准AssetTag>_<资产ID>_<变体编号> /
 // T_Env_<标准AssetTag>_<资产ID>_<纹理类型>（不带分辨率）/
 // MI_Env_<标准AssetTag>_<资产ID>_<变体编号>[_OPAQUE]。
+// 不透明裁切整批导入时，_OPAQUE 只加在**资产文件夹**上（…/<文件夹>_OPAQUE/），网格与
+// 普通版本同名；材质实例名保留 _OPAQUE，因为同一次导入里 masked 与裁切两套 MI 可能并存。
 static FString ResolvePlantTagSegment(const TArray<FString> &Tags) {
   const TCHAR *PreferredTags[] = {TEXT("Tree"), TEXT("Bush"), TEXT("Grass"),
                                   TEXT("MicroFoliage"), TEXT("HeroFoliage")};
@@ -5110,6 +5112,12 @@ static FString NormalizeModelSourceKey(const FString &SourceFile) {
       .ToLower();
 }
 
+// 整批模型变体是否都是 _OPAQUE 裁切：决定把 _OPAQUE 后缀放在**资产文件夹**上，而不是
+// 对象名上（2026-10-16 约定：剪切资产与普通版本同名，只有文件夹区分两者）。
+// 判据与导入循环内保持一致：modelVariants 的 opaque 标志 / 变体键后缀优先，其次看文件名后缀；
+// 只要有一项不是裁切变体（混合批次），就返回 false，命名退回逐对象加后缀的老行为。
+static bool IsOpaquePlantModelSet(const TSharedPtr<FJsonObject> &AssetObject);
+
 static bool ReadModelVariantKey(const TSharedPtr<FJsonObject> &Object,
                                 FString &OutVariantKey) {
   if (!Object.IsValid()) {
@@ -5137,6 +5145,59 @@ static bool ReadModelVariantKey(const TSharedPtr<FJsonObject> &Object,
   }
 
   return false;
+}
+
+static bool IsOpaquePlantModelSet(const TSharedPtr<FJsonObject> &AssetObject) {
+  if (!AssetObject.IsValid()) {
+    return false;
+  }
+  int32 TotalCount = 0;
+  int32 OpaqueCount = 0;
+  const TArray<TSharedPtr<FJsonValue>> *ModelVariants = nullptr;
+  if (AssetObject->TryGetArrayField(TEXT("modelVariants"), ModelVariants) &&
+      ModelVariants != nullptr) {
+    for (const TSharedPtr<FJsonValue> &VariantValue : *ModelVariants) {
+      if (!VariantValue.IsValid() || VariantValue->Type != EJson::Object) {
+        continue;
+      }
+      const TSharedPtr<FJsonObject> VariantObject = VariantValue->AsObject();
+      if (!VariantObject.IsValid()) {
+        continue;
+      }
+      FString VariantKey;
+      if (!ReadModelVariantKey(VariantObject, VariantKey)) {
+        continue;
+      }
+      bool bOpaqueVariant = false;
+      VariantObject->TryGetBoolField(TEXT("opaque"), bOpaqueVariant);
+      TotalCount += 1;
+      if (bOpaqueVariant || IsOpaqueModelVariantKey(VariantKey)) {
+        OpaqueCount += 1;
+      }
+    }
+  }
+  if (TotalCount == 0) {
+    // 老载荷没有 modelVariants：退回按文件名判断（与导入循环里的文件名判定同口径）。
+    const TArray<TSharedPtr<FJsonValue>> *ModelFiles = nullptr;
+    if (!AssetObject->TryGetArrayField(TEXT("modelFiles"), ModelFiles) ||
+        ModelFiles == nullptr) {
+      return false;
+    }
+    for (const TSharedPtr<FJsonValue> &FileValue : *ModelFiles) {
+      if (!FileValue.IsValid() || FileValue->Type != EJson::String) {
+        continue;
+      }
+      const FString SourceFile = FileValue->AsString();
+      if (FPaths::GetExtension(SourceFile).ToLower() == TEXT("abc")) {
+        continue;
+      }
+      TotalCount += 1;
+      if (IsOpaqueModelVariantKey(FPaths::GetBaseFilename(SourceFile))) {
+        OpaqueCount += 1;
+      }
+    }
+  }
+  return TotalCount > 0 && OpaqueCount == TotalCount;
 }
 
 static FString ResolveModelVariantKey(
@@ -5272,7 +5333,7 @@ CreateFoliageTypeAsset(const FString &AssetFolder, const FString &AssetName,
   if (!StaticMesh) {
     return nullptr;
   }
-  // 命名跟随静态网格体：SM_ 前缀换成 FT_（SM_Env_Grass_x_01_OPAQUE -> FT_Env_Grass_x_01_OPAQUE）。
+  // 命名跟随静态网格体：SM_ 前缀换成 FT_（SM_Env_Grass_x_01 -> FT_Env_Grass_x_01）。
   FString FoliageStem = StaticMesh->GetName();
   if (FoliageStem.StartsWith(TEXT("SM_"), ESearchCase::CaseSensitive)) {
     FoliageStem.RightChopInline(3);
@@ -6645,6 +6706,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const FString PlantObjectStem =
         bFbxPlantNaming ? BuildPlantObjectStem(AssetStandardTags, SafeAssetId)
                         : FString();
+    // 不透明裁切（_OPAQUE）整批导入：后缀落在**资产文件夹**上，网格/材质保持普通命名
+    // （2026-10-16 约定）。只改文件夹名、不动 SafeAssetFolderName，避免污染对象名词干
+    // （Zion 3D 资产的对象名是从文件夹名派生的）。
+    // 混合批次（有非裁切变体）不加后缀，退回逐对象加 _OPAQUE 的老行为。
+    const bool bOpaquePlantSet =
+        bFbxPlantNaming && IsOpaquePlantModelSet(AssetObject);
+    const FString PlantFolderName =
+        bOpaquePlantSet ? SafeAssetFolderName + TEXT("_OPAQUE")
+                        : SafeAssetFolderName;
     // 对象名词干直接复用资产文件夹名：Zion 的"去 Env_ / 不带 ID"与 Temp 的
     // "Temp_ 前缀"只在文件夹名这一处计算，SM_/T_/MI_ 与文件夹因此天然一致，
     // 不会出现 ID 重复或 "__"。
@@ -6671,8 +6741,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     const FString AssetFolder =
         ZionCategoryFolder.IsEmpty()
-            ? AssetDestinationPath / SafeAssetFolderName
-            : AssetDestinationPath / ZionCategoryFolder / SafeAssetFolderName;
+            ? AssetDestinationPath / PlantFolderName
+            : AssetDestinationPath / ZionCategoryFolder / PlantFolderName;
     const bool bUsesMaterialFolders = bIsSurface || bIsDecal;
     // 植被（3dplant）：材质实例 / 纹理 / 静态网格体分目录存放，FoliageType 留在资产文件夹根。
     const bool bUsesFoliageFolders = AssetType == TEXT("3dplant");
@@ -7004,15 +7074,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           }
 
           const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
-          // The cut mesh is also recognised from its own file name
-          // (SM_..._01OPAQUE.fbx) so a missing variant flag cannot turn an
-          // opaque export back into a masked one.
-          const bool bOpaqueMeshVariant =
-              bFbxPlantAsset &&
-              (IsOpaqueModelVariantKey(VariantKey) ||
-               IsOpaqueModelVariantKey(FPaths::GetBaseFilename(BaseFile)) ||
-               OpaqueModelVariantKeys.Contains(
-                   NormalizeModelVariantKey(VariantKey)));
           const bool bNeedsVariantSuffix =
               bFbxPlantAsset || bHasExplicitModelVariants ||
               VariantKeys.Num() > 1;
@@ -7023,10 +7084,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                         bFbxPlantAsset ? *PlantObjectStem : *AssetStem,
                         *VariantKey)
                   : (bFbxPlantAsset ? PlantObjectStem : AssetStem);
+          // 不透明裁切变体不再往对象名上加 _OPAQUE（2026-10-16 约定）：整批裁切时后缀
+          // 落在资产文件夹上（见 PlantFolderName），网格与普通版本同名，靠目录区分。
           const FString BaseMeshName =
-              bOpaqueMeshVariant
-                  ? FString::Printf(TEXT("SM_%s_OPAQUE"), *VariantStem)
-                  : FString::Printf(TEXT("SM_%s"), *VariantStem);
+              FString::Printf(TEXT("SM_%s"), *VariantStem);
 
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 8, 0, 99)),
@@ -7101,12 +7162,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             const FString VariantKey = ResolveModelVariantKey(
                 SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
             const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
-            const bool bOpaqueMeshVariant =
-                bFbxPlantAsset &&
-                (IsOpaqueModelVariantKey(VariantKey) ||
-                 IsOpaqueModelVariantKey(FPaths::GetBaseFilename(SourceFile)) ||
-                 OpaqueModelVariantKeys.Contains(
-                     NormalizeModelVariantKey(VariantKey)));
             const bool bNeedsVariantSuffix =
                 bFbxPlantAsset || bHasExplicitModelVariants ||
                 ValidModelCount > 1;
@@ -7119,9 +7174,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                     : FString::Printf(
                           TEXT("SM_%s"),
                           bFbxPlantAsset ? *PlantObjectStem : *AssetStem);
-            if (bOpaqueMeshVariant) {
-              ModelAssetName += TEXT("_OPAQUE");
-            }
+            // 不透明裁切变体不再往对象名上加 _OPAQUE（2026-10-16 约定）：整批裁切时后缀
+            // 落在资产文件夹上，网格/材质与普通版本同名，靠目录区分。
           } else {
             ModelAssetName = FString::Printf(TEXT("SM_%s_%s"), *AssetStem,
                                              *DetectModelSuffix(SourceFile));
@@ -8265,8 +8319,8 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                                                TEXT("01")),
             FString(TEXT("MI_Env_abc123_002_01")));
 
-  // 3D Plants 命名（2026-09-30 定稿）：SM_/MI_/T_ 采用
-  // Env_<标准AssetTag>_<资产ID> 模板，OPAQUE 变体追加 _OPAQUE 后缀。
+  // 3D Plants 命名（2026-09-30 定稿；_OPAQUE 位置 2026-10-16 修订）：SM_/MI_/T_ 采用
+  // Env_<标准AssetTag>_<资产ID> 模板；不透明裁切的后缀只加在资产文件夹上，网格名不变。
   TArray<FString> PlantTags;
   PlantTags.Add(TEXT("Grass"));
   const FString PlantStem = BuildPlantObjectStem(PlantTags, TEXT("abc123"));
@@ -8275,9 +8329,10 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("Plant masked mesh name"),
             FString::Printf(TEXT("SM_%s_%s"), *PlantStem, TEXT("01")),
             FString(TEXT("SM_Env_Grass_abc123_01")));
-  TestEqual(TEXT("Plant opaque mesh name"),
-            FString::Printf(TEXT("SM_%s_%s_OPAQUE"), *PlantStem, TEXT("01")),
-            FString(TEXT("SM_Env_Grass_abc123_01_OPAQUE")));
+  // 裁切网格与 masked 同名（后缀在文件夹上）：名称不应再出现 _OPAQUE。
+  TestEqual(TEXT("Plant cut mesh keeps the plain name"),
+            FString::Printf(TEXT("SM_%s_%s"), *PlantStem, TEXT("01")),
+            FString(TEXT("SM_Env_Grass_abc123_01")));
   TestEqual(TEXT("Plant texture name uses slot abbreviation"),
             FString::Printf(TEXT("T_%s_%s"), *PlantStem, TEXT("D")),
             FString(TEXT("T_Env_Grass_abc123_D")));
@@ -8320,6 +8375,49 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestFalse(TEXT("Opaque suffix plant skips masked material set"),
             HasMaskedPlantModelVariant(OpaqueSuffixPlantVariants,
                                        NoOpaquePlantVariantKeys));
+
+  // _OPAQUE 后缀只落在资产文件夹上（2026-10-16 约定）：整批裁切才加后缀，混合批次不加。
+  {
+    auto OpaqueOnlySet = MakeShared<FJsonObject>();
+    auto OpaqueVariant = MakeShared<FJsonObject>();
+    OpaqueVariant->SetStringField(TEXT("file"), TEXT("D:/Plant/fern_01_OPAQUE.fbx"));
+    OpaqueVariant->SetStringField(TEXT("variantKey"), TEXT("01OPAQUE"));
+    OpaqueSet->SetArrayField(TEXT("modelVariants"),
+                             {MakeShared<FJsonValueObject>(OpaqueVariant)});
+    TestTrue(TEXT("All-cut plant set puts _OPAQUE on the asset folder"),
+             IsOpaquePlantModelSet(OpaqueOnlySet));
+
+    auto OpaqueFlagSet = MakeShared<FJsonObject>();
+    auto FlagVariant = MakeShared<FJsonObject>();
+    FlagVariant->SetStringField(TEXT("file"), TEXT("D:/Plant/fern_01.fbx"));
+    FlagVariant->SetStringField(TEXT("variantKey"), TEXT("01"));
+    FlagVariant->SetBoolField(TEXT("opaque"), true);
+    OpaqueFlagSet->SetArrayField(TEXT("modelVariants"),
+                                 {MakeShared<FJsonValueObject>(FlagVariant)});
+    TestTrue(TEXT("Explicit opaque flag also marks the asset folder"),
+             IsOpaquePlantModelSet(OpaqueFlagSet));
+
+    auto MixedSet = MakeShared<FJsonObject>();
+    auto CutVariant = MakeShared<FJsonObject>();
+    CutVariant->SetStringField(TEXT("file"), TEXT("D:/Plant/fern_01_OPAQUE.fbx"));
+    CutVariant->SetStringField(TEXT("variantKey"), TEXT("01OPAQUE"));
+    auto MaskedVariant = MakeShared<FJsonObject>();
+    MaskedVariant->SetStringField(TEXT("file"), TEXT("D:/Plant/fern_02.fbx"));
+    MaskedVariant->SetStringField(TEXT("variantKey"), TEXT("02"));
+    MixedSet->SetArrayField(
+        TEXT("modelVariants"),
+        {MakeShared<FJsonValueObject>(CutVariant),
+         MakeShared<FJsonValueObject>(MaskedVariant)});
+    TestFalse(TEXT("Mixed plant set keeps per-asset _OPAQUE suffix"),
+              IsOpaquePlantModelSet(MixedSet));
+
+    auto LegacySet = MakeShared<FJsonObject>();
+    LegacySet->SetArrayField(
+        TEXT("modelFiles"),
+        {MakeShared<FJsonValueString>(FString(TEXT("D:/Plant/fern_01_OPAQUE.fbx")))});
+    TestTrue(TEXT("Legacy payload without modelVariants falls back to file names"),
+             IsOpaquePlantModelSet(LegacySet));
+  }
 
   TMap<UStaticMesh *, FString> MaskedFallbackPlantVariants;
   MaskedFallbackPlantVariants.Add(nullptr, TEXT("01"));
