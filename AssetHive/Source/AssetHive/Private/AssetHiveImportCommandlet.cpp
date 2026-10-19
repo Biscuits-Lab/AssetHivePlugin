@@ -1331,10 +1331,9 @@ struct FEnvironmentAssetProfile {
   FString TypePrefix;
   bool bUseAssetIdOnly = false;
   FString FolderName = TEXT("Objects");
-  // 来源分类子目录（2026-10-19 定稿）：Megascans / PBRMAX / Temp 三种 tag 的资产在
-  // Objects 下再落一层同名文件夹（Objects/<Megascans|PBRMAX|Temp>/<资产文件夹>），
-  // 便于按来源批量管理与整批清理（Temp）。只在基础分类目录为 Objects 时生效，
-  // Kits / Props / Destructible / MEGA 等分类保持原路径。
+  // 来源分类子目录（2026-10-19 定稿）：第三方资产（Megascans / PBRMAX / 显式 ThirdParty
+  // 标签）落 Objects/ThirdParty；Temp 资产落 Objects/Temp；其它资产不加这一层。
+  // 只在基础分类目录为 Objects 时生效，Kits / Props / Destructible / MEGA 等分类保持原路径。
   FString SourceFolder;
   bool bBaseFamily = true;
   bool bHighResPreset = true;
@@ -1408,17 +1407,18 @@ static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
                              : FString::Printf(TEXT("Temp_%s"), *Profile.TypePrefix);
     Profile.bBaseFamily = false;
   }
-  // 来源子目录：优先级 Temp > Megascans > PBRMAX。
-  // Temp 排最前是刻意的——它是"工作状态"而不是来源，整批清理时按 Objects/Temp 检索；
-  // 一个资产同时带 Megascans 与 Temp 时归入 Temp，避免清理时漏掉。
-  // Temp 的 Temp_ 前缀与对象名 Temp 段保持不变（只增加目录层级，不改既有命名，
-  // 避免影响已引用这些资产的地方）。
+  // 来源子目录（2026-10-19 定稿）：优先级 Temp > ThirdParty。
+  // 第三方资产 = Megascans / PBRMAX 两个扫描来源，以及显式打了 ThirdParty（第三方）标签的
+  // 资产，统一落 Objects/ThirdParty；不再按 Megascans / PBRMAX 分桶。
+  // Temp 排最前是刻意的——它是"工作状态"而不是来源：一个资产同时带第三方标签与 Temp 时
+  // 归入 Objects/Temp，整批清理时不会漏。
   if (bTemp) {
     Profile.SourceFolder = TEXT("Temp");
-  } else if (HasAssetTag(Tags, TEXT("Megascans"))) {
-    Profile.SourceFolder = TEXT("Megascans");
-  } else if (HasAssetTag(Tags, TEXT("PBRMAX"))) {
-    Profile.SourceFolder = TEXT("PBRMAX");
+  } else if (HasAssetTag(Tags, TEXT("Megascans")) ||
+             HasAssetTag(Tags, TEXT("PBRMAX")) ||
+             HasAssetTag(Tags, TEXT("ThirdParty")) ||
+             HasAssetTag(Tags, TEXT("第三方"))) {
+    Profile.SourceFolder = TEXT("ThirdParty");
   }
   return Profile;
 }
@@ -8328,32 +8328,44 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("Megascans uses tag and asset ID only"), MegascansStem,
             FString(TEXT("Env_abc123")));
 
-  // 来源子目录（2026-10-19）：Megascans / PBRMAX / Temp 在 Objects 下多一层同名目录。
-  // 优先级 Temp > Megascans > PBRMAX（Temp 是工作状态，整批清理按它检索）。
+  // 来源子目录（2026-10-19）：第三方资产（Megascans / PBRMAX / ThirdParty 标签）统一进
+  // Objects/ThirdParty；Temp 优先于 ThirdParty（工作状态优先，便于整批清理）。
   {
     auto SourceFolderForTags = [](const TArray<FString> &Tags) {
       return ResolveEnvironmentAssetProfile(Tags).SourceFolder;
     };
     TArray<FString> MegascansTags;
     MegascansTags.Add(TEXT("Megascans"));
-    TestEqual(TEXT("Megascans 资产来源目录为 Megascans"),
-              SourceFolderForTags(MegascansTags), FString(TEXT("Megascans")));
+    TestEqual(TEXT("Megascans 计入第三方目录"),
+              SourceFolderForTags(MegascansTags), FString(TEXT("ThirdParty")));
 
     TArray<FString> PbrMaxTags;
     PbrMaxTags.Add(TEXT("PBRMAX"));
-    TestEqual(TEXT("PBRMAX 资产来源目录为 PBRMAX"),
-              SourceFolderForTags(PbrMaxTags), FString(TEXT("PBRMAX")));
+    TestEqual(TEXT("PBRMAX 计入第三方目录"),
+              SourceFolderForTags(PbrMaxTags), FString(TEXT("ThirdParty")));
+
+    TArray<FString> ThirdPartyTags;
+    ThirdPartyTags.Add(TEXT("ThirdParty"));
+    TestEqual(TEXT("显式 ThirdParty 标签进第三方目录"),
+              SourceFolderForTags(ThirdPartyTags), FString(TEXT("ThirdParty")));
+
+    // 写法容错：大小写、空格、连字符、下划线都等价（HasAssetTag 会归一化）。
+    TArray<FString> ThirdPartyVariantTags;
+    ThirdPartyVariantTags.Add(TEXT("third party"));
+    TestEqual(TEXT("ThirdParty 标签变体也识别"),
+              SourceFolderForTags(ThirdPartyVariantTags),
+              FString(TEXT("ThirdParty")));
 
     TArray<FString> TempTags;
     TempTags.Add(TEXT("Temp"));
     TestEqual(TEXT("Temp 资产来源目录为 Temp"),
               SourceFolderForTags(TempTags), FString(TEXT("Temp")));
 
-    TArray<FString> TempMegascansTags;
-    TempMegascansTags.Add(TEXT("Temp"));
-    TempMegascansTags.Add(TEXT("Megascans"));
-    TestEqual(TEXT("Temp 优先于 Megascans"),
-              SourceFolderForTags(TempMegascansTags), FString(TEXT("Temp")));
+    TArray<FString> TempThirdPartyTags;
+    TempThirdPartyTags.Add(TEXT("Temp"));
+    TempThirdPartyTags.Add(TEXT("Megascans"));
+    TestEqual(TEXT("Temp 优先于第三方目录"),
+              SourceFolderForTags(TempThirdPartyTags), FString(TEXT("Temp")));
 
     // 其它分类不参与来源目录：Dressing / Kits 等保持原路径（SourceFolder 为空）。
     TArray<FString> DressingTags;
