@@ -1331,6 +1331,11 @@ struct FEnvironmentAssetProfile {
   FString TypePrefix;
   bool bUseAssetIdOnly = false;
   FString FolderName = TEXT("Objects");
+  // 来源分类子目录（2026-10-19 定稿）：Megascans / PBRMAX / Temp 三种 tag 的资产在
+  // Objects 下再落一层同名文件夹（Objects/<Megascans|PBRMAX|Temp>/<资产文件夹>），
+  // 便于按来源批量管理与整批清理（Temp）。只在基础分类目录为 Objects 时生效，
+  // Kits / Props / Destructible / MEGA 等分类保持原路径。
+  FString SourceFolder;
   bool bBaseFamily = true;
   bool bHighResPreset = true;
   bool bMega = false;
@@ -1402,6 +1407,18 @@ static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
                              ? FString(TEXT("Temp"))
                              : FString::Printf(TEXT("Temp_%s"), *Profile.TypePrefix);
     Profile.bBaseFamily = false;
+  }
+  // 来源子目录：优先级 Temp > Megascans > PBRMAX。
+  // Temp 排最前是刻意的——它是"工作状态"而不是来源，整批清理时按 Objects/Temp 检索；
+  // 一个资产同时带 Megascans 与 Temp 时归入 Temp，避免清理时漏掉。
+  // Temp 的 Temp_ 前缀与对象名 Temp 段保持不变（只增加目录层级，不改既有命名，
+  // 避免影响已引用这些资产的地方）。
+  if (bTemp) {
+    Profile.SourceFolder = TEXT("Temp");
+  } else if (HasAssetTag(Tags, TEXT("Megascans"))) {
+    Profile.SourceFolder = TEXT("Megascans");
+  } else if (HasAssetTag(Tags, TEXT("PBRMAX"))) {
+    Profile.SourceFolder = TEXT("PBRMAX");
   }
   return Profile;
 }
@@ -6734,6 +6751,18 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     FString ZionCategoryFolder = SafeCategoryFolder;
+    // 来源分类子目录（Megascans / PBRMAX / Temp）紧贴在 Objects 之下：
+    //   /Game/Environment/Asset/Objects/<来源>/[<Zion 二级目录>/]<资产文件夹>
+    // 只对**非 Zion 资产**插入：Zion 资产（zionTags 非空）走用户自选的二级目录体系，
+    // 不按来源分桶；导出侧显式给了别的目录（3D_Assets 等）时也不插。
+    const bool bObjectsRoot =
+        SafeCategoryFolder.Equals(TEXT("Objects"), ESearchCase::IgnoreCase);
+    if (bObjectsRoot && !bIsZionAsset &&
+        !EnvironmentProfile.SourceFolder.IsEmpty()) {
+      ZionCategoryFolder = ZionCategoryFolder.IsEmpty()
+                               ? EnvironmentProfile.SourceFolder
+                               : ZionCategoryFolder / EnvironmentProfile.SourceFolder;
+    }
     if (bIsZionAsset && !ZionSubfolder.IsEmpty()) {
       ZionCategoryFolder = ZionCategoryFolder.IsEmpty()
                                ? ZionSubfolder
@@ -8298,6 +8327,44 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   const FString MegascansStem = BuildStemForTag(TEXT("Megascans"));
   TestEqual(TEXT("Megascans uses tag and asset ID only"), MegascansStem,
             FString(TEXT("Env_abc123")));
+
+  // 来源子目录（2026-10-19）：Megascans / PBRMAX / Temp 在 Objects 下多一层同名目录。
+  // 优先级 Temp > Megascans > PBRMAX（Temp 是工作状态，整批清理按它检索）。
+  {
+    auto SourceFolderForTags = [](const TArray<FString> &Tags) {
+      return ResolveEnvironmentAssetProfile(Tags).SourceFolder;
+    };
+    TArray<FString> MegascansTags;
+    MegascansTags.Add(TEXT("Megascans"));
+    TestEqual(TEXT("Megascans 资产来源目录为 Megascans"),
+              SourceFolderForTags(MegascansTags), FString(TEXT("Megascans")));
+
+    TArray<FString> PbrMaxTags;
+    PbrMaxTags.Add(TEXT("PBRMAX"));
+    TestEqual(TEXT("PBRMAX 资产来源目录为 PBRMAX"),
+              SourceFolderForTags(PbrMaxTags), FString(TEXT("PBRMAX")));
+
+    TArray<FString> TempTags;
+    TempTags.Add(TEXT("Temp"));
+    TestEqual(TEXT("Temp 资产来源目录为 Temp"),
+              SourceFolderForTags(TempTags), FString(TEXT("Temp")));
+
+    TArray<FString> TempMegascansTags;
+    TempMegascansTags.Add(TEXT("Temp"));
+    TempMegascansTags.Add(TEXT("Megascans"));
+    TestEqual(TEXT("Temp 优先于 Megascans"),
+              SourceFolderForTags(TempMegascansTags), FString(TEXT("Temp")));
+
+    // 其它分类不参与来源目录：Dressing / Kits 等保持原路径（SourceFolder 为空）。
+    TArray<FString> DressingTags;
+    DressingTags.Add(TEXT("Dressing"));
+    TestEqual(TEXT("Dressing 不产生来源目录"), SourceFolderForTags(DressingTags),
+              FString());
+    TArray<FString> KitsTags;
+    KitsTags.Add(TEXT("Kits"));
+    TestEqual(TEXT("Kits 不产生来源目录"), SourceFolderForTags(KitsTags),
+              FString());
+  }
   // 资产名自带 Env_ 前缀时不得再拼一次（Zion 资产目录里常见 "Env_diaodeng"）。
   TestEqual(TEXT("Asset name with Env_ prefix is not double-prefixed"),
             BuildEnvironmentObjectStem(ResolveEnvironmentAssetProfile(TArray<FString>()),
