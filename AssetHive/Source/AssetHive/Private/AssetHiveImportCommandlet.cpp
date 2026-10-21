@@ -170,6 +170,46 @@ static void CollectAssetTags(const TSharedPtr<FJsonObject> &AssetObject,
   }
 }
 
+// 分类专用标签：只信 job 的 standardAssetTags（库元数据的标准 Asset Tag，权威字段）。
+//
+// 为什么不能直接用 CollectAssetTags 的合并结果分类：导出侧的 tags 字段同时携带由
+// assetType / category 派生的泛化词（3D 资产的 "props"、贴花的 "atlas" 等），它们
+// 与标准 Asset Tag 同名不同义。合并后 "props" 会先命中 Props 分支，把 Megascans /
+// PBRMAX 资产误判成 Props 档——后果是预算降档（次要贴图上限 1024）、对象名带 Prop
+// 段、资产落 Props/ 目录，且 ORM 等次要贴图因 <2048 而无法开 VT（UE 会警告
+// "expects texture to be Virtual"）。
+//
+// 兼容与叠加标记：
+//   - standardAssetTags 为空（老载荷）时退回合并标签，保持原有兜底行为；
+//   - Temp 是叠加标记、历史上可能只写在 tags 里，仍需从合并结果补回来，
+//     否则 Temp 目录与 Temp_ 前缀会失效。
+static void CollectEnvironmentProfileTags(
+    const TSharedPtr<FJsonObject> &AssetObject,
+    const TArray<FString> &MergedTags, TArray<FString> &OutTags) {
+  OutTags.Reset();
+  if (AssetObject.IsValid()) {
+    const TArray<TSharedPtr<FJsonValue>> *Values = nullptr;
+    if (AssetObject->TryGetArrayField(TEXT("standardAssetTags"), Values) &&
+        Values) {
+      for (const TSharedPtr<FJsonValue> &Value : *Values) {
+        if (Value.IsValid() && Value->Type == EJson::String) {
+          const FString Tag = Value->AsString().TrimStartAndEnd();
+          if (!Tag.IsEmpty()) {
+            OutTags.AddUnique(Tag);
+          }
+        }
+      }
+    }
+  }
+  if (OutTags.Num() == 0) {
+    OutTags = MergedTags;
+  }
+  if (!HasAssetTag(OutTags, TEXT("Temp")) &&
+      HasAssetTag(MergedTags, TEXT("Temp"))) {
+    OutTags.Add(TEXT("Temp"));
+  }
+}
+
 // 3D Plants 命名（用户口头 P0，2026-09-30 定稿；_OPAQUE 位置 2026-10-16 修订）：
 // SM_Env_<标准AssetTag>_<资产ID>_<变体编号> /
 // T_Env_<标准AssetTag>_<资产ID>_<纹理类型>（不带分辨率）/
@@ -6594,7 +6634,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       CollectAssetTags(AssetObject, AssetStandardTags);
     }
     if (bIs3DAsset) {
-      EnvironmentProfile = ResolveEnvironmentAssetProfile(AssetStandardTags);
+      // 分类只认标准 Asset Tag（standardAssetTags）；job 的 tags 里混有 assetType /
+      // category 派生词（如 "props"），直接合并会把 PBRMAX/Megascans 资产误判成 Props。
+      TArray<FString> EnvironmentProfileTags;
+      CollectEnvironmentProfileTags(AssetObject, AssetStandardTags,
+                                    EnvironmentProfileTags);
+      EnvironmentProfile =
+          ResolveEnvironmentAssetProfile(EnvironmentProfileTags);
       // 导出侧的 categoryFolder 只承载"基础分类目录"。Zion 资产刻意传空串，
       // 由这里按 Asset Tag 推导（Dressing/Megascans/PBRMAX → Objects、Kits → Kits、
       // Props → Props、Destructible → Destructible、MEGA → MEGA），保持这份映射
@@ -8376,6 +8422,77 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
     KitsTags.Add(TEXT("Kits"));
     TestEqual(TEXT("Kits 不产生来源目录"), SourceFolderForTags(KitsTags),
               FString());
+  }
+
+  // 分类只认标准 Asset Tag（2026-10-21 修复）：导出侧 job 的 tags 里混有 assetType /
+  // category 派生词（3D 资产的 "props"），并入分类会把 Megascans / PBRMAX 资产误判成
+  // Props 档 —— 预算降档（次要贴图 1024）、对象名带 Prop、落 Props/ 目录，且 ORM 等
+  // 次要贴图因 <2048 无法开 VT（UE 警告 "expects texture to be Virtual"）。
+  {
+    auto MakeJobAsset = [](const TArray<FString> &StandardTags,
+                           const TArray<FString> &DerivedTags) {
+      auto JobAsset = MakeShared<FJsonObject>();
+      TArray<TSharedPtr<FJsonValue>> StandardValues;
+      for (const FString &Tag : StandardTags) {
+        StandardValues.Add(MakeShared<FJsonValueString>(Tag));
+      }
+      JobAsset->SetArrayField(TEXT("standardAssetTags"), StandardValues);
+      TArray<TSharedPtr<FJsonValue>> DerivedValues;
+      for (const FString &Tag : DerivedTags) {
+        DerivedValues.Add(MakeShared<FJsonValueString>(Tag));
+      }
+      JobAsset->SetArrayField(TEXT("tags"), DerivedValues);
+      return JobAsset;
+    };
+    TArray<FString> StandardPbrMax;
+    StandardPbrMax.Add(TEXT("PBRMAX"));
+    TArray<FString> DerivedTags;
+    DerivedTags.Add(TEXT("3d assets"));
+    DerivedTags.Add(TEXT("3d"));
+    DerivedTags.Add(TEXT("props"));
+    DerivedTags.Add(TEXT("pbrmax"));
+    TArray<FString> MergedTags;
+    CollectAssetTags(MakeJobAsset(StandardPbrMax, DerivedTags), MergedTags);
+    TArray<FString> ProfileTags;
+    CollectEnvironmentProfileTags(MakeJobAsset(StandardPbrMax, DerivedTags),
+                                  MergedTags, ProfileTags);
+    const FEnvironmentAssetProfile PbrMaxProfile =
+        ResolveEnvironmentAssetProfile(ProfileTags);
+    TestEqual(TEXT("PBRMAX 资产不被派生的 props 标签带偏（目录仍为 Objects）"),
+              PbrMaxProfile.FolderName, FString(TEXT("Objects")));
+    TestTrue(TEXT("PBRMAX 资产保持高分辨率预设"),
+             PbrMaxProfile.bHighResPreset);
+    TestTrue(TEXT("PBRMAX 资产不带 Prop 命名段"),
+             PbrMaxProfile.TypePrefix.IsEmpty());
+
+    // 老载荷：没有 standardAssetTags 时退回合并标签（保持原兜底行为）。
+    TArray<FString> NoStandardTags;
+    TArray<FString> LegacyMerged;
+    CollectAssetTags(MakeJobAsset(NoStandardTags, DerivedTags), LegacyMerged);
+    TArray<FString> LegacyProfileTags;
+    CollectEnvironmentProfileTags(MakeJobAsset(NoStandardTags, DerivedTags),
+                                  LegacyMerged, LegacyProfileTags);
+    TestEqual(TEXT("老载荷退回合并标签（props 仍进 Props）"),
+              ResolveEnvironmentAssetProfile(LegacyProfileTags).FolderName,
+              FString(TEXT("Props")));
+
+    // Temp 是叠加标记：即使只写在 tags 里也必须保留，否则 Temp 目录/前缀会失效。
+    TArray<FString> TempDerived;
+    TempDerived.Add(TEXT("3d"));
+    TempDerived.Add(TEXT("Temp"));
+    TArray<FString> TempStandard;
+    TempStandard.Add(TEXT("PBRMAX"));
+    TArray<FString> TempMerged;
+    CollectAssetTags(MakeJobAsset(TempStandard, TempDerived), TempMerged);
+    TArray<FString> TempProfileTags;
+    CollectEnvironmentProfileTags(MakeJobAsset(TempStandard, TempDerived),
+                                  TempMerged, TempProfileTags);
+    const FEnvironmentAssetProfile TempPbrMaxProfile =
+        ResolveEnvironmentAssetProfile(TempProfileTags);
+    TestTrue(TEXT("Temp 标记在只出现在 tags 时仍生效"),
+             TempPbrMaxProfile.bTemp);
+    TestEqual(TEXT("Temp + PBRMAX 落 Objects/Temp"),
+              TempPbrMaxProfile.SourceFolder, FString(TEXT("Temp")));
   }
   // 资产名自带 Env_ 前缀时不得再拼一次（Zion 资产目录里常见 "Env_diaodeng"）。
   TestEqual(TEXT("Asset name with Env_ prefix is not double-prefixed"),
