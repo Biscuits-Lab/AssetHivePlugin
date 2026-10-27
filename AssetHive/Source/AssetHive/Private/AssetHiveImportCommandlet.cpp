@@ -4975,6 +4975,11 @@ static FString ToSlotSuffix(const FString &SlotName) {
   if (SlotName.Equals(TEXT("hdr"), ESearchCase::IgnoreCase)) {
     return TEXT("HDR");
   }
+  if (SlotName.Equals(TEXT("displacement"), ESearchCase::IgnoreCase) ||
+      SlotName.Equals(TEXT("height"), ESearchCase::IgnoreCase)) {
+    // Surface / Decal 的高度贴图统一 _Dis 后缀（2026-10-27）。
+    return TEXT("Dis");
+  }
   if (SlotName.Equals(TEXT("subsurfacecolor"), ESearchCase::IgnoreCase)) {
     return TEXT("SSC");
   }
@@ -6895,18 +6900,29 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         ZionCategoryFolder.IsEmpty()
             ? AssetDestinationPath / PlantFolderName
             : AssetDestinationPath / ZionCategoryFolder / PlantFolderName;
-    const bool bUsesMaterialFolders = bIsSurface || bIsDecal;
+    // 产物子目录（2026-10-27 修订）：Surface / Decal 的材质实例与纹理默认都直接放在资产
+    // 文件夹下，不再分 MI / Tex 子目录；带 Zion 标签的 Surface / Decal 例外（job 字段
+    // materialFolders），仍按 MI / Tex 分目录。植被仍按 MI / Tex / Meshes 分目录，
+    // Zion 3D 资产仍按 Material / Tex / Mesh 分目录。
+    bool bZionMaterialFolders = false;
+    if (bIsSurface || bIsDecal) {
+      AssetObject->TryGetBoolField(TEXT("materialFolders"),
+                                   bZionMaterialFolders);
+    }
     // 植被（3dplant）：材质实例 / 纹理 / 静态网格体分目录存放，FoliageType 留在资产文件夹根。
     const bool bUsesFoliageFolders = AssetType == TEXT("3dplant");
     // Zion 3D 资产：三类产物同样分目录，目录名按项目约定为 Material / Tex / Mesh。
     const bool bUsesZionFolders = bIs3DAsset && bIsZionAsset;
+    // Zion 标签的 Surface / Decal：沿用 MI / Tex 两级子目录。
+    const bool bUsesZionMaterialFolders =
+        (bIsSurface || bIsDecal) && bZionMaterialFolders;
     const FString TextureFolder =
-        (bUsesMaterialFolders || bUsesFoliageFolders || bUsesZionFolders)
+        (bUsesFoliageFolders || bUsesZionFolders || bUsesZionMaterialFolders)
             ? AssetFolder / TEXT("Tex")
             : AssetFolder;
     const FString MaterialFolder =
         bUsesZionFolders ? AssetFolder / TEXT("Material")
-                         : ((bUsesMaterialFolders || bUsesFoliageFolders)
+                         : ((bUsesFoliageFolders || bUsesZionMaterialFolders)
                                 ? AssetFolder / TEXT("MI")
                                 : AssetFolder);
     const FString MeshFolder =
@@ -7469,10 +7485,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             SlotName == TEXT("opacity") || SlotName == TEXT("orm") ||
             SlotName == TEXT("displacement");
         const bool bAllowHdriSlots = SlotName == TEXT("hdr");
+        // Surface 的 Height / Displacement（2026-10-27）：只作为独立纹理导入
+        // （后缀 _Dis），不参与材质实例参数；其余槽位仍按 BCR / N / M / E。
         const bool bAllowSurfaceSlots =
             bIsSurface && (SlotName == TEXT("bcr") || SlotName == TEXT("normal") ||
                            SlotName == TEXT("metalness") ||
-                           SlotName == TEXT("emissive"));
+                           SlotName == TEXT("emissive") ||
+                           SlotName == TEXT("displacement"));
         if ((bIsSurface && !bAllowSurfaceSlots) ||
             (!bIsSurface &&
              ((bIsHdri && !bAllowHdriSlots) ||
