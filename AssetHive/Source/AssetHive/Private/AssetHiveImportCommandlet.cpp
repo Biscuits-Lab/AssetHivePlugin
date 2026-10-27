@@ -227,11 +227,16 @@ static FString ResolvePlantTagSegment(const TArray<FString> &Tags) {
   for (const FString &Tag : Tags) {
     const FString SafeTag = MakeSafeObjectName(Tag.TrimStartAndEnd());
     if (!SafeTag.IsEmpty()) {
-      // Megascans 源缺少细分植被标签时，导出名使用 Foliage，
-      // 与供应商名解耦（例如 SM_Env_Foliage_<资产ID>_01）。
-      return NormalizeAssetTagToken(Tag) == TEXT("megascans")
-                 ? FString(TEXT("Foliage"))
-                 : SafeTag;
+      // 缺少细分植被标签时用 Foliage 与供应商名解耦（SM_Env_Foliage_<资产ID>_01）。
+      // ThirdParty 是来源/目录标记，不能作为命名段（2026-10-27 约定）：Megascans 来源与
+      // 统一后的 ThirdParty 标签都回落到 Foliage，保持既有资产名不变。
+      const FString NormalizedTag = NormalizeAssetTagToken(Tag);
+      if (NormalizedTag == TEXT("megascans") ||
+          NormalizedTag == TEXT("thirdparty") ||
+          NormalizedTag == TEXT("第三方")) {
+        return FString(TEXT("Foliage"));
+      }
+      return SafeTag;
     }
   }
   return TEXT("Plant");
@@ -1371,9 +1376,10 @@ struct FEnvironmentAssetProfile {
   FString TypePrefix;
   bool bUseAssetIdOnly = false;
   FString FolderName = TEXT("Objects");
-  // 来源分类子目录（2026-10-19 定稿）：第三方资产（Megascans / PBRMAX / 显式 ThirdParty
-  // 标签）落 Objects/ThirdParty；Temp 资产落 Objects/Temp；其它资产不加这一层。
-  // 只在基础分类目录为 Objects 时生效，Kits / Props / Destructible / MEGA 等分类保持原路径。
+  // 来源分类子目录（2026-10-27 修订）：只承载 Temp —— Temp 资产落 Objects/Temp。
+  // 第三方资产的 ThirdParty 层不放这里：它要追加在**原始导出路径**的末尾
+  // （3D Assets → Objects/ThirdParty；3D Plants → Vegetation/Grass/ThirdParty），
+  // 由 ResolveThirdPartyCategoryFolder 统一处理；只在 Objects 下插层的旧规则已废弃。
   FString SourceFolder;
   bool bBaseFamily = true;
   bool bHighResPreset = true;
@@ -1447,18 +1453,64 @@ static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
                              : FString::Printf(TEXT("Temp_%s"), *Profile.TypePrefix);
     Profile.bBaseFamily = false;
   }
-  // 来源子目录（2026-10-19 定稿）：优先级 Temp > ThirdParty。
-  // 第三方资产 = Megascans / PBRMAX 两个扫描来源，以及显式打了 ThirdParty（第三方）标签的
-  // 资产，统一落 Objects/ThirdParty；不再按 Megascans / PBRMAX 分桶。
-  // Temp 排最前是刻意的——它是"工作状态"而不是来源：一个资产同时带第三方标签与 Temp 时
-  // 归入 Objects/Temp，整批清理时不会漏。
+  // Temp 子目录（2026-10-27 修订）：SourceFolder 只承载 Temp，且只对基础分类目录为
+  // Objects 的 3D 资产生效（见资产路径拼接处）。Temp 是"工作状态"而不是来源：
+  // 一个资产即使同时带 ThirdParty，也只保留 Objects/Temp，整批清理时不会漏。
   if (bTemp) {
     Profile.SourceFolder = TEXT("Temp");
-  } else if (HasAssetTag(Tags, TEXT("Megascans")) ||
-             HasAssetTag(Tags, TEXT("PBRMAX")) ||
-             HasAssetTag(Tags, TEXT("ThirdParty")) ||
-             HasAssetTag(Tags, TEXT("第三方"))) {
-    Profile.SourceFolder = TEXT("ThirdParty");
+  }
+  return Profile;
+}
+
+// 第三方资产判定（2026-10-27 定稿）：标准 Asset Tag 统一用 ThirdParty 标记第三方来源。
+// 库侧已把 Megascans / PBRMAX 从标准标签里移除（只作为来源标记留在普通 tags 里，导出
+// job 的 tags 仍带着它们），这里把它们一并视为第三方：已入库、尚未补打 ThirdParty 的
+// 旧资产不会因为这次标签收敛而换目录。
+static bool IsThirdPartyAsset(const TArray<FString> &Tags) {
+  return HasAssetTag(Tags, TEXT("ThirdParty")) ||
+         HasAssetTag(Tags, TEXT("第三方")) ||
+         HasAssetTag(Tags, TEXT("Megascans")) ||
+         HasAssetTag(Tags, TEXT("Quixel")) ||
+         HasAssetTag(Tags, TEXT("PBRMAX"));
+}
+
+// 第三方目录（2026-10-27 定稿）：在**原本的导出路径**末尾再追加一层 ThirdParty，
+// 资产文件夹落在这一层下面：
+//   3D Assets → Objects/ThirdParty/<资产文件夹>
+//   3D Plants → Vegetation/<子类>/ThirdParty/<资产文件夹>（如 Vegetation/Grass/ThirdParty）
+//   Surface   → TilableTex/ThirdParty/<资产文件夹>
+//   Decal     → Decal/ThirdParty/<资产文件夹>
+// 传入的 CategoryFolder 是已经算好的基础分类目录（Objects / Grass / TilableTex / Decal …）。
+// 不追加的两种情况：Zion 资产（zionTags 非空，走用户自选的二级目录体系，不按来源分桶）、
+// Temp 资产（Temp 是工作状态，优先整批清理，不再叠来源层）。
+static FString ResolveThirdPartyCategoryFolder(const FString &CategoryFolder,
+                                               bool bThirdPartyAsset,
+                                               bool bIsZionAsset, bool bTemp) {
+  if (!bThirdPartyAsset || bIsZionAsset || bTemp) {
+    return CategoryFolder;
+  }
+  return CategoryFolder.IsEmpty() ? FString(TEXT("ThirdParty"))
+                                  : CategoryFolder / TEXT("ThirdParty");
+}
+
+// 第三方扫描资产（2026-10-27）：Megascans / PBRMAX 来源与统一后的 ThirdParty 标签都按
+// Dressing 的面数预算处理。标签收紧后来源标记只留在 tags 里，两者都要认。
+static bool IsScanSourceTags(const TArray<FString> &Tags) {
+  return HasAssetTag(Tags, TEXT("Megascans")) ||
+         HasAssetTag(Tags, TEXT("PBRMAX")) ||
+         HasAssetTag(Tags, TEXT("ThirdParty")) ||
+         HasAssetTag(Tags, TEXT("第三方"));
+}
+
+// 第三方资产的命名沿用旧规则（2026-10-27 约定）：ThirdParty 只作目录层，**不进对象名**。
+// Megascans 来源的 3D 资产历史上是"只用资产 ID"命名（Env_<ID>），标签收紧后来源只留在
+// tags 里，这里按来源标记把旧命名补回来；其它第三方来源维持含资产名的旧命名
+// （Env_<资产名>_<资产ID>），分类目录名不进名字。
+static FEnvironmentAssetProfile ApplyThirdPartyLegacyNaming(
+    FEnvironmentAssetProfile Profile, const TArray<FString> &MergedTags) {
+  if (Profile.TypeKey.Equals(TEXT("Objects"), ESearchCase::IgnoreCase) &&
+      HasAssetTag(MergedTags, TEXT("Megascans"))) {
+    Profile.bUseAssetIdOnly = true;
   }
   return Profile;
 }
@@ -6630,23 +6682,43 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     FEnvironmentAssetProfile EnvironmentProfile;
     FPlantAssetProfile PlantProfile;
     TArray<FString> AssetStandardTags;
-    if (bIs3DAsset || AssetType == TEXT("3dplant")) {
-      CollectAssetTags(AssetObject, AssetStandardTags);
-    }
+    // 所有 Asset Type 都收标签：第三方目录判定对 Surface / Decal 同样生效，而这两类的
+    // job 只有 tags、没有 standardAssetTags。
+    CollectAssetTags(AssetObject, AssetStandardTags);
+    // 第三方目录判定（2026-10-27）：3D Assets / 3D Plants / Surface / Decal 都在原本导出
+    // 路径末尾追加 ThirdParty（Objects/ThirdParty、Vegetation/Grass/ThirdParty、
+    // TilableTex/ThirdParty、Decal/ThirdParty）。HDRI 不追加：它没有标准 Asset Tag，
+    // 导出结构与来源无关。
+    // 判定用合并标签：标准 Asset Tag 的 ThirdParty，以及 tags 里仍保留的
+    // Megascans / PBRMAX 来源标记（见 IsThirdPartyAsset）；Surface / Decal 的 job 只有
+    // tags、没有 standardAssetTags。
+    const bool bThirdPartyFolder =
+        (bIs3DAsset || AssetType == TEXT("3dplant") || bIsSurface || bIsDecal) &&
+        IsThirdPartyAsset(AssetStandardTags);
     if (bIs3DAsset) {
       // 分类只认标准 Asset Tag（standardAssetTags）；job 的 tags 里混有 assetType /
-      // category 派生词（如 "props"），直接合并会把 PBRMAX/Megascans 资产误判成 Props。
+      // category 派生词（如 "props"），直接合并会把第三方资产误判成 Props。
       TArray<FString> EnvironmentProfileTags;
       CollectEnvironmentProfileTags(AssetObject, AssetStandardTags,
                                     EnvironmentProfileTags);
-      EnvironmentProfile =
-          ResolveEnvironmentAssetProfile(EnvironmentProfileTags);
+      // 命名沿用旧规则（2026-10-27）：ThirdParty 只是目录层，不进对象名；Megascans 来源
+      // 的 3D 资产仍按"只用资产 ID"命名（见 ApplyThirdPartyLegacyNaming）。
+      EnvironmentProfile = ApplyThirdPartyLegacyNaming(
+          ResolveEnvironmentAssetProfile(EnvironmentProfileTags),
+          AssetStandardTags);
       // 导出侧的 categoryFolder 只承载"基础分类目录"。Zion 资产刻意传空串，
-      // 由这里按 Asset Tag 推导（Dressing/Megascans/PBRMAX → Objects、Kits → Kits、
+      // 由这里按 Asset Tag 推导（ThirdParty/Dressing → Objects、Kits → Kits、
       // Props → Props、Destructible → Destructible、MEGA → MEGA），保持这份映射
       // 只有一处权威定义；非 Zion 资产仍由导出侧给出分类。
       // 用户选定的二级目录走独立的 zionSubfolder 字段，在下面单独拼接。
       if (CategoryFolder.TrimStartAndEnd().IsEmpty()) {
+        CategoryFolder = EnvironmentProfile.FolderName;
+      }
+      // 迁移期兜底：第三方资产若来自不带标准标签的老 job / 老库，导出侧仍会给出按类型
+      // 推导的 "3D_Assets"。这类资产应落 Objects（再由 ThirdParty 层细分），不能因为
+      // 导出侧给了泛化目录就留在 3D_Assets 下。
+      if (bThirdPartyFolder &&
+          CategoryFolder.Equals(TEXT("3D_Assets"), ESearchCase::IgnoreCase)) {
         CategoryFolder = EnvironmentProfile.FolderName;
       }
     } else if (AssetType == TEXT("3dplant")) {
@@ -6683,11 +6755,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       CategoryFolder = PlantProfile.SubtypeFolder;
     }
     // Third party scans follow the Dressing triangle budget even when their
-    // tags route them into another asset folder.
+    // tags route them into another asset folder. 标签收紧后 ThirdParty 是标准标记，
+    // Megascans / PBRMAX 只留在 tags 里，两者都算扫描来源（见 IsScanSourceTags）。
     const bool bScanSourceAsset =
         bIs3DAsset &&
-        (HasAssetTag(AssetStandardTags, TEXT("Megascans")) ||
-         HasAssetTag(AssetStandardTags, TEXT("PBRMAX")) ||
+        (IsScanSourceTags(AssetStandardTags) ||
          EnvironmentProfile.TypeKey == TEXT("Megascans") ||
          EnvironmentProfile.TypeKey == TEXT("PBRMAX"));
     FString AssetDestinationPath =
@@ -6797,10 +6869,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     FString ZionCategoryFolder = SafeCategoryFolder;
-    // 来源分类子目录（Megascans / PBRMAX / Temp）紧贴在 Objects 之下：
-    //   /Game/Environment/Asset/Objects/<来源>/[<Zion 二级目录>/]<资产文件夹>
-    // 只对**非 Zion 资产**插入：Zion 资产（zionTags 非空）走用户自选的二级目录体系，
-    // 不按来源分桶；导出侧显式给了别的目录（3D_Assets 等）时也不插。
+    // Temp 子目录紧贴在 Objects 之下：
+    //   /Game/Environment/Asset/Objects/Temp/[<Zion 二级目录>/]<资产文件夹>
+    // 只对**非 Zion 资产**插入：Zion 资产（zionTags 非空）走用户自选的二级目录体系；
+    // 导出侧显式给了别的目录（Props / Kits / 3D_Assets 等）时也不插。
     const bool bObjectsRoot =
         SafeCategoryFolder.Equals(TEXT("Objects"), ESearchCase::IgnoreCase);
     if (bObjectsRoot && !bIsZionAsset &&
@@ -6814,6 +6886,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                                ? ZionSubfolder
                                : ZionCategoryFolder / ZionSubfolder;
     }
+    // 第三方目录（2026-10-27）：在原本导出路径的末尾追加一层 ThirdParty ——
+    // 3D Assets → Objects/ThirdParty；3D Plants → Vegetation/<子类>/ThirdParty。
+    ZionCategoryFolder = ResolveThirdPartyCategoryFolder(
+        ZionCategoryFolder, bThirdPartyFolder, bIsZionAsset,
+        EnvironmentProfile.bTemp);
     const FString AssetFolder =
         ZionCategoryFolder.IsEmpty()
             ? AssetDestinationPath / PlantFolderName
@@ -8374,54 +8451,113 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("Megascans uses tag and asset ID only"), MegascansStem,
             FString(TEXT("Env_abc123")));
 
-  // 来源子目录（2026-10-19）：第三方资产（Megascans / PBRMAX / ThirdParty 标签）统一进
-  // Objects/ThirdParty；Temp 优先于 ThirdParty（工作状态优先，便于整批清理）。
+  // 第三方目录（2026-10-27 修订）：Megascans / PBRMAX 不再是标准 Asset Tag，统一收成
+  // ThirdParty；第三方资产在**原本导出路径**末尾追加一层 ThirdParty
+  // （3D Assets → Objects/ThirdParty，3D Plants → Vegetation/Grass/ThirdParty，
+  //  Surface → TilableTex/ThirdParty，Decal → Decal/ThirdParty）。
+  // SourceFolder 只剩 Temp 一种（Objects/Temp），第三方层不再走它。
   {
+    auto MakeTags = [](const TCHAR *First, const TCHAR *Second = nullptr) {
+      TArray<FString> Tags;
+      if (First) {
+        Tags.Add(First);
+      }
+      if (Second) {
+        Tags.Add(Second);
+      }
+      return Tags;
+    };
     auto SourceFolderForTags = [](const TArray<FString> &Tags) {
       return ResolveEnvironmentAssetProfile(Tags).SourceFolder;
     };
-    TArray<FString> MegascansTags;
-    MegascansTags.Add(TEXT("Megascans"));
-    TestEqual(TEXT("Megascans 计入第三方目录"),
-              SourceFolderForTags(MegascansTags), FString(TEXT("ThirdParty")));
 
-    TArray<FString> PbrMaxTags;
-    PbrMaxTags.Add(TEXT("PBRMAX"));
-    TestEqual(TEXT("PBRMAX 计入第三方目录"),
-              SourceFolderForTags(PbrMaxTags), FString(TEXT("ThirdParty")));
+    TestEqual(TEXT("Megascans 来源不再进分类目录"),
+              SourceFolderForTags(MakeTags(TEXT("Megascans"))), FString());
+    TestEqual(TEXT("PBRMAX 来源不再进分类目录"),
+              SourceFolderForTags(MakeTags(TEXT("PBRMAX"))), FString());
+    TestEqual(TEXT("Temp 资产来源目录仍为 Temp"),
+              SourceFolderForTags(MakeTags(TEXT("Temp"))),
+              FString(TEXT("Temp")));
 
-    TArray<FString> ThirdPartyTags;
-    ThirdPartyTags.Add(TEXT("ThirdParty"));
-    TestEqual(TEXT("显式 ThirdParty 标签进第三方目录"),
-              SourceFolderForTags(ThirdPartyTags), FString(TEXT("ThirdParty")));
+    // 第三方判定：标准标签 ThirdParty（含写法变体）与旧来源标记都算第三方。
+    TestTrue(TEXT("ThirdParty 标准标签判定为第三方资产"),
+             IsThirdPartyAsset(MakeTags(TEXT("ThirdParty"))));
+    TestTrue(TEXT("第三方中文标签判定为第三方资产"),
+             IsThirdPartyAsset(MakeTags(TEXT("第三方"))));
+    TestTrue(TEXT("ThirdParty 写法变体也识别"),
+             IsThirdPartyAsset(MakeTags(TEXT("third party"))));
+    TestTrue(TEXT("旧 Megascans 来源标记判定为第三方资产"),
+             IsThirdPartyAsset(MakeTags(TEXT("Megascans"))));
+    TestTrue(TEXT("旧 PBRMAX 来源标记判定为第三方资产"),
+             IsThirdPartyAsset(MakeTags(TEXT("PBRMAX"))));
+    TestFalse(TEXT("Dressing 不是第三方资产"),
+              IsThirdPartyAsset(MakeTags(TEXT("Dressing"))));
 
-    // 写法容错：大小写、空格、连字符、下划线都等价（HasAssetTag 会归一化）。
-    TArray<FString> ThirdPartyVariantTags;
-    ThirdPartyVariantTags.Add(TEXT("third party"));
-    TestEqual(TEXT("ThirdParty 标签变体也识别"),
-              SourceFolderForTags(ThirdPartyVariantTags),
+    // 目录拼接：追加在原本路径末尾；空分类时 ThirdParty 直接作为分类目录。
+    TestEqual(TEXT("3D Assets 第三方目录为 Objects/ThirdParty"),
+              ResolveThirdPartyCategoryFolder(TEXT("Objects"), true, false,
+                                              false),
+              FString(TEXT("Objects/ThirdParty")));
+    TestEqual(TEXT("3D Plants 第三方目录为 Grass/ThirdParty"),
+              ResolveThirdPartyCategoryFolder(TEXT("Grass"), true, false,
+                                              false),
+              FString(TEXT("Grass/ThirdParty")));
+    TestEqual(TEXT("Surface 第三方目录为 TilableTex/ThirdParty"),
+              ResolveThirdPartyCategoryFolder(TEXT("TilableTex"), true, false,
+                                              false),
+              FString(TEXT("TilableTex/ThirdParty")));
+    TestEqual(TEXT("Decal 第三方目录为 Decal/ThirdParty"),
+              ResolveThirdPartyCategoryFolder(TEXT("Decal"), true, false,
+                                              false),
+              FString(TEXT("Decal/ThirdParty")));
+    TestEqual(TEXT("空分类时以 ThirdParty 作为分类目录"),
+              ResolveThirdPartyCategoryFolder(FString(), true, false, false),
               FString(TEXT("ThirdParty")));
+    TestEqual(TEXT("非第三方资产不改目录"),
+              ResolveThirdPartyCategoryFolder(TEXT("Objects"), false, false,
+                                              false),
+              FString(TEXT("Objects")));
+    TestEqual(TEXT("Zion 资产不追加第三方目录"),
+              ResolveThirdPartyCategoryFolder(TEXT("Objects"), true, true,
+                                              false),
+              FString(TEXT("Objects")));
+    TestEqual(TEXT("Temp 资产不追加第三方目录"),
+              ResolveThirdPartyCategoryFolder(TEXT("Objects/Temp"), true, false,
+                                              true),
+              FString(TEXT("Objects/Temp")));
 
-    TArray<FString> TempTags;
-    TempTags.Add(TEXT("Temp"));
-    TestEqual(TEXT("Temp 资产来源目录为 Temp"),
-              SourceFolderForTags(TempTags), FString(TEXT("Temp")));
+    // 命名沿用旧规则（2026-10-27）：ThirdParty 只作目录层，不进对象名。
+    // Megascans 来源的 3D 资产仍按"只用资产 ID"命名；其它第三方来源保留资产名。
+    const FEnvironmentAssetProfile ThirdPartyProfile =
+        ApplyThirdPartyLegacyNaming(
+            ResolveEnvironmentAssetProfile(MakeTags(TEXT("ThirdParty"))),
+            MakeTags(TEXT("ThirdParty"), TEXT("megascans")));
+    TestEqual(TEXT("Megascans 来源的第三方资产仍只用资产 ID 命名"),
+              BuildEnvironmentObjectStem(ThirdPartyProfile, TEXT("Bucket"),
+                                         TEXT("abc123")),
+              FString(TEXT("Env_abc123")));
+    const FEnvironmentAssetProfile PbrMaxThirdPartyProfile =
+        ApplyThirdPartyLegacyNaming(
+            ResolveEnvironmentAssetProfile(MakeTags(TEXT("ThirdParty"))),
+            MakeTags(TEXT("ThirdParty"), TEXT("pbrmax")));
+    TestEqual(TEXT("PBRMAX 来源的第三方资产保留资产名"),
+              BuildEnvironmentObjectStem(PbrMaxThirdPartyProfile,
+                                         TEXT("Bucket"), TEXT("abc123")),
+              FString(TEXT("Env_Bucket_abc123")));
+    TestEqual(TEXT("ThirdParty 本身不作为植被命名段"),
+              BuildPlantObjectStem(MakeTags(TEXT("ThirdParty"), TEXT("foliage")),
+                                   TEXT("abc123")),
+              FString(TEXT("Env_Foliage_abc123")));
 
-    TArray<FString> TempThirdPartyTags;
-    TempThirdPartyTags.Add(TEXT("Temp"));
-    TempThirdPartyTags.Add(TEXT("Megascans"));
-    TestEqual(TEXT("Temp 优先于第三方目录"),
-              SourceFolderForTags(TempThirdPartyTags), FString(TEXT("Temp")));
-
-    // 其它分类不参与来源目录：Dressing / Kits 等保持原路径（SourceFolder 为空）。
-    TArray<FString> DressingTags;
-    DressingTags.Add(TEXT("Dressing"));
-    TestEqual(TEXT("Dressing 不产生来源目录"), SourceFolderForTags(DressingTags),
-              FString());
-    TArray<FString> KitsTags;
-    KitsTags.Add(TEXT("Kits"));
-    TestEqual(TEXT("Kits 不产生来源目录"), SourceFolderForTags(KitsTags),
-              FString());
+    // 扫描面数预算：ThirdParty 标签与旧来源标记都按 Dressing 预算处理。
+    TestTrue(TEXT("ThirdParty 计入扫描预算"),
+             IsScanSourceTags(MakeTags(TEXT("ThirdParty"))));
+    TestTrue(TEXT("Megascans 来源计入扫描预算"),
+             IsScanSourceTags(MakeTags(TEXT("Megascans"))));
+    TestTrue(TEXT("PBRMAX 来源计入扫描预算"),
+             IsScanSourceTags(MakeTags(TEXT("PBRMAX"))));
+    TestFalse(TEXT("Dressing 不计入扫描预算"),
+              IsScanSourceTags(MakeTags(TEXT("Dressing"))));
   }
 
   // 分类只认标准 Asset Tag（2026-10-21 修复）：导出侧 job 的 tags 里混有 assetType /
