@@ -7593,7 +7593,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                                              ? SourceTextureResolutionByPath[SourceKey]
                                              : TEXT("");
               const bool bDisplacement = SlotName == TEXT("displacement");
-              Texture->VirtualTextureStreaming = bUseVT && !bDisplacement;
               if (bDisplacement) {
                 Texture->CompressionSettings = TC_Masks;
                 Texture->SRGB = false;
@@ -7642,6 +7641,18 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 Texture->LODGroup = TEXTUREGROUP_World;
                 Texture->LossyCompressionAmount = TLCA_Medium;
                 Texture->MaxTextureSize = 2048;
+              }
+              // VT 门槛统一按"2K 及以上"（2026-10-27）：Surface / Decal 额外导出的
+              // displacement / height（_Dis）与其它贴图同规则 —— Surface 的 _Dis 是 2K，
+              // 达到门槛后开 VT；Decal 的 _Dis 仍是 1K，因此保持关闭。
+              // 压缩沿用 ORM 规则（TC_Masks、无 sRGB），已在上面各分支内设置。
+              Texture->VirtualTextureStreaming =
+                  bUseVT && Texture->MaxTextureSize >= 2048;
+              // 视差贴花（POM / Triplanar POM）的 _Dis 固定 1K、明确不参与 VT；
+              // 普通贴花不下发 displacement 槽位（导出侧只在视差父材质下导出 _Dis）。
+              if (bIsDecal && bDisplacement) {
+                Texture->MaxTextureSize = 1024;
+                Texture->VirtualTextureStreaming = false;
               }
             } else if (SlotName == TEXT("albedo")) {
               Texture->CompressionSettings = TC_Default;
