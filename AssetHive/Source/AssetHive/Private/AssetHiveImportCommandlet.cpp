@@ -1572,17 +1572,25 @@ static bool HasZionTaggedAsset(const TSharedPtr<FJsonObject> &AssetObject) {
 }
 
 // Dressing 减面预算的适用判定（2026-10-29）：Dressing / 第三方 / 扫描来源的 3D 资产
-// 套 Dressing 规格；**Zion 资产除外** —— Zion + 第三方按 Zion 规则处理，目录不加
-// ThirdParty 层、命名走 Zion 约定，也不做扫描资产的减面收敛。
+// 套 Dressing 规格（单边 ≥5m 55 万、否则 30 万）。
+//  - Dressing 是**分类档**：Zion 资产同样是场景 Dressing 网格，照样吃 300k/550k；
+//  - 第三方/扫描来源：Zion + 第三方按 Zion 规则处理（目录不加 ThirdParty 层、命名走
+//    Zion 约定），因此不按扫描资产套预算。
 static bool ShouldApplyDressingTriangleBudget(bool bIs3DAsset,
                                               bool bIsZionAsset,
                                               const TArray<FString> &StandardTags,
                                               const FString &TypeKey) {
-  if (!bIs3DAsset || bIsZionAsset) {
+  if (!bIs3DAsset) {
+    return false;
+  }
+  if (TypeKey == TEXT("Dressing")) {
+    return true;
+  }
+  if (bIsZionAsset) {
     return false;
   }
   return IsScanSourceTags(StandardTags) || TypeKey == TEXT("Megascans") ||
-         TypeKey == TEXT("PBRMAX") || TypeKey == TEXT("Dressing");
+         TypeKey == TEXT("PBRMAX");
 }
 
 // 第三方资产的命名沿用旧规则（2026-10-27 约定）：ThirdParty 只作目录层，**不进对象名**。
@@ -8775,7 +8783,7 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
     // Zion + 第三方按 Zion 规则处理（2026-10-29）：不追加 ThirdParty 层、也不套第三方减面。
     TArray<FString> ZionThirdPartyTags;
     ZionThirdPartyTags.Add(TEXT("ThirdParty"));
-    TestFalse(TEXT("Zion 资产不套 Dressing 减面预算"),
+    TestFalse(TEXT("Zion 第三方资产不按扫描来源减面"),
               ShouldApplyDressingTriangleBudget(true, true, ZionThirdPartyTags,
                                                 TEXT("Objects")));
     TestTrue(TEXT("非 Zion 第三方资产套 Dressing 减面预算"),
@@ -8787,6 +8795,14 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
     TestTrue(TEXT("Megascans 来源 3D 资产套 Dressing 减面预算"),
              ShouldApplyDressingTriangleBudget(
                  true, false, MakeTags(TEXT("Megascans")), TEXT("Objects")));
+    // Dressing 是分类档（2026-10-29 定稿）：Zion 资产同样吃 300k/550k。
+    TestTrue(TEXT("Zion Dressing 资产同样套 Dressing 减面预算"),
+             ShouldApplyDressingTriangleBudget(true, true, MakeTags(TEXT("Dressing")),
+                                               TEXT("Dressing")));
+    TestTrue(TEXT("非 Zion Dressing 资产套 Dressing 减面预算"),
+             ShouldApplyDressingTriangleBudget(true, false,
+                                               MakeTags(TEXT("Dressing")),
+                                               TEXT("Dressing")));
     // zionTags 解析：空对象不算 Zion，非空即算。
     const TSharedPtr<FJsonObject> PlainAssetObject = MakeShared<FJsonObject>();
     TestFalse(TEXT("无 zionTags 的不是 Zion 资产"),
