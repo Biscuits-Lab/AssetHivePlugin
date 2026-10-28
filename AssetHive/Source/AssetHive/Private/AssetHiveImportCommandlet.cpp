@@ -1571,14 +1571,14 @@ static bool HasZionTaggedAsset(const TSharedPtr<FJsonObject> &AssetObject) {
   return false;
 }
 
-// Dressing 减面预算的适用判定（2026-10-29）：Dressing / 第三方 / 扫描来源的 3D 资产
-// 套 Dressing 规格（单边 ≥5m 55 万、否则 30 万）。
-//  - Dressing 是**分类档**：Zion 资产同样是场景 Dressing 网格，照样吃 300k/550k；
-//  - 第三方/扫描来源：Zion + 第三方按 Zion 规则处理（目录不加 ThirdParty 层、命名走
-//    Zion 约定），因此不按扫描资产套预算。
+// Dressing 减面预算的适用判定（2026-10-29 修订）：Dressing 规则是**绝对兜底** ——
+// 3D 资产先按自身分类档取固定预算（Props 15 万、Kits/MEGA/Destructible 各 10 万），
+// **取不到固定档的一律按 Dressing 规格收敛**（单边 ≥5m 55 万、否则 30 万）：包括
+// Dressing 分类、第三方资产，以及没有任何分类标签的 Objects 资产。
+// Zion 资产仍按 Zion 规则：只有 Dressing 分类吃 300k/550k，其余不套兜底档。
 static bool ShouldApplyDressingTriangleBudget(bool bIs3DAsset,
                                               bool bIsZionAsset,
-                                              const TArray<FString> &StandardTags,
+                                              int32 FixedTriangleBudget,
                                               const FString &TypeKey) {
   if (!bIs3DAsset) {
     return false;
@@ -1589,8 +1589,7 @@ static bool ShouldApplyDressingTriangleBudget(bool bIs3DAsset,
   if (bIsZionAsset) {
     return false;
   }
-  return IsScanSourceTags(StandardTags) || TypeKey == TEXT("Megascans") ||
-         TypeKey == TEXT("PBRMAX");
+  return FixedTriangleBudget <= 0;
 }
 
 // 第三方资产的命名沿用旧规则（2026-10-27 约定）：ThirdParty 只作目录层，**不进对象名**。
@@ -1828,6 +1827,49 @@ static bool ApplyNaniteTriangleBudget(UStaticMesh *StaticMesh,
       TEXT("%s %.2f m source, %d triangles, budget %d, Nanite keep %.4f"),
       *StaticMesh->GetName(), MaxDimensionCm / 100.0f, SourceTriangles,
       TriangleBudget, KeepPercent);
+  UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
+  return true;
+}
+
+// Dressing 绝对兜底（2026-10-29）：无论第一轮档位减面（分类固定档 / Dressing 档）
+// 的结果如何，网格阶段都要再走一遍 Dressing 上限检查 —— 单边 ≥5m 55 万、否则 30 万。
+// 只降不升：已经在预算内的资产（例如 Props 15 万、Kits 10 万）保持原 keep，不会被抬高。
+static bool ClampNaniteDressingBudget(UStaticMesh *StaticMesh,
+                                      FString &OutSummary) {
+  OutSummary.Reset();
+  if (!StaticMesh) {
+    return false;
+  }
+  const FMeshDescription *SourceMesh = StaticMesh->GetMeshDescription(0);
+  if (!SourceMesh) {
+    return false;
+  }
+  const int32 SourceTriangles = SourceMesh->Triangles().Num();
+  if (SourceTriangles <= 0) {
+    return false;
+  }
+  const float MaxDimensionCm = GetSourceMeshMaxDimensionCm(*SourceMesh);
+  const int32 TriangleBudget = ResolveScanSourceTriangleBudget(MaxDimensionCm);
+  if (TriangleBudget <= 0) {
+    return false;
+  }
+  // 该上限允许的最大 keep：源面数本身在预算内时为 1.0。
+  const float MaxKeep =
+      SourceTriangles <= TriangleBudget
+          ? 1.0f
+          : FMath::Clamp(static_cast<float>(TriangleBudget) /
+                             static_cast<float>(SourceTriangles),
+                         0.0f, 1.0f);
+  FMeshNaniteSettings *NaniteSettings = GetMutableNaniteSettings(StaticMesh);
+  const float CurrentKeep = NaniteSettings->KeepPercentTriangles;
+  if (CurrentKeep <= MaxKeep + 0.0001f) {
+    return false;  // 已经是更严的档位（或恰好达标），不做任何修改
+  }
+  NaniteSettings->KeepPercentTriangles = MaxKeep;
+  OutSummary = FString::Printf(
+      TEXT("%s %.2f m Dressing 兜底: %d triangles, budget %d, keep %.4f -> %.4f"),
+      *StaticMesh->GetName(), MaxDimensionCm / 100.0f, SourceTriangles,
+      TriangleBudget, CurrentKeep, MaxKeep);
   UE_LOG(LogTemp, Display, TEXT("AssetHive import: %s"), *OutSummary);
   return true;
 }
@@ -6858,13 +6900,28 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
       CategoryFolder = PlantProfile.SubtypeFolder;
     }
-    // Third party scans follow the Dressing triangle budget even when their
-    // tags route them into another asset folder. 标签收紧后 ThirdParty 是标准标记，
-    // Megascans / PBRMAX 只留在 tags 里，两者都算扫描来源（见 IsScanSourceTags）。
-    // 2026-10-28：Dressing 档（第三方资产、Temp + Props）同样套 Dressing 减面预算。
-    // 2026-10-29：Zion + 第三方按 Zion 规则处理，不套第三方减面预算。
+    // 减面档位（2026-10-29 修订）：先取自身分类档的固定预算（Props 15 万、
+    // Kits/MEGA/Destructible 各 10 万）；取不到的一律按 Dressing 规格兜底
+    // （单边 ≥5m 55 万、否则 30 万），覆盖 Dressing 分类、第三方资产与无分类标签的资产。
+    // 档位在这里算好（沿用 EnvironmentProfile.TypeKey），网格阶段直接复用。
+    int32 FixedTriangleBudget = 0;
+    if (bIs3DAsset) {
+      if (EnvironmentProfile.TypeKey == TEXT("Props")) {
+        FixedTriangleBudget =
+            UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles();
+      } else if (EnvironmentProfile.TypeKey == TEXT("Kits")) {
+        FixedTriangleBudget =
+            UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles();
+      } else if (EnvironmentProfile.TypeKey == TEXT("MEGA")) {
+        FixedTriangleBudget =
+            UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles();
+      } else if (EnvironmentProfile.TypeKey == TEXT("Destructible")) {
+        FixedTriangleBudget =
+            UAssetHiveSettings::GetAsset3DDestructibleMaxLOD0Triangles();
+      }
+    }
     const bool bScanSourceAsset = ShouldApplyDressingTriangleBudget(
-        bIs3DAsset, HasZionTaggedAsset(AssetObject), AssetStandardTags,
+        bIs3DAsset, HasZionTaggedAsset(AssetObject), FixedTriangleBudget,
         EnvironmentProfile.TypeKey);
     FString AssetDestinationPath =
         bIs3DAsset ? TEXT("/Game/Environment/Asset") : DestinationPath;
@@ -8234,29 +8291,18 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           IsOpaqueModelVariantKey(MeshVariantKey) ||
           OpaqueModelVariantKeys.Contains(
               NormalizeModelVariantKey(MeshVariantKey));
-      // 3D 资产减面（2026-10-28 定稿）：
-      //   - Dressing / 第三方 / 扫描来源：单边 ≥5 m → 55 万、否则 30 万；
-      //   - Props：固定 15 万；Kits / MEGA / Destructible：固定 10 万（均与尺寸无关）。
-      int32 FixedTriangleBudget = 0;
+      // 3D 资产减面（2026-10-29 修订）：
+      //   第一轮：分类固定档（Props 15 万 / Kits、MEGA、Destructible 10 万）；
+      //   第二轮：Dressing 绝对兜底 —— 无论第一轮结果如何，3D 资产都要再走一遍
+      //           Dressing 上限检查（≥5m 55 万、否则 30 万），只降不升。
       if (bIs3DAsset) {
-        if (EnvironmentProfile.TypeKey == TEXT("Props")) {
-          FixedTriangleBudget =
-              UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles();
-        } else if (EnvironmentProfile.TypeKey == TEXT("Kits")) {
-          FixedTriangleBudget =
-              UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles();
-        } else if (EnvironmentProfile.TypeKey == TEXT("MEGA")) {
-          FixedTriangleBudget =
-              UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles();
-        } else if (EnvironmentProfile.TypeKey == TEXT("Destructible")) {
-          FixedTriangleBudget =
-              UAssetHiveSettings::GetAsset3DDestructibleMaxLOD0Triangles();
-        }
-      }
-      if (bScanSourceAsset || FixedTriangleBudget > 0) {
         FString TriangleBudgetSummary;
-        ApplyNaniteTriangleBudget(StaticMesh, TriangleBudgetSummary,
-                                  FixedTriangleBudget);
+        if (bScanSourceAsset || FixedTriangleBudget > 0) {
+          ApplyNaniteTriangleBudget(StaticMesh, TriangleBudgetSummary,
+                                    FixedTriangleBudget);
+        }
+        FString DressingClampSummary;
+        ClampNaniteDressingBudget(StaticMesh, DressingClampSummary);
       }
       if (AssetType == TEXT("3dplant")) {
         // 3D Plants（md §5.2）：Nanite 按子类开关（Micro 不使用），面数按子类
@@ -8780,29 +8826,35 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                                               true),
               FString(TEXT("Objects/Temp")));
 
-    // Zion + 第三方按 Zion 规则处理（2026-10-29）：不追加 ThirdParty 层、也不套第三方减面。
-    TArray<FString> ZionThirdPartyTags;
-    ZionThirdPartyTags.Add(TEXT("ThirdParty"));
-    TestFalse(TEXT("Zion 第三方资产不按扫描来源减面"),
-              ShouldApplyDressingTriangleBudget(true, true, ZionThirdPartyTags,
-                                                TEXT("Objects")));
-    TestTrue(TEXT("非 Zion 第三方资产套 Dressing 减面预算"),
-             ShouldApplyDressingTriangleBudget(true, false, ZionThirdPartyTags,
-                                               TEXT("Objects")));
-    TestFalse(TEXT("非 3D 资产不套 Dressing 减面预算"),
-              ShouldApplyDressingTriangleBudget(false, false, ZionThirdPartyTags,
-                                                TEXT("Objects")));
-    TestTrue(TEXT("Megascans 来源 3D 资产套 Dressing 减面预算"),
-             ShouldApplyDressingTriangleBudget(
-                 true, false, MakeTags(TEXT("Megascans")), TEXT("Objects")));
-    // Dressing 是分类档（2026-10-29 定稿）：Zion 资产同样吃 300k/550k。
-    TestTrue(TEXT("Zion Dressing 资产同样套 Dressing 减面预算"),
-             ShouldApplyDressingTriangleBudget(true, true, MakeTags(TEXT("Dressing")),
-                                               TEXT("Dressing")));
-    TestTrue(TEXT("非 Zion Dressing 资产套 Dressing 减面预算"),
-             ShouldApplyDressingTriangleBudget(true, false,
-                                               MakeTags(TEXT("Dressing")),
-                                               TEXT("Dressing")));
+    // Dressing 规则是绝对兜底（2026-10-29 修订）：取不到分类固定档就按 30/55 万收敛。
+    // Zion 资产仍按 Zion 规则：只有 Dressing 分类吃 300k/550k。
+    TestTrue(TEXT("无固定档的 Objects 资产按 Dressing 兜底"),
+             ShouldApplyDressingTriangleBudget(true, false, 0, TEXT("Objects")));
+    TestTrue(TEXT("Dressing 分类按兜底档减面"),
+             ShouldApplyDressingTriangleBudget(true, false, 0, TEXT("Dressing")));
+    TestTrue(TEXT("Zion Dressing 资产同样套兜底档"),
+             ShouldApplyDressingTriangleBudget(true, true, 0, TEXT("Dressing")));
+    TestFalse(TEXT("Zion 非 Dressing 资产不套兜底档"),
+              ShouldApplyDressingTriangleBudget(true, true, 0, TEXT("Objects")));
+    TestFalse(TEXT("Props 固定档不吃兜底档"),
+              ShouldApplyDressingTriangleBudget(
+                  true, false,
+                  UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles(),
+                  TEXT("Props")));
+    TestFalse(TEXT("Kits 固定档不吃兜底档"),
+              ShouldApplyDressingTriangleBudget(
+                  true, false,
+                  UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles(),
+                  TEXT("Kits")));
+    TestFalse(TEXT("非 3D 资产不套兜底档"),
+              ShouldApplyDressingTriangleBudget(false, false, 0, TEXT("Objects")));
+    // 第三方 + Props：分类折叠成 Dressing（无固定档）→ 走兜底档。
+    TArray<FString> ThirdPartyPropsTags;
+    ThirdPartyPropsTags.Add(TEXT("Props"));
+    ThirdPartyPropsTags.Add(TEXT("ThirdParty"));
+    TestEqual(TEXT("第三方 Props 折叠成 Dressing 档"),
+              ResolveEnvironmentAssetProfile(ThirdPartyPropsTags).TypeKey,
+              FString(TEXT("Dressing")));
     // zionTags 解析：空对象不算 Zion，非空即算。
     const TSharedPtr<FJsonObject> PlainAssetObject = MakeShared<FJsonObject>();
     TestFalse(TEXT("无 zionTags 的不是 Zion 资产"),
@@ -9423,6 +9475,28 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
                                 static_cast<float>(SmallBudget) /
                                     static_cast<float>(SourceTriangles),
                                 0.001f));
+
+  // Dressing 绝对兜底（2026-10-29）：第二轮上限检查，只降不升。
+  Settings->Asset3DMaxLOD0Triangles = SmallBudget;
+  UStaticMesh *ClampMesh = MakeGridMesh(10.0f, TEXT("AssetHiveClampProbe"));
+  FGCObjectScopeGuard ClampMeshGuard(ClampMesh);
+  GetMutableNaniteSettings(ClampMesh)->KeepPercentTriangles = 1.0f;
+  FString ClampSummary;
+  TestTrue(TEXT("Dressing 兜底会把超预算网格压到上限"),
+           ClampNaniteDressingBudget(ClampMesh, ClampSummary));
+  TestTrue(TEXT("Dressing 兜底后的 keep 等于上限 / 源面数"),
+           FMath::IsNearlyEqual(
+               GetMutableNaniteSettings(ClampMesh)->KeepPercentTriangles,
+               static_cast<float>(SmallBudget) /
+                   static_cast<float>(SourceTriangles),
+               0.001f));
+  GetMutableNaniteSettings(ClampMesh)->KeepPercentTriangles = 0.01f;
+  FString ClampAgainSummary;
+  TestFalse(TEXT("Dressing 兜底不会抬高更严档位的 keep"),
+            ClampNaniteDressingBudget(ClampMesh, ClampAgainSummary));
+  TestTrue(TEXT("更严档位（如 Props 15 万）的 keep 保持不变"),
+           FMath::IsNearlyEqual(
+               GetMutableNaniteSettings(ClampMesh)->KeepPercentTriangles, 0.01f));
 
   // 5 m 分档边界（2026-10-28）：≥ 阈值用大件预算，略低于阈值用常规预算。
   TestEqual(TEXT("Threshold boundary uses the large budget"),
