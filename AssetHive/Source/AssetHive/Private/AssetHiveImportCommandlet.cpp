@@ -1376,11 +1376,6 @@ struct FEnvironmentAssetProfile {
   FString TypePrefix;
   bool bUseAssetIdOnly = false;
   FString FolderName = TEXT("Objects");
-  // 来源分类子目录（2026-10-27 修订）：只承载 Temp —— Temp 资产落 Objects/Temp。
-  // 第三方资产的 ThirdParty 层不放这里：它要追加在**原始导出路径**的末尾
-  // （3D Assets → Objects/ThirdParty；3D Plants → Vegetation/Grass/ThirdParty），
-  // 由 ResolveThirdPartyCategoryFolder 统一处理；只在 Objects 下插层的旧规则已废弃。
-  FString SourceFolder;
   bool bBaseFamily = true;
   bool bHighResPreset = true;
   bool bMega = false;
@@ -1390,14 +1385,38 @@ struct FEnvironmentAssetProfile {
   bool bTemp = false;
 };
 
+static bool IsThirdPartyAsset(const TArray<FString> &Tags);
+
 static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
     const TArray<FString> &Tags) {
   // Temp 是叠加标记、不是互斥分类：带 Temp 的资产仍按其正式标签归类，
   // 只是额外获得 Temp_ 文件夹前缀与 Temp 对象名段。
   // 用内层 lambda 完成分类，最后统一套用 Temp，避免在每个提前 return 处重复处理。
   const bool bTemp = HasAssetTag(Tags, TEXT("Temp"));
-  FEnvironmentAssetProfile Profile = [&Tags]() {
+  FEnvironmentAssetProfile Profile = [&Tags, bTemp]() {
     FEnvironmentAssetProfile Resolved;
+    // 第三方资产（2026-10-28 定稿）：3D Assets 里凡是第三方（ThirdParty 标准标签，或 tags 里
+    // 的 Megascans / PBRMAX 来源标记），**即使另带分类标签**（Props / Kits / Destructible /
+    // MEGA）也统一按 **Dressing 档**处理：
+    //   分类目录 → Objects（随后由 ResolveThirdPartyCategoryFolder 追加 ThirdParty 层
+    //              → Objects/ThirdParty）
+    //   命名    → Env_<资产名>_<ID>（不带 Prop / Kit / Dest / MEGA 段，也不退回"只用 ID"）
+    //   预设    → Objects 档（主图 2K/4K、次要贴图 2048、达 2K 门槛开 VT）
+    // 只带第三方标记、没有分类标签的资产仍走默认 Objects 档，保留旧命名规则
+    // （Megascans 来源只用资产 ID，见 ApplyThirdPartyLegacyNaming）。
+    const bool bThirdPartyWithCategoryTag =
+        IsThirdPartyAsset(Tags) &&
+        (HasAssetTag(Tags, TEXT("Props")) ||
+         HasAssetTag(Tags, TEXT("Kits")) || HasAssetTag(Tags, TEXT("Kit")) ||
+         HasAssetTag(Tags, TEXT("Destructible")) ||
+         HasAssetTag(Tags, TEXT("MEGA")));
+    if (bThirdPartyWithCategoryTag) {
+      Resolved.TypeKey = TEXT("Dressing");
+      Resolved.FolderName = TEXT("Objects");
+      Resolved.bBaseFamily = true;
+      Resolved.bHighResPreset = true;
+      return Resolved;
+    }
     if (HasAssetTag(Tags, TEXT("MEGA"))) {
       Resolved.TypeKey = TEXT("MEGA");
       Resolved.TypePrefix = TEXT("MEGA");
@@ -1424,6 +1443,15 @@ static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
       return Resolved;
     }
     if (HasAssetTag(Tags, TEXT("Props"))) {
+      // Temp + Props（2026-10-28）：走 Dressing 流程 —— 目录 Objects/Temp、命名不带 Prop 段、
+      // 高分辨率预设，并套 Dressing 的 Nanite 减面预算（见 bScanSourceAsset）。
+      if (bTemp) {
+        Resolved.TypeKey = TEXT("Dressing");
+        Resolved.FolderName = TEXT("Objects");
+        Resolved.bBaseFamily = true;
+        Resolved.bHighResPreset = true;
+        return Resolved;
+      }
       Resolved.TypeKey = TEXT("Props");
       Resolved.TypePrefix = TEXT("Prop");
       Resolved.FolderName = TEXT("Props");
@@ -1453,12 +1481,6 @@ static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
                              : FString::Printf(TEXT("Temp_%s"), *Profile.TypePrefix);
     Profile.bBaseFamily = false;
   }
-  // Temp 子目录（2026-10-27 修订）：SourceFolder 只承载 Temp，且只对基础分类目录为
-  // Objects 的 3D 资产生效（见资产路径拼接处）。Temp 是"工作状态"而不是来源：
-  // 一个资产即使同时带 ThirdParty，也只保留 Objects/Temp，整批清理时不会漏。
-  if (bTemp) {
-    Profile.SourceFolder = TEXT("Temp");
-  }
   return Profile;
 }
 
@@ -1472,6 +1494,17 @@ static bool IsThirdPartyAsset(const TArray<FString> &Tags) {
          HasAssetTag(Tags, TEXT("Megascans")) ||
          HasAssetTag(Tags, TEXT("Quixel")) ||
          HasAssetTag(Tags, TEXT("PBRMAX"));
+}
+
+// 分类感知第三方（2026-10-28）：标准标签可能只有 Props，而 Megascans / PBRMAX 来源标记
+// 只写在普通 tags 里。分类只看 standardAssetTags，会漏掉这类"第三方 Props"，于是补一个
+// ThirdParty 标记，让 ResolveEnvironmentAssetProfile 走 Objects 档（目录再追加 ThirdParty）。
+static void AddThirdPartyMarkerIfNeeded(const TArray<FString> &MergedTags,
+                                        TArray<FString> &ProfileTags) {
+  if (IsThirdPartyAsset(MergedTags) &&
+      !HasAssetTag(ProfileTags, TEXT("ThirdParty"))) {
+    ProfileTags.Add(TEXT("ThirdParty"));
+  }
 }
 
 // 第三方目录（2026-10-27 定稿）：在**原本的导出路径**末尾再追加一层 ThirdParty，
@@ -1491,6 +1524,21 @@ static FString ResolveThirdPartyCategoryFolder(const FString &CategoryFolder,
   }
   return CategoryFolder.IsEmpty() ? FString(TEXT("ThirdParty"))
                                   : CategoryFolder / TEXT("ThirdParty");
+}
+
+// Temp 子目录（2026-10-28 修订）：Temp 资产在**各自的分类目录下**再建一层 Temp ——
+//   Temp + Kits → Kits/Temp；Temp + Props → Props/Temp；Temp + Dressing / 第三方 →
+//   Objects/Temp；Temp + MEGA → MEGA/Temp；Temp + Destructible → Destructible/Temp。
+// 这样既保留分类归属（美术按分类找资产），又能按 Temp 层整批清理。
+// 只对**非 Zion 资产**生效：Zion 资产（zionTags 非空）走用户自选的二级目录体系。
+// 资产文件夹名仍带 Temp_ 前缀、对象名仍带 Temp 段。
+static FString ResolveTempCategoryFolder(const FString &CategoryFolder,
+                                         bool bTempAsset, bool bIsZionAsset) {
+  if (!bTempAsset || bIsZionAsset) {
+    return CategoryFolder;
+  }
+  return CategoryFolder.IsEmpty() ? FString(TEXT("Temp"))
+                                  : CategoryFolder / TEXT("Temp");
 }
 
 // 第三方扫描资产（2026-10-27）：Megascans / PBRMAX 来源与统一后的 ThirdParty 标签都按
@@ -1690,15 +1738,18 @@ static float GetSourceMeshMaxDimensionCm(const FMeshDescription &Mesh) {
   return static_cast<float>(FMath::Max3(Size.X, Size.Y, Size.Z));
 }
 
+// Dressing 面数规格（2026-10-28 修订）：单边 ≥5 m 用大件预算（默认 55 万），否则 30 万。
 static int32 ResolveScanSourceTriangleBudget(float MaxDimensionCm) {
-  return MaxDimensionCm > UAssetHiveSettings::GetAsset3DLargeSizeThresholdCm()
+  return MaxDimensionCm >= UAssetHiveSettings::GetAsset3DLargeSizeThresholdCm()
              ? UAssetHiveSettings::GetAsset3DLargeMaxLOD0Triangles()
              : UAssetHiveSettings::GetAsset3DMaxLOD0Triangles();
 }
 
 // Returns true when the Nanite keep percentage was written for this mesh.
+// BudgetOverride > 0 时直接使用该预算（Props 固定 15 万面，与尺寸无关）。
 static bool ApplyNaniteTriangleBudget(UStaticMesh *StaticMesh,
-                                      FString &OutSummary) {
+                                      FString &OutSummary,
+                                      int32 BudgetOverride = 0) {
   OutSummary.Reset();
   if (!StaticMesh) {
     return false;
@@ -1712,7 +1763,9 @@ static bool ApplyNaniteTriangleBudget(UStaticMesh *StaticMesh,
     return false;
   }
   const float MaxDimensionCm = GetSourceMeshMaxDimensionCm(*SourceMesh);
-  const int32 TriangleBudget = ResolveScanSourceTriangleBudget(MaxDimensionCm);
+  const int32 TriangleBudget = BudgetOverride > 0
+                                   ? BudgetOverride
+                                   : ResolveScanSourceTriangleBudget(MaxDimensionCm);
   if (TriangleBudget <= 0) {
     return false;
   }
@@ -6706,6 +6759,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       TArray<FString> EnvironmentProfileTags;
       CollectEnvironmentProfileTags(AssetObject, AssetStandardTags,
                                     EnvironmentProfileTags);
+      // 第三方 Props（2026-10-28）：来源标记只写在 tags 里（Megascans / PBRMAX）而标准标签
+      // 只有 Props 时，也给分类补 ThirdParty 标记，让"第三方 Props 走 Objects 档"对旧载荷生效。
+      AddThirdPartyMarkerIfNeeded(AssetStandardTags, EnvironmentProfileTags);
       // 命名沿用旧规则（2026-10-27）：ThirdParty 只是目录层，不进对象名；Megascans 来源
       // 的 3D 资产仍按"只用资产 ID"命名（见 ApplyThirdPartyLegacyNaming）。
       EnvironmentProfile = ApplyThirdPartyLegacyNaming(
@@ -6762,11 +6818,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // Third party scans follow the Dressing triangle budget even when their
     // tags route them into another asset folder. 标签收紧后 ThirdParty 是标准标记，
     // Megascans / PBRMAX 只留在 tags 里，两者都算扫描来源（见 IsScanSourceTags）。
+    // 2026-10-28：Dressing 档（第三方资产、Temp + Props）同样套 Dressing 减面预算。
     const bool bScanSourceAsset =
         bIs3DAsset &&
         (IsScanSourceTags(AssetStandardTags) ||
          EnvironmentProfile.TypeKey == TEXT("Megascans") ||
-         EnvironmentProfile.TypeKey == TEXT("PBRMAX"));
+         EnvironmentProfile.TypeKey == TEXT("PBRMAX") ||
+         EnvironmentProfile.TypeKey == TEXT("Dressing"));
     FString AssetDestinationPath =
         bIs3DAsset ? TEXT("/Game/Environment/Asset") : DestinationPath;
     if (AssetType == TEXT("3dplant")) {
@@ -6874,17 +6932,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     FString ZionCategoryFolder = SafeCategoryFolder;
-    // Temp 子目录紧贴在 Objects 之下：
-    //   /Game/Environment/Asset/Objects/Temp/[<Zion 二级目录>/]<资产文件夹>
-    // 只对**非 Zion 资产**插入：Zion 资产（zionTags 非空）走用户自选的二级目录体系；
-    // 导出侧显式给了别的目录（Props / Kits / 3D_Assets 等）时也不插。
-    const bool bObjectsRoot =
-        SafeCategoryFolder.Equals(TEXT("Objects"), ESearchCase::IgnoreCase);
-    if (bObjectsRoot && !bIsZionAsset &&
-        !EnvironmentProfile.SourceFolder.IsEmpty()) {
-      ZionCategoryFolder = ZionCategoryFolder.IsEmpty()
-                               ? EnvironmentProfile.SourceFolder
-                               : ZionCategoryFolder / EnvironmentProfile.SourceFolder;
+    // Temp 子目录（2026-10-28 修订）：Temp 资产在各自分类目录下再建一层 Temp ——
+    // Kits/Temp、Props/Temp、Objects/Temp、MEGA/Temp、Destructible/Temp。
+    // 只对**非 Zion 资产**生效：Zion 资产（zionTags 非空）走用户自选的二级目录体系。
+    const bool bTempCategory = !bIsZionAsset && EnvironmentProfile.bTemp;
+    if (bTempCategory) {
+      ZionCategoryFolder =
+          ResolveTempCategoryFolder(ZionCategoryFolder, true, false);
     }
     if (bIsZionAsset && !ZionSubfolder.IsEmpty()) {
       ZionCategoryFolder = ZionCategoryFolder.IsEmpty()
@@ -8153,9 +8207,29 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           IsOpaqueModelVariantKey(MeshVariantKey) ||
           OpaqueModelVariantKeys.Contains(
               NormalizeModelVariantKey(MeshVariantKey));
-      if (bScanSourceAsset) {
+      // 3D 资产减面（2026-10-28 定稿）：
+      //   - Dressing / 第三方 / 扫描来源：单边 ≥5 m → 55 万、否则 30 万；
+      //   - Props：固定 15 万；Kits / MEGA / Destructible：固定 10 万（均与尺寸无关）。
+      int32 FixedTriangleBudget = 0;
+      if (bIs3DAsset) {
+        if (EnvironmentProfile.TypeKey == TEXT("Props")) {
+          FixedTriangleBudget =
+              UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles();
+        } else if (EnvironmentProfile.TypeKey == TEXT("Kits")) {
+          FixedTriangleBudget =
+              UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles();
+        } else if (EnvironmentProfile.TypeKey == TEXT("MEGA")) {
+          FixedTriangleBudget =
+              UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles();
+        } else if (EnvironmentProfile.TypeKey == TEXT("Destructible")) {
+          FixedTriangleBudget =
+              UAssetHiveSettings::GetAsset3DDestructibleMaxLOD0Triangles();
+        }
+      }
+      if (bScanSourceAsset || FixedTriangleBudget > 0) {
         FString TriangleBudgetSummary;
-        ApplyNaniteTriangleBudget(StaticMesh, TriangleBudgetSummary);
+        ApplyNaniteTriangleBudget(StaticMesh, TriangleBudgetSummary,
+                                  FixedTriangleBudget);
       }
       if (AssetType == TEXT("3dplant")) {
         // 3D Plants（md §5.2）：Nanite 按子类开关（Micro 不使用），面数按子类
@@ -8485,7 +8559,7 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   // ThirdParty；第三方资产在**原本导出路径**末尾追加一层 ThirdParty
   // （3D Assets → Objects/ThirdParty，3D Plants → Vegetation/Grass/ThirdParty，
   //  Surface → TilableTex/ThirdParty，Decal → Decal/ThirdParty）。
-  // SourceFolder 只剩 Temp 一种（Objects/Temp），第三方层不再走它。
+  // Temp 走独立的 Temp 分类（2026-10-28），与第三方层互斥且优先。
   {
     auto MakeTags = [](const TCHAR *First, const TCHAR *Second = nullptr) {
       TArray<FString> Tags;
@@ -8497,17 +8571,32 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
       }
       return Tags;
     };
-    auto SourceFolderForTags = [](const TArray<FString> &Tags) {
-      return ResolveEnvironmentAssetProfile(Tags).SourceFolder;
-    };
-
-    TestEqual(TEXT("Megascans 来源不再进分类目录"),
-              SourceFolderForTags(MakeTags(TEXT("Megascans"))), FString());
-    TestEqual(TEXT("PBRMAX 来源不再进分类目录"),
-              SourceFolderForTags(MakeTags(TEXT("PBRMAX"))), FString());
-    TestEqual(TEXT("Temp 资产来源目录仍为 Temp"),
-              SourceFolderForTags(MakeTags(TEXT("Temp"))),
+    // Temp 子目录（2026-10-28）：Temp 资产在各自分类目录下再建一层 Temp；
+    // 非 Temp 与 Zion 资产不改分类目录。
+    TestEqual(TEXT("Temp + Kits 落 Kits/Temp"),
+              ResolveTempCategoryFolder(TEXT("Kits"), true, false),
+              FString(TEXT("Kits/Temp")));
+    TestEqual(TEXT("Temp + Props 落 Props/Temp"),
+              ResolveTempCategoryFolder(TEXT("Props"), true, false),
+              FString(TEXT("Props/Temp")));
+    TestEqual(TEXT("Temp + Objects（Dressing/第三方）落 Objects/Temp"),
+              ResolveTempCategoryFolder(TEXT("Objects"), true, false),
+              FString(TEXT("Objects/Temp")));
+    TestEqual(TEXT("Temp + MEGA 落 MEGA/Temp"),
+              ResolveTempCategoryFolder(TEXT("MEGA"), true, false),
+              FString(TEXT("MEGA/Temp")));
+    TestEqual(TEXT("Temp + Destructible 落 Destructible/Temp"),
+              ResolveTempCategoryFolder(TEXT("Destructible"), true, false),
+              FString(TEXT("Destructible/Temp")));
+    TestEqual(TEXT("空分类 + Temp 直接落 Temp"),
+              ResolveTempCategoryFolder(FString(), true, false),
               FString(TEXT("Temp")));
+    TestEqual(TEXT("非 Temp 资产分类目录不变"),
+              ResolveTempCategoryFolder(TEXT("Objects"), false, false),
+              FString(TEXT("Objects")));
+    TestEqual(TEXT("Zion 资产不参与 Temp 子目录"),
+              ResolveTempCategoryFolder(TEXT("Objects"), true, true),
+              FString(TEXT("Objects")));
 
     // 第三方判定：标准标签 ThirdParty（含写法变体）与旧来源标记都算第三方。
     TestTrue(TEXT("ThirdParty 标准标签判定为第三方资产"),
@@ -8522,6 +8611,114 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
              IsThirdPartyAsset(MakeTags(TEXT("PBRMAX"))));
     TestFalse(TEXT("Dressing 不是第三方资产"),
               IsThirdPartyAsset(MakeTags(TEXT("Dressing"))));
+
+    // 第三方 Props（2026-10-28）：按 Objects 档分类，目录再由 ThirdParty 层表达；
+    // 普通 Props（非第三方）仍走 Props 档。
+    const FEnvironmentAssetProfile ThirdPartyPropsProfile =
+        ResolveEnvironmentAssetProfile(
+            MakeTags(TEXT("Props"), TEXT("ThirdParty")));
+    TestEqual(TEXT("第三方 Props 落 Objects 分类"),
+              ThirdPartyPropsProfile.FolderName, FString(TEXT("Objects")));
+    TestTrue(TEXT("第三方 Props 使用高分辨率预设"),
+             ThirdPartyPropsProfile.bHighResPreset);
+    TestTrue(TEXT("第三方 Props 不带 Prop 命名段"),
+             ThirdPartyPropsProfile.TypePrefix.IsEmpty());
+    TestEqual(TEXT("第三方 Props 按 Dressing 档分类"), ThirdPartyPropsProfile.TypeKey,
+              FString(TEXT("Dressing")));
+    // 命名与 Dressing 一致：即使来源标记里有 Megascans，也保留资产名（不退回"只用 ID"）。
+    TArray<FString> ThirdPartyPropsMergedTags;
+    ThirdPartyPropsMergedTags.Add(TEXT("Props"));
+    ThirdPartyPropsMergedTags.Add(TEXT("ThirdParty"));
+    ThirdPartyPropsMergedTags.Add(TEXT("megascans"));
+    TestEqual(TEXT("第三方 Props 命名按 Dressing（保留资产名）"),
+              BuildEnvironmentObjectStem(
+                  ApplyThirdPartyLegacyNaming(ThirdPartyPropsProfile,
+                                              ThirdPartyPropsMergedTags),
+                  TEXT("Bucket"), TEXT("abc123")),
+              FString(TEXT("Env_Bucket_abc123")));
+    TestEqual(TEXT("非第三方 Props 仍落 Props 分类"),
+              ResolveEnvironmentAssetProfile(MakeTags(TEXT("Props"))).FolderName,
+              FString(TEXT("Props")));
+
+    // 旧载荷：标准标签只有 Props、来源标记在 tags 里时，补 ThirdParty 后同样走 Objects。
+    TArray<FString> LegacyThirdPartyPropsProfileTags;
+    LegacyThirdPartyPropsProfileTags.Add(TEXT("Props"));
+    AddThirdPartyMarkerIfNeeded(MakeTags(TEXT("Props"), TEXT("pbrmax")),
+                                LegacyThirdPartyPropsProfileTags);
+    TestEqual(TEXT("来源标记补齐后第三方 Props 也落 Objects"),
+              ResolveEnvironmentAssetProfile(LegacyThirdPartyPropsProfileTags)
+                  .FolderName,
+              FString(TEXT("Objects")));
+    TArray<FString> PlainPropsProfileTags;
+    PlainPropsProfileTags.Add(TEXT("Props"));
+    AddThirdPartyMarkerIfNeeded(MakeTags(TEXT("Props")),
+                                PlainPropsProfileTags);
+    TestEqual(TEXT("没有第三方来源时不补标记（仍 Props）"),
+              ResolveEnvironmentAssetProfile(PlainPropsProfileTags).FolderName,
+              FString(TEXT("Props")));
+
+    // 第三方 + Kits / Destructible / MEGA（2026-10-28 定稿）：同样按 Dressing 档 →
+    // Objects（再追加 ThirdParty 层），不带分类前缀、使用高分辨率预设。
+    TArray<FString> ThirdPartyKitTags;
+    ThirdPartyKitTags.Add(TEXT("Kits"));
+    ThirdPartyKitTags.Add(TEXT("ThirdParty"));
+    const FEnvironmentAssetProfile ThirdPartyKitProfile =
+        ResolveEnvironmentAssetProfile(ThirdPartyKitTags);
+    TestEqual(TEXT("第三方 Kits 落 Objects 分类"), ThirdPartyKitProfile.FolderName,
+              FString(TEXT("Objects")));
+    TestTrue(TEXT("第三方 Kits 不带 Kit 命名段"),
+             ThirdPartyKitProfile.TypePrefix.IsEmpty());
+    TestTrue(TEXT("第三方 Kits 使用高分辨率预设"),
+             ThirdPartyKitProfile.bHighResPreset);
+    TArray<FString> ThirdPartyDestructibleTags;
+    ThirdPartyDestructibleTags.Add(TEXT("Destructible"));
+    ThirdPartyDestructibleTags.Add(TEXT("ThirdParty"));
+    const FEnvironmentAssetProfile ThirdPartyDestructibleProfile =
+        ResolveEnvironmentAssetProfile(ThirdPartyDestructibleTags);
+    TestEqual(TEXT("第三方 Destructible 落 Objects 分类"),
+              ThirdPartyDestructibleProfile.FolderName, FString(TEXT("Objects")));
+    TestTrue(TEXT("第三方 Destructible 不带 Dest 命名段"),
+             ThirdPartyDestructibleProfile.TypePrefix.IsEmpty());
+    TArray<FString> ThirdPartyMegaTags;
+    ThirdPartyMegaTags.Add(TEXT("MEGA"));
+    ThirdPartyMegaTags.Add(TEXT("ThirdParty"));
+    const FEnvironmentAssetProfile ThirdPartyMegaProfile =
+        ResolveEnvironmentAssetProfile(ThirdPartyMegaTags);
+    TestEqual(TEXT("第三方 MEGA 落 Objects 分类"), ThirdPartyMegaProfile.FolderName,
+              FString(TEXT("Objects")));
+    TestFalse(TEXT("第三方 MEGA 不再标记 bMega"), ThirdPartyMegaProfile.bMega);
+    TestEqual(TEXT("第三方 Kits 命名按 Dressing（Env_<名>_<ID>）"),
+              BuildEnvironmentObjectStem(ThirdPartyKitProfile, TEXT("Bucket"),
+                                         TEXT("abc123")),
+              FString(TEXT("Env_Bucket_abc123")));
+    TestEqual(TEXT("非第三方 Kits 仍落 Kits 分类"),
+              ResolveEnvironmentAssetProfile(MakeTags(TEXT("Kits"))).FolderName,
+              FString(TEXT("Kits")));
+    TestEqual(TEXT("非第三方 MEGA 仍落 MEGA 分类"),
+              ResolveEnvironmentAssetProfile(MakeTags(TEXT("MEGA"))).FolderName,
+              FString(TEXT("MEGA")));
+
+    // Temp + Props（2026-10-28 定稿）：走 Dressing 流程 —— Objects/Temp、命名不带 Prop 段、
+    // 高分辨率预设，并套 Dressing 的 Nanite 减面预算（bScanSourceAsset 认 Dressing 档）。
+    TArray<FString> TempPropsTags;
+    TempPropsTags.Add(TEXT("Props"));
+    TempPropsTags.Add(TEXT("Temp"));
+    const FEnvironmentAssetProfile TempPropsProfile =
+        ResolveEnvironmentAssetProfile(TempPropsTags);
+    TestEqual(TEXT("Temp + Props 走 Dressing 档"), TempPropsProfile.TypeKey,
+              FString(TEXT("Dressing")));
+    TestEqual(TEXT("Temp + Props 分类目录为 Objects"),
+              TempPropsProfile.FolderName, FString(TEXT("Objects")));
+    TestTrue(TEXT("Temp + Props 使用高分辨率预设"),
+             TempPropsProfile.bHighResPreset);
+    TestEqual(TEXT("Temp + Props 命名不带 Prop 段"),
+              BuildEnvironmentObjectStem(TempPropsProfile, TEXT("Bucket"),
+                                         TEXT("abc123")),
+              FString(TEXT("Env_Temp_Bucket_abc123")));
+    TestEqual(TEXT("Temp + Props 落 Objects/Temp"),
+              ResolveTempCategoryFolder(TEXT("Objects"), TempPropsProfile.bTemp,
+                                        false),
+              FString(TEXT("Objects/Temp")));
 
     // 目录拼接：追加在原本路径末尾；空分类时 ThirdParty 直接作为分类目录。
     TestEqual(TEXT("3D Assets 第三方目录为 Objects/ThirdParty"),
@@ -8657,8 +8854,10 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
         ResolveEnvironmentAssetProfile(TempProfileTags);
     TestTrue(TEXT("Temp 标记在只出现在 tags 时仍生效"),
              TempPbrMaxProfile.bTemp);
-    TestEqual(TEXT("Temp + PBRMAX 落 Objects/Temp"),
-              TempPbrMaxProfile.SourceFolder, FString(TEXT("Temp")));
+    TestEqual(TEXT("Temp 资产落分类下的 Temp 子目录（Objects/Temp）"),
+              ResolveTempCategoryFolder(TEXT("Objects"), TempPbrMaxProfile.bTemp,
+                                        false),
+              FString(TEXT("Objects/Temp")));
   }
   // 资产名自带 Env_ 前缀时不得再拼一次（Zion 资产目录里常见 "Env_diaodeng"）。
   TestEqual(TEXT("Asset name with Env_ prefix is not double-prefixed"),
@@ -9053,6 +9252,10 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
   const int32 SavedMaxTriangles = Settings->Asset3DMaxLOD0Triangles;
   const int32 SavedLargeTriangles = Settings->Asset3DLargeMaxLOD0Triangles;
   const float SavedThreshold = Settings->Asset3DLargeSizeThresholdCm;
+  const int32 SavedPropsTriangles = Settings->Asset3DPropsMaxLOD0Triangles;
+  const int32 SavedKitsTriangles = Settings->Asset3DKitsMaxLOD0Triangles;
+  const int32 SavedMegaTriangles = Settings->Asset3DMegaMaxLOD0Triangles;
+  const int32 SavedDestructibleTriangles = Settings->Asset3DDestructibleMaxLOD0Triangles;
 
   // 4 m asset, well inside the default 300k spec: Nanite stays untouched.
   UStaticMesh *SmallMesh = MakeGridMesh(10.0f, TEXT("AssetHiveSmallProbe"));
@@ -9103,9 +9306,80 @@ bool FAssetHiveMeshTriangleBudgetTest::RunTest(const FString &Parameters) {
                                     static_cast<float>(SourceTriangles),
                                 0.001f));
 
+  // Props 固定预算（2026-10-28）：与尺寸无关，直接使用 override。
+  UStaticMesh *PropsMesh = MakeGridMesh(10.0f, TEXT("AssetHivePropsProbe"));
+  FGCObjectScopeGuard PropsMeshGuard(PropsMesh);
+  Settings->Asset3DPropsMaxLOD0Triangles = SmallBudget;
+  FString PropsSummary;
+  TestTrue(TEXT("Props fixed budget overrides the size-based spec"),
+           ApplyNaniteTriangleBudget(PropsMesh, PropsSummary, SmallBudget));
+  TestTrue(TEXT("Props keep percentage follows the fixed budget"),
+           FMath::IsNearlyEqual(GetMutableNaniteSettings(PropsMesh)->KeepPercentTriangles,
+                                static_cast<float>(SmallBudget) /
+                                    static_cast<float>(SourceTriangles),
+                                0.001f));
+
+  // Kits / MEGA 固定预算（2026-10-28）：10 万面，与尺寸无关。
+  UStaticMesh *KitsMesh = MakeGridMesh(10.0f, TEXT("AssetHiveKitsProbe"));
+  FGCObjectScopeGuard KitsMeshGuard(KitsMesh);
+  Settings->Asset3DKitsMaxLOD0Triangles = SmallBudget;
+  FString KitsSummary;
+  TestTrue(TEXT("Kits fixed budget overrides the size-based spec"),
+           ApplyNaniteTriangleBudget(
+               KitsMesh, KitsSummary,
+               UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles()));
+  TestTrue(TEXT("Kits keep percentage follows the fixed budget"),
+           FMath::IsNearlyEqual(GetMutableNaniteSettings(KitsMesh)->KeepPercentTriangles,
+                                static_cast<float>(SmallBudget) /
+                                    static_cast<float>(SourceTriangles),
+                                0.001f));
+  UStaticMesh *MegaMesh = MakeGridMesh(10.0f, TEXT("AssetHiveMegaProbe"));
+  FGCObjectScopeGuard MegaMeshGuard(MegaMesh);
+  Settings->Asset3DMegaMaxLOD0Triangles = SmallBudget;
+  FString MegaSummary;
+  TestTrue(TEXT("MEGA fixed budget overrides the size-based spec"),
+           ApplyNaniteTriangleBudget(
+               MegaMesh, MegaSummary,
+               UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles()));
+  TestTrue(TEXT("MEGA keep percentage follows the fixed budget"),
+           FMath::IsNearlyEqual(GetMutableNaniteSettings(MegaMesh)->KeepPercentTriangles,
+                                static_cast<float>(SmallBudget) /
+                                    static_cast<float>(SourceTriangles),
+                                0.001f));
+
+  // Destructible 固定预算（2026-10-28）：10 万面，与尺寸无关。
+  UStaticMesh *DestructibleMesh =
+      MakeGridMesh(10.0f, TEXT("AssetHiveDestructibleProbe"));
+  FGCObjectScopeGuard DestructibleMeshGuard(DestructibleMesh);
+  Settings->Asset3DDestructibleMaxLOD0Triangles = SmallBudget;
+  FString DestructibleSummary;
+  TestTrue(TEXT("Destructible fixed budget overrides the size-based spec"),
+           ApplyNaniteTriangleBudget(
+               DestructibleMesh, DestructibleSummary,
+               UAssetHiveSettings::GetAsset3DDestructibleMaxLOD0Triangles()));
+  TestTrue(TEXT("Destructible keep percentage follows the fixed budget"),
+           FMath::IsNearlyEqual(GetMutableNaniteSettings(DestructibleMesh)->KeepPercentTriangles,
+                                static_cast<float>(SmallBudget) /
+                                    static_cast<float>(SourceTriangles),
+                                0.001f));
+
+  // 5 m 分档边界（2026-10-28）：≥ 阈值用大件预算，略低于阈值用常规预算。
+  TestEqual(TEXT("Threshold boundary uses the large budget"),
+            ResolveScanSourceTriangleBudget(
+                UAssetHiveSettings::GetAsset3DLargeSizeThresholdCm()),
+            UAssetHiveSettings::GetAsset3DLargeMaxLOD0Triangles());
+  TestEqual(TEXT("Just below the threshold uses the standard budget"),
+            ResolveScanSourceTriangleBudget(
+                UAssetHiveSettings::GetAsset3DLargeSizeThresholdCm() - 0.1f),
+            UAssetHiveSettings::GetAsset3DMaxLOD0Triangles());
+
   Settings->Asset3DMaxLOD0Triangles = SavedMaxTriangles;
   Settings->Asset3DLargeMaxLOD0Triangles = SavedLargeTriangles;
   Settings->Asset3DLargeSizeThresholdCm = SavedThreshold;
+  Settings->Asset3DPropsMaxLOD0Triangles = SavedPropsTriangles;
+  Settings->Asset3DKitsMaxLOD0Triangles = SavedKitsTriangles;
+  Settings->Asset3DMegaMaxLOD0Triangles = SavedMegaTriangles;
+  Settings->Asset3DDestructibleMaxLOD0Triangles = SavedDestructibleTriangles;
   return true;
 }
 

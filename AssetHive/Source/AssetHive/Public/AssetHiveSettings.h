@@ -16,159 +16,193 @@ public:
     UAssetHiveSettings();
     virtual FName GetCategoryName() const override { return TEXT("Plugins"); }
 
-    UPROPERTY(EditAnywhere, config, Category="Import", meta=(DisplayName="Import Root Path", ToolTip="Destination for new imports. Default: Content/AssetHive. Accepts Content/MyAssets or /Game/MyAssets. Existing assets are not moved."))
+    // ------------------------------------------------------------------------
+    // 1. Import：新导入资产的落盘根目录（不移动已导入资产）
+    // ------------------------------------------------------------------------
+    UPROPERTY(EditAnywhere, config, Category="1. Import", meta=(DisplayName="Import Root Path", ToolTip="Destination for new imports. Default: Content/AssetHive. Accepts Content/MyAssets or /Game/MyAssets. Existing assets are not moved."))
     FString ImportRootPath;
 
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for Surface exports. Default: /Game/MaterialLibrary/Environment/MI_Tiling/MI_Env_Tiling_VT_Simple.MI_Env_Tiling_VT_Simple"))
-    TSoftObjectPtr<UMaterialInterface> SurfaceParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Material Name Prefix", ToolTip="Prefix for generated Surface material instances. Default: MI_Env_Tile_"))
-    FString SurfaceMaterialNamePrefix;
-
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="BCR Texture Parameter", ToolTip="Texture parameter receiving packed BaseColor RGB + Roughness A."))
-    FString SurfaceBCRParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Normal texture."))
-    FString SurfaceNormalParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Metallic Texture Parameter", ToolTip="Texture parameter receiving the Metallic texture."))
-    FString SurfaceMetallicParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Emissive Texture Parameter", ToolTip="Texture parameter receiving the Emissive texture."))
-    FString SurfaceEmissiveParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Use Metallic Switch", ToolTip="Static switch enabled when a Metallic texture is present."))
-    FString SurfaceUseMetallicSwitch;
-
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Use Emissive Switch", ToolTip="Static switch enabled when an Emissive texture is present."))
-    FString SurfaceUseEmissiveSwitch;
-
-    UPROPERTY(EditAnywhere, config, Category="Surface Material", meta=(DisplayName="Tiling Parameter", ToolTip="Vector parameter receiving Base Tiling in XY and zero offset in ZW."))
-    FString SurfaceTilingParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Normal Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for normal Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_VT.MI_Env_Decal_VT"))
-    TSoftObjectPtr<UMaterialInterface> DecalParentMaterial;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Parallax Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for parallax (POM) Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_VT.MI_Env_POMDecal_VT"))
-    TSoftObjectPtr<UMaterialInterface> DecalPOMParentMaterial;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Triplanar Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for triplanar Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_Tri_VT.MI_Env_Decal_Tri_VT"))
-    TSoftObjectPtr<UMaterialInterface> DecalTriPlanarParentMaterial;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Triplanar Parallax Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for triplanar parallax Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_Tri_VT.MI_Env_POMDecal_Tri_VT"))
-    TSoftObjectPtr<UMaterialInterface> DecalTriPlanarPOMParentMaterial;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Material Name Prefix", ToolTip="Prefix for generated Decal material instances. Default: MI_Env_Decal_"))
-    FString DecalMaterialNamePrefix;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the Decal diffuse texture. Default: Diffuse_VT"))
-    FString DecalDiffuseParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Decal normal texture. Default: Normal_VT"))
-    FString DecalNormalParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="OpacityMasked Texture Parameter", ToolTip="Texture parameter receiving the Decal opacity mask texture. Default: OpacityMasked_VT"))
-    FString DecalOpacityParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="ORM Texture Parameter", ToolTip="Texture parameter receiving AO/Roughness/Metallic packed in RGB. Default: ORM_VT"))
-    FString DecalORMTextureParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Displacement Texture Parameter", ToolTip="Texture parameter receiving the 1K non-virtual Displacement texture for POM Decals. Default: Displacement"))
-    FString DecalDisplacementParameter;
-
-    UPROPERTY(EditAnywhere, config, Category="Decal Material", meta=(DisplayName="Use Opacity Texture Switch", ToolTip="Static switch enabled when an OpacityMasked texture is present. Default: Opacity_UseOpacityTex"))
-    FString DecalUseOpacityTextureSwitch;
-
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Base Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Props, Kits and default Objects 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_VT_Simple.MI_Env_Base_VT_Simple"))
+    // ------------------------------------------------------------------------
+    // 2. 3D Assets / Material：3D 资产母材质与材质参数名
+    // ------------------------------------------------------------------------
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Base Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Props, Kits and default Objects 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_VT_Simple.MI_Env_Base_VT_Simple"))
     TSoftObjectPtr<UMaterialInterface> AssetBaseParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Base Masked Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Base-family 3D assets whose Mask texture carries opacity. Default: /Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_Masked_VT_Simple.MI_Env_Base_Masked_VT_Simple"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Base Masked Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Base-family 3D assets whose Mask texture carries opacity. Default: /Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_Masked_VT_Simple.MI_Env_Base_Masked_VT_Simple"))
     TSoftObjectPtr<UMaterialInterface> AssetBaseMaskedParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Destructible Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Fixed parent MI used for Destructible 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Destructible/MI_Env_Destructible_VT_UV.MI_Env_Destructible_VT_UV"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Destructible Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Fixed parent MI used for Destructible 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Destructible/MI_Env_Destructible_VT_UV.MI_Env_Destructible_VT_UV"))
     TSoftObjectPtr<UMaterialInterface> AssetDestructibleParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="MEGA Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Fixed parent MI used for MEGA 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Mega/MI_Env_Mega.MI_Env_Mega"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="MEGA Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Fixed parent MI used for MEGA 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Mega/MI_Env_Mega.MI_Env_Mega"))
     TSoftObjectPtr<UMaterialInterface> AssetMegaParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the 3D asset Diffuse texture. Default: Diffuse_VT"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the 3D asset Diffuse texture. Default: Diffuse_VT"))
     FString AssetAlbedoParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the 3D asset Normal texture. Default: Normal_VT"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the 3D asset Normal texture. Default: Normal_VT"))
     FString AssetNormalParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="ORM Texture Parameter", ToolTip="Texture parameter receiving AO/Roughness/Metallic packed in RGB. Default: ORM_VT"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="ORM Texture Parameter", ToolTip="Texture parameter receiving AO/Roughness/Metallic packed in RGB. Default: ORM_VT"))
     FString AssetORMTextureParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Base Masked Texture Parameter", ToolTip="Texture parameter receiving OpacityMasked for the Base Masked parent. Default: Mask_VT"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Base Masked Texture Parameter", ToolTip="Texture parameter receiving OpacityMasked for the Base Masked parent. Default: Mask_VT"))
     FString AssetMaskParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="MEGA UV2 Mask Texture Parameter", ToolTip="Texture parameter receiving the MEGA UV2 Mask texture. Default: Mega Mask_UV2"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="MEGA UV2 Mask Texture Parameter", ToolTip="Texture parameter receiving the MEGA UV2 Mask texture. Default: Mega Mask_UV2"))
     FString AssetMegaMaskParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Emissive Texture Parameter", ToolTip="Texture parameter receiving Emissive for Base/MEGA parents. Default: Emissive_Tex_VT"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Emissive Texture Parameter", ToolTip="Texture parameter receiving Emissive for Base/MEGA parents. Default: Emissive_Tex_VT"))
     FString AssetEmissiveParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Destructible Emissive Texture Parameter", ToolTip="Texture parameter receiving Emissive for the Destructible parent. Default: Emissive_Tex"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Destructible Emissive Texture Parameter", ToolTip="Texture parameter receiving Emissive for the Destructible parent. Default: Emissive_Tex"))
     FString AssetDestructibleEmissiveParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Material", meta=(DisplayName="Use Emissive Switch", ToolTip="Optional static switch enabled when an Emissive texture is present."))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Use Emissive Switch", ToolTip="Optional static switch enabled when an Emissive texture is present."))
     FString AssetUseEmissiveSwitch;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Mesh", meta=(DisplayName="Megascans / PBRMAX Max LOD0 Triangles", ToolTip="Dressing mesh spec triangle budget. Megascans and PBRMAX 3D assets are decimated on import so the stored LOD0 source geometry stays inside this limit. Default: 300000"))
+
+    // ------------------------------------------------------------------------
+    // 2. 3D Assets / Mesh：Nanite 面数预算、大件阈值与导入网格处理
+    // ------------------------------------------------------------------------
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Dressing / ThirdParty Max LOD0 Triangles", ToolTip="Dressing mesh spec triangle budget. Dressing assets and third-party 3D assets (ThirdParty / Megascans / PBRMAX) are decimated on import so the stored LOD0 source geometry stays inside this limit. Default: 300000"))
     int32 Asset3DMaxLOD0Triangles = 300000;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Mesh", meta=(DisplayName="Megascans / PBRMAX Large Asset Max LOD0 Triangles", ToolTip="Triangle budget used when the asset is larger than the large asset size threshold. Default: 550000"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Dressing / ThirdParty Large Asset Max LOD0 Triangles", ToolTip="Triangle budget used when the asset is at or above the large asset size threshold on any axis. Default: 550000"))
     int32 Asset3DLargeMaxLOD0Triangles = 550000;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Mesh", meta=(DisplayName="Large Asset Size Threshold (cm)", ToolTip="Assets whose largest bounding box axis exceeds this size use the large asset triangle budget. Default: 1000 (10 m)"))
-    float Asset3DLargeSizeThresholdCm = 1000.0f;
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Large Asset Size Threshold (cm)", ToolTip="Assets whose largest bounding box axis is at or above this size use the large asset triangle budget. Default: 500 (5 m)"))
+    float Asset3DLargeSizeThresholdCm = 500.0f;
 
-    UPROPERTY(EditAnywhere, config, Category="3D Asset Mesh", meta=(DisplayName="Missing Smoothing Group Angle (deg)", ClampMin="0.0", ClampMax="180.0", ToolTip="When a 3D Asset FBX has no smoothing-group layer, edges above this angle are marked hard while imported vertex normals are preserved. Recompute Normals remains disabled. Foliage is excluded. Default: 60"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Props Max LOD0 Triangles", ToolTip="Props 3D assets use a fixed triangle budget on import, independent of size. Default: 150000"))
+    int32 Asset3DPropsMaxLOD0Triangles = 150000;
+
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Kits Max LOD0 Triangles", ToolTip="Kits 3D assets use a fixed triangle budget on import, independent of size. Default: 100000"))
+    int32 Asset3DKitsMaxLOD0Triangles = 100000;
+
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="MEGA Max LOD0 Triangles", ToolTip="MEGA 3D assets use a fixed triangle budget on import, independent of size. Default: 100000"))
+    int32 Asset3DMegaMaxLOD0Triangles = 100000;
+
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Destructible Max LOD0 Triangles", ToolTip="Destructible 3D assets use a fixed triangle budget on import, independent of size. Default: 100000"))
+    int32 Asset3DDestructibleMaxLOD0Triangles = 100000;
+
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Missing Smoothing Group Angle (deg)", ClampMin="0.0", ClampMax="180.0", ToolTip="When a 3D Asset FBX has no smoothing-group layer, edges above this angle are marked hard while imported vertex normals are preserved. Recompute Normals remains disabled. Foliage is excluded. Default: 60"))
     float Asset3DMissingSmoothingAngleDegrees = 60.0f;
 
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Atlas Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Atlas texture groups (masked foliage). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_Masked_ST_VT.MI_Env_GrassBend_Masked_ST_VT"))
+    // ------------------------------------------------------------------------
+    // 3. 3D Plants / Material：植被母材质与材质参数名
+    // ------------------------------------------------------------------------
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Atlas Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Atlas texture groups (masked foliage). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_Masked_ST_VT.MI_Env_GrassBend_Masked_ST_VT"))
     TSoftObjectPtr<UMaterialInterface> PlantAtlasParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Billboard Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Billboard texture groups. Defaults to the Atlas parent so the two texture sets still produce separate material instances."))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Billboard Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for 3D Plant Billboard texture groups. Defaults to the Atlas parent so the two texture sets still produce separate material instances."))
     TSoftObjectPtr<UMaterialInterface> PlantBillboardParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Atlas Material Name Prefix", ToolTip="Prefix for 3D Plant Atlas material instances. Default: MI_"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Atlas Material Name Prefix", ToolTip="Prefix for 3D Plant Atlas material instances. Default: MI_"))
     FString PlantAtlasMaterialNamePrefix;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Billboard Material Name Prefix", ToolTip="Prefix for 3D Plant Billboard material instances. Default: MI_Billboard_"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Billboard Material Name Prefix", ToolTip="Prefix for 3D Plant Billboard material instances. Default: MI_Billboard_"))
     FString PlantBillboardMaterialNamePrefix;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the Plant Diffuse texture T_..._D (albedo used as diffuse). Default: Diffuse_VT"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the Plant Diffuse texture T_..._D (albedo used as diffuse). Default: Diffuse_VT"))
     FString PlantDiffuseParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Plant Normal texture T_..._N. Default: Normal_VT"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Plant Normal texture T_..._N. Default: Normal_VT"))
     FString PlantNormalParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="ORM Texture Parameter", ToolTip="Texture parameter receiving the Plant ORM texture T_..._ORM. Default: ORM_VT"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="ORM Texture Parameter", ToolTip="Texture parameter receiving the Plant ORM texture T_..._ORM. Default: ORM_VT"))
     FString PlantORMParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="OpacityMasked Texture Parameter", ToolTip="Texture parameter receiving the Plant OpacityMasked texture T_..._O (masked foliage only). Default: OpacityMasked_VT"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="OpacityMasked Texture Parameter", ToolTip="Texture parameter receiving the Plant OpacityMasked texture T_..._O (masked foliage only). Default: OpacityMasked_VT"))
     FString PlantOpacityMaskedParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Use OpacityMasked Switch", ToolTip="Static switch enabled when masked foliage carries an OpacityMasked texture. Default: Use OpacityMasked"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Use OpacityMasked Switch", ToolTip="Static switch enabled when masked foliage carries an OpacityMasked texture. Default: Use OpacityMasked"))
     FString PlantUseOpacityMaskedSwitch;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SubsurfaceColor Texture Parameter", ToolTip="Texture parameter receiving the Plant SubsurfaceColor (SSC) texture T_..._SSC; the Megascans Translucency (T) map fills this slot. Resolved on the parent material (GrassBend Opaque/Masked = SubsurfaceColor_VT, Tree/Bush/Grass = SubsurfaceColor_VT). Default: SubsurfaceColor_VT"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="SubsurfaceColor Texture Parameter", ToolTip="Texture parameter receiving the Plant SubsurfaceColor (SSC) texture T_..._SSC; the Megascans Translucency (T) map fills this slot. Resolved on the parent material (GrassBend Opaque/Masked = SubsurfaceColor_VT, Tree/Bush/Grass = SubsurfaceColor_VT). Default: SubsurfaceColor_VT"))
     FString PlantSubsurfaceParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for cut _OPAQUE foliage variants (grass and bush). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT; leaving it empty falls back to the same default."))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Opaque Variant Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for cut _OPAQUE foliage variants (grass and bush). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_ST_VT.MI_Env_GrassBend_ST_VT; leaving it empty falls back to the same default."))
     TSoftObjectPtr<UMaterialInterface> PlantOpaqueParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SpeedTree Grass Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant grass assets that carry synthetic SpeedTree wind data (branch1). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Grass_ST_VT"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="SpeedTree Grass Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant grass assets that carry synthetic SpeedTree wind data (branch1). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Grass_ST_VT"))
     TSoftObjectPtr<UMaterialInterface> PlantGrassSTParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SpeedTree Bush Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant bush assets that carry synthetic SpeedTree wind data (branch1 + branch2 remapped to UV3). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Bush_ST_VT"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="SpeedTree Bush Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant bush assets that carry synthetic SpeedTree wind data (branch1 + branch2 remapped to UV3). Default: /Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Bush_ST_VT"))
     TSoftObjectPtr<UMaterialInterface> PlantBushSTParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="Plant Material", meta=(DisplayName="SpeedTree Fern Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant fern assets that carry synthetic SpeedTree wind data (contact-connected fronds merged, branch1 only). Defaults to the Grass ST parent until a dedicated fern MI is assigned here."))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="SpeedTree Fern Wind Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Parent MI used for Megascans 3D Plant fern assets that carry synthetic SpeedTree wind data (contact-connected fronds merged, branch1 only). Defaults to the Grass ST parent until a dedicated fern MI is assigned here."))
     TSoftObjectPtr<UMaterialInterface> PlantFernSTParentMaterial;
+
+
+    // ------------------------------------------------------------------------
+    // 4. Surface / Material：Surface 母材质与材质参数名
+    // ------------------------------------------------------------------------
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for Surface exports. Default: /Game/MaterialLibrary/Environment/MI_Tiling/MI_Env_Tiling_VT_Simple.MI_Env_Tiling_VT_Simple"))
+    TSoftObjectPtr<UMaterialInterface> SurfaceParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Material Name Prefix", ToolTip="Prefix for generated Surface material instances. Default: MI_Env_Tile_"))
+    FString SurfaceMaterialNamePrefix;
+
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="BCR Texture Parameter", ToolTip="Texture parameter receiving packed BaseColor RGB + Roughness A."))
+    FString SurfaceBCRParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Normal texture."))
+    FString SurfaceNormalParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Metallic Texture Parameter", ToolTip="Texture parameter receiving the Metallic texture."))
+    FString SurfaceMetallicParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Emissive Texture Parameter", ToolTip="Texture parameter receiving the Emissive texture."))
+    FString SurfaceEmissiveParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Use Metallic Switch", ToolTip="Static switch enabled when a Metallic texture is present."))
+    FString SurfaceUseMetallicSwitch;
+
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Use Emissive Switch", ToolTip="Static switch enabled when an Emissive texture is present."))
+    FString SurfaceUseEmissiveSwitch;
+
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Tiling Parameter", ToolTip="Vector parameter receiving Base Tiling in XY and zero offset in ZW."))
+    FString SurfaceTilingParameter;
+
+
+    // ------------------------------------------------------------------------
+    // 5. Decal / Material：Decal 母材质与材质参数名
+    // ------------------------------------------------------------------------
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Normal Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for normal Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_VT.MI_Env_Decal_VT"))
+    TSoftObjectPtr<UMaterialInterface> DecalParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Parallax Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for parallax (POM) Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_VT.MI_Env_POMDecal_VT"))
+    TSoftObjectPtr<UMaterialInterface> DecalPOMParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Triplanar Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for triplanar Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_Tri_VT.MI_Env_Decal_Tri_VT"))
+    TSoftObjectPtr<UMaterialInterface> DecalTriPlanarParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Triplanar Parallax Decal Parent Material Instance", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Project-side parent MI used for triplanar parallax Decal exports. Default: /Game/MaterialLibrary/Environment/MI_Decal/MI_Env_POMDecal_Tri_VT.MI_Env_POMDecal_Tri_VT"))
+    TSoftObjectPtr<UMaterialInterface> DecalTriPlanarPOMParentMaterial;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Material Name Prefix", ToolTip="Prefix for generated Decal material instances. Default: MI_Env_Decal_"))
+    FString DecalMaterialNamePrefix;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the Decal diffuse texture. Default: Diffuse_VT"))
+    FString DecalDiffuseParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Decal normal texture. Default: Normal_VT"))
+    FString DecalNormalParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="OpacityMasked Texture Parameter", ToolTip="Texture parameter receiving the Decal opacity mask texture. Default: OpacityMasked_VT"))
+    FString DecalOpacityParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="ORM Texture Parameter", ToolTip="Texture parameter receiving AO/Roughness/Metallic packed in RGB. Default: ORM_VT"))
+    FString DecalORMTextureParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Displacement Texture Parameter", ToolTip="Texture parameter receiving the 1K non-virtual Displacement texture for POM Decals. Default: Displacement"))
+    FString DecalDisplacementParameter;
+
+    UPROPERTY(EditAnywhere, config, Category="5. Decal|Material", meta=(DisplayName="Use Opacity Texture Switch", ToolTip="Static switch enabled when an OpacityMasked texture is present. Default: Opacity_UseOpacityTex"))
+    FString DecalUseOpacityTextureSwitch;
 
     static bool IsValidImportRootPath(const FString& Path);
     static FString GetDefaultImportRootPath();
@@ -206,6 +240,10 @@ public:
     static int32 GetAsset3DMaxLOD0Triangles();
     static int32 GetAsset3DLargeMaxLOD0Triangles();
     static float GetAsset3DLargeSizeThresholdCm();
+    static int32 GetAsset3DPropsMaxLOD0Triangles();
+    static int32 GetAsset3DKitsMaxLOD0Triangles();
+    static int32 GetAsset3DMegaMaxLOD0Triangles();
+    static int32 GetAsset3DDestructibleMaxLOD0Triangles();
     static float GetAsset3DMissingSmoothingAngle();
     static FString GetDefaultPlantAtlasParentMaterialPath();
     static FString GetDefaultPlantOpaqueParentMaterialPath();

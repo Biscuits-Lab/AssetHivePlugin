@@ -40,7 +40,13 @@ UAssetHiveSettings::UAssetHiveSettings()
     AssetUseEmissiveSwitch = TEXT("UseEmissive");
     Asset3DMaxLOD0Triangles = 300000;
     Asset3DLargeMaxLOD0Triangles = 550000;
-    Asset3DLargeSizeThresholdCm = 1000.0f;
+    // 2026-10-28：Dressing 规格按 5 m 分档（≥5m 用大件预算）；Props 固定 15 万面，
+    // Kits / MEGA / Destructible 固定 10 万面。
+    Asset3DLargeSizeThresholdCm = 500.0f;
+    Asset3DPropsMaxLOD0Triangles = 150000;
+    Asset3DKitsMaxLOD0Triangles = 100000;
+    Asset3DMegaMaxLOD0Triangles = 100000;
+    Asset3DDestructibleMaxLOD0Triangles = 100000;
     Asset3DMissingSmoothingAngleDegrees = 60.0f;
     // 2026-09-30：项目侧统一使用 GrassBend 植被材质，未裁切（Masked）植被用 Masked 版本。
     PlantAtlasParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_Masked_ST_VT.MI_Env_GrassBend_Masked_ST_VT")));
@@ -350,7 +356,31 @@ int32 UAssetHiveSettings::GetAsset3DLargeMaxLOD0Triangles()
 float UAssetHiveSettings::GetAsset3DLargeSizeThresholdCm()
 {
     const float Value = GetDefault<UAssetHiveSettings>()->Asset3DLargeSizeThresholdCm;
-    return Value > 0.0f ? Value : 1000.0f;
+    return Value > 0.0f ? Value : 500.0f;
+}
+
+int32 UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles()
+{
+    const int32 Value = GetDefault<UAssetHiveSettings>()->Asset3DPropsMaxLOD0Triangles;
+    return Value > 0 ? Value : 150000;
+}
+
+int32 UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles()
+{
+    const int32 Value = GetDefault<UAssetHiveSettings>()->Asset3DKitsMaxLOD0Triangles;
+    return Value > 0 ? Value : 100000;
+}
+
+int32 UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles()
+{
+    const int32 Value = GetDefault<UAssetHiveSettings>()->Asset3DMegaMaxLOD0Triangles;
+    return Value > 0 ? Value : 100000;
+}
+
+int32 UAssetHiveSettings::GetAsset3DDestructibleMaxLOD0Triangles()
+{
+    const int32 Value = GetDefault<UAssetHiveSettings>()->Asset3DDestructibleMaxLOD0Triangles;
+    return Value > 0 ? Value : 100000;
 }
 
 float UAssetHiveSettings::GetAsset3DMissingSmoothingAngle()
