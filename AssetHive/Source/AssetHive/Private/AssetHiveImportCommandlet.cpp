@@ -1550,6 +1550,41 @@ static bool IsScanSourceTags(const TArray<FString> &Tags) {
          HasAssetTag(Tags, TEXT("第三方"));
 }
 
+// Zion 资产判定（2026-10-29 提取）：库元数据 zionTags 非空即按 Zion 约定导出。
+// 提取成独立函数是为了让"第三方减面预算"在建档前就能排除 Zion 资产。
+static bool HasZionTaggedAsset(const TSharedPtr<FJsonObject> &AssetObject) {
+  if (!AssetObject.IsValid()) {
+    return false;
+  }
+  const TArray<TSharedPtr<FJsonValue>> *ZionTagValues = nullptr;
+  if (!AssetObject->TryGetArrayField(TEXT("zionTags"), ZionTagValues) ||
+      !ZionTagValues) {
+    return false;
+  }
+  for (const TSharedPtr<FJsonValue> &Value : *ZionTagValues) {
+    FString Tag;
+    if (Value.IsValid() && Value->TryGetString(Tag) &&
+        !Tag.TrimStartAndEnd().IsEmpty()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Dressing 减面预算的适用判定（2026-10-29）：Dressing / 第三方 / 扫描来源的 3D 资产
+// 套 Dressing 规格；**Zion 资产除外** —— Zion + 第三方按 Zion 规则处理，目录不加
+// ThirdParty 层、命名走 Zion 约定，也不做扫描资产的减面收敛。
+static bool ShouldApplyDressingTriangleBudget(bool bIs3DAsset,
+                                              bool bIsZionAsset,
+                                              const TArray<FString> &StandardTags,
+                                              const FString &TypeKey) {
+  if (!bIs3DAsset || bIsZionAsset) {
+    return false;
+  }
+  return IsScanSourceTags(StandardTags) || TypeKey == TEXT("Megascans") ||
+         TypeKey == TEXT("PBRMAX") || TypeKey == TEXT("Dressing");
+}
+
 // 第三方资产的命名沿用旧规则（2026-10-27 约定）：ThirdParty 只作目录层，**不进对象名**。
 // Megascans 来源的 3D 资产历史上是"只用资产 ID"命名（Env_<ID>），标签收紧后来源只留在
 // tags 里，这里按来源标记把旧命名补回来；其它第三方来源维持含资产名的旧命名
@@ -6819,12 +6854,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // tags route them into another asset folder. 标签收紧后 ThirdParty 是标准标记，
     // Megascans / PBRMAX 只留在 tags 里，两者都算扫描来源（见 IsScanSourceTags）。
     // 2026-10-28：Dressing 档（第三方资产、Temp + Props）同样套 Dressing 减面预算。
-    const bool bScanSourceAsset =
-        bIs3DAsset &&
-        (IsScanSourceTags(AssetStandardTags) ||
-         EnvironmentProfile.TypeKey == TEXT("Megascans") ||
-         EnvironmentProfile.TypeKey == TEXT("PBRMAX") ||
-         EnvironmentProfile.TypeKey == TEXT("Dressing"));
+    // 2026-10-29：Zion + 第三方按 Zion 规则处理，不套第三方减面预算。
+    const bool bScanSourceAsset = ShouldApplyDressingTriangleBudget(
+        bIs3DAsset, HasZionTaggedAsset(AssetObject), AssetStandardTags,
+        EnvironmentProfile.TypeKey);
     FString AssetDestinationPath =
         bIs3DAsset ? TEXT("/Game/Environment/Asset") : DestinationPath;
     if (AssetType == TEXT("3dplant")) {
@@ -6843,21 +6876,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // Zion 资产（库元数据 zionTags 非空）走单独导出约定：资产文件夹不带 _<id> 后缀，
     // 且材质实例 / 纹理 / 静态网格体各进独立子目录。第三方资产维持原有命名，
     // 避免与已导入的同名资产互相覆盖。
-    bool bIsZionAsset = false;
-    {
-      const TArray<TSharedPtr<FJsonValue>> *ZionTagValues = nullptr;
-      if (AssetObject->TryGetArrayField(TEXT("zionTags"), ZionTagValues) &&
-          ZionTagValues) {
-        for (const TSharedPtr<FJsonValue> &Value : *ZionTagValues) {
-          FString Tag;
-          if (Value.IsValid() && Value->TryGetString(Tag) &&
-              !Tag.TrimStartAndEnd().IsEmpty()) {
-            bIsZionAsset = true;
-            break;
-          }
-        }
-      }
-    }
+    const bool bIsZionAsset = HasZionTaggedAsset(AssetObject);
     // Env_ 与 Temp_ 都属"前缀层"，不参与名字本身：先把资产名里已有的这两个前缀
     // 按任意叠加顺序全部剥掉，再由下面的规则统一加回（Temp 由 bTemp 决定，
     // Env_ 在对象名前缀处补）。否则 "Env_Temp_stone_rubble_pile" 这类源名
@@ -8752,6 +8771,32 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
               ResolveThirdPartyCategoryFolder(TEXT("Objects/Temp"), true, false,
                                               true),
               FString(TEXT("Objects/Temp")));
+
+    // Zion + 第三方按 Zion 规则处理（2026-10-29）：不追加 ThirdParty 层、也不套第三方减面。
+    TArray<FString> ZionThirdPartyTags;
+    ZionThirdPartyTags.Add(TEXT("ThirdParty"));
+    TestFalse(TEXT("Zion 资产不套 Dressing 减面预算"),
+              ShouldApplyDressingTriangleBudget(true, true, ZionThirdPartyTags,
+                                                TEXT("Objects")));
+    TestTrue(TEXT("非 Zion 第三方资产套 Dressing 减面预算"),
+             ShouldApplyDressingTriangleBudget(true, false, ZionThirdPartyTags,
+                                               TEXT("Objects")));
+    TestFalse(TEXT("非 3D 资产不套 Dressing 减面预算"),
+              ShouldApplyDressingTriangleBudget(false, false, ZionThirdPartyTags,
+                                                TEXT("Objects")));
+    TestTrue(TEXT("Megascans 来源 3D 资产套 Dressing 减面预算"),
+             ShouldApplyDressingTriangleBudget(
+                 true, false, MakeTags(TEXT("Megascans")), TEXT("Objects")));
+    // zionTags 解析：空对象不算 Zion，非空即算。
+    const TSharedPtr<FJsonObject> PlainAssetObject = MakeShared<FJsonObject>();
+    TestFalse(TEXT("无 zionTags 的不是 Zion 资产"),
+              HasZionTaggedAsset(PlainAssetObject));
+    const TSharedPtr<FJsonObject> ZionAssetObject = MakeShared<FJsonObject>();
+    TArray<TSharedPtr<FJsonValue>> ZionTagValues;
+    ZionTagValues.Add(MakeShared<FJsonValueString>(TEXT("zion")));
+    ZionAssetObject->SetArrayField(TEXT("zionTags"), ZionTagValues);
+    TestTrue(TEXT("zionTags 非空的是 Zion 资产"),
+             HasZionTaggedAsset(ZionAssetObject));
 
     // 命名沿用旧规则（2026-10-27）：ThirdParty 只作目录层，不进对象名。
     // Megascans 来源的 3D 资产仍按"只用资产 ID"命名；其它第三方来源保留资产名。
