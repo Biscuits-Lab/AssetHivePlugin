@@ -1443,15 +1443,8 @@ static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
       return Resolved;
     }
     if (HasAssetTag(Tags, TEXT("Props"))) {
-      // Temp + Props（2026-10-28）：走 Dressing 流程 —— 目录 Objects/Temp、命名不带 Prop 段、
-      // 高分辨率预设，并套 Dressing 的 Nanite 减面预算（见 bScanSourceAsset）。
-      if (bTemp) {
-        Resolved.TypeKey = TEXT("Dressing");
-        Resolved.FolderName = TEXT("Objects");
-        Resolved.bBaseFamily = true;
-        Resolved.bHighResPreset = true;
-        return Resolved;
-      }
+      // Temp + Props（2026-10-29 修订）：Temp 只是 Zion 变体与目录层，分类仍按 Props ——
+      // 目录 Props/Temp、命名走 Zion 规格（不带 Prop 段、无 _<ID>）、预算按 Props 固定档。
       Resolved.TypeKey = TEXT("Props");
       Resolved.TypePrefix = TEXT("Prop");
       Resolved.FolderName = TEXT("Props");
@@ -1571,23 +1564,39 @@ static bool HasZionTaggedAsset(const TSharedPtr<FJsonObject> &AssetObject) {
   return false;
 }
 
-// Dressing 减面预算的适用判定（2026-10-29 修订）：Dressing 规则是**绝对兜底** ——
-// 3D 资产先按自身分类档取固定预算（Props 15 万、Kits/MEGA/Destructible 各 10 万），
-// **取不到固定档的一律按 Dressing 规格收敛**（单边 ≥5m 55 万、否则 30 万）：包括
-// Dressing 分类、第三方资产，以及没有任何分类标签的 Objects 资产。
-// Zion 资产仍按 Zion 规则：只有 Dressing 分类吃 300k/550k，其余不套兜底档。
+// 减面档位（2026-10-29 定稿）：3D Assets 里**第三方 asset tag 统一走 Dressing 档**
+// （ThirdParty 标准标签，或 Megascans / PBRMAX 来源标记），只有非第三方资产才按
+// Props / Kits / MEGA / Destructible 这些分类分档；取不到固定档的一律 Dressing 兜底
+// （单边 ≥5m 55 万、否则 30 万），与分类/导出的 tag 规则保持一致。
+//
+// 判定顺序与 ResolveEnvironmentAssetProfile 的分类优先级一致：MEGA → Kits →
+// Destructible → Props；其它标签（Dressing / Objects / 无标签 / Temp / Zion）返回 0。
+static int32 ResolveFixedTriangleBudgetFromTags(const TArray<FString> &Tags) {
+  if (HasAssetTag(Tags, TEXT("MEGA"))) {
+    return UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles();
+  }
+  if (HasAssetTag(Tags, TEXT("Kits")) || HasAssetTag(Tags, TEXT("Kit"))) {
+    return UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles();
+  }
+  if (HasAssetTag(Tags, TEXT("Destructible"))) {
+    return UAssetHiveSettings::GetAsset3DDestructibleMaxLOD0Triangles();
+  }
+  if (HasAssetTag(Tags, TEXT("Props"))) {
+    return UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles();
+  }
+  return 0;
+}
+
+// Dressing 减面预算的适用判定（2026-10-29 定稿）：3D Assets 里第三方 asset tag 统一走
+// Dressing；非第三方才可能拿到分类固定档；取不到固定档的一律 Dressing 兜底。
 static bool ShouldApplyDressingTriangleBudget(bool bIs3DAsset,
-                                              bool bIsZionAsset,
-                                              int32 FixedTriangleBudget,
-                                              const FString &TypeKey) {
+                                              bool bThirdPartyAsset,
+                                              int32 FixedTriangleBudget) {
   if (!bIs3DAsset) {
     return false;
   }
-  if (TypeKey == TEXT("Dressing")) {
+  if (bThirdPartyAsset) {
     return true;
-  }
-  if (bIsZionAsset) {
-    return false;
   }
   return FixedTriangleBudget <= 0;
 }
@@ -6828,6 +6837,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // 所有 Asset Type 都收标签：第三方目录判定对 Surface / Decal 同样生效，而这两类的
     // job 只有 tags、没有 standardAssetTags。
     CollectAssetTags(AssetObject, AssetStandardTags);
+    // 分类用的标签集合（标准 Asset Tag 优先，缺失时回落到合并 tags）。3D 资产的分类
+    // 与减面档位都基于这一份，避免两处口径漂移。
+    TArray<FString> EnvironmentProfileTags;
+    CollectEnvironmentProfileTags(AssetObject, AssetStandardTags,
+                                  EnvironmentProfileTags);
+    AddThirdPartyMarkerIfNeeded(AssetStandardTags, EnvironmentProfileTags);
     // 第三方目录判定（2026-10-27）：3D Assets / 3D Plants / Surface / Decal 都在原本导出
     // 路径末尾追加 ThirdParty（Objects/ThirdParty、Vegetation/Grass/ThirdParty、
     // TilableTex/ThirdParty、Decal/ThirdParty）。HDRI 不追加：它没有标准 Asset Tag，
@@ -6839,14 +6854,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         (bIs3DAsset || AssetType == TEXT("3dplant") || bIsSurface || bIsDecal) &&
         IsThirdPartyAsset(AssetStandardTags);
     if (bIs3DAsset) {
-      // 分类只认标准 Asset Tag（standardAssetTags）；job 的 tags 里混有 assetType /
-      // category 派生词（如 "props"），直接合并会把第三方资产误判成 Props。
-      TArray<FString> EnvironmentProfileTags;
-      CollectEnvironmentProfileTags(AssetObject, AssetStandardTags,
-                                    EnvironmentProfileTags);
       // 第三方 Props（2026-10-28）：来源标记只写在 tags 里（Megascans / PBRMAX）而标准标签
       // 只有 Props 时，也给分类补 ThirdParty 标记，让"第三方 Props 走 Objects 档"对旧载荷生效。
-      AddThirdPartyMarkerIfNeeded(AssetStandardTags, EnvironmentProfileTags);
+      // （标记已在上面统一补齐，这里保留注释说明来源。）
+
       // 命名沿用旧规则（2026-10-27）：ThirdParty 只是目录层，不进对象名；Megascans 来源
       // 的 3D 资产仍按"只用资产 ID"命名（见 ApplyThirdPartyLegacyNaming）。
       EnvironmentProfile = ApplyThirdPartyLegacyNaming(
@@ -6900,29 +6911,19 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
       CategoryFolder = PlantProfile.SubtypeFolder;
     }
-    // 减面档位（2026-10-29 修订）：先取自身分类档的固定预算（Props 15 万、
-    // Kits/MEGA/Destructible 各 10 万）；取不到的一律按 Dressing 规格兜底
-    // （单边 ≥5m 55 万、否则 30 万），覆盖 Dressing 分类、第三方资产与无分类标签的资产。
-    // 档位在这里算好（沿用 EnvironmentProfile.TypeKey），网格阶段直接复用。
+    // 减面档位（2026-10-29 定稿，与 tag 规则对齐）：
+    //   - 3D Assets 里**第三方 asset tag 统一走 Dressing 档**（ThirdParty 标准标签或
+    //     Megascans / PBRMAX 来源标记），即使同时带 Props/Kits/MEGA/Destructible；
+    //   - 只有**非第三方**资产才按 Props 15 万 / Kits、MEGA、Destructible 各 10 万分档；
+    //   - 取不到固定档的一律 Dressing 兜底（单边 ≥5m 55 万、否则 30 万）。
+    const bool bThirdPartyAssetTags = IsThirdPartyAsset(AssetStandardTags);
     int32 FixedTriangleBudget = 0;
-    if (bIs3DAsset) {
-      if (EnvironmentProfile.TypeKey == TEXT("Props")) {
-        FixedTriangleBudget =
-            UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles();
-      } else if (EnvironmentProfile.TypeKey == TEXT("Kits")) {
-        FixedTriangleBudget =
-            UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles();
-      } else if (EnvironmentProfile.TypeKey == TEXT("MEGA")) {
-        FixedTriangleBudget =
-            UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles();
-      } else if (EnvironmentProfile.TypeKey == TEXT("Destructible")) {
-        FixedTriangleBudget =
-            UAssetHiveSettings::GetAsset3DDestructibleMaxLOD0Triangles();
-      }
+    if (bIs3DAsset && !bThirdPartyAssetTags) {
+      FixedTriangleBudget =
+          ResolveFixedTriangleBudgetFromTags(EnvironmentProfileTags);
     }
     const bool bScanSourceAsset = ShouldApplyDressingTriangleBudget(
-        bIs3DAsset, HasZionTaggedAsset(AssetObject), FixedTriangleBudget,
-        EnvironmentProfile.TypeKey);
+        bIs3DAsset, bThirdPartyAssetTags, FixedTriangleBudget);
     FString AssetDestinationPath =
         bIs3DAsset ? TEXT("/Game/Environment/Asset") : DestinationPath;
     if (AssetType == TEXT("3dplant")) {
@@ -6941,7 +6942,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // Zion 资产（库元数据 zionTags 非空）走单独导出约定：资产文件夹不带 _<id> 后缀，
     // 且材质实例 / 纹理 / 静态网格体各进独立子目录。第三方资产维持原有命名，
     // 避免与已导入的同名资产互相覆盖。
-    const bool bIsZionAsset = HasZionTaggedAsset(AssetObject);
+    // Zion 资产判定（2026-10-29 定稿）：
+    //   - **显式 Zion**（zionTags 非空）→ 落 Objects/<zionSubfolder>/，按 Zion 约定导出；
+    //   - **Temp**（带 Temp 标记）是 Zion 的**变体**：导出规格跟随 Zion（无 _<id> 后缀、
+    //     Material/Tex/Mesh 子目录、命名从文件夹名派生），但目录进**自身分类下的 Temp**：
+    //     Props/Temp、Kits/Temp、MEGA/Temp、Destructible/Temp、Objects/Temp。
+    // 两者都不追加 ThirdParty 层（Temp 也不叠第三方层）。
+    const bool bExplicitZionAsset = HasZionTaggedAsset(AssetObject);
+    const bool bTempAsset = HasAssetTag(AssetStandardTags, TEXT("Temp"));
+    const bool bIsZionAsset = bExplicitZionAsset || bTempAsset;
     // Env_ 与 Temp_ 都属"前缀层"，不参与名字本身：先把资产名里已有的这两个前缀
     // 按任意叠加顺序全部剥掉，再由下面的规则统一加回（Temp 由 bTemp 决定，
     // Env_ 在对象名前缀处补）。否则 "Env_Temp_stone_rubble_pile" 这类源名
@@ -7016,18 +7025,18 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     FString ZionCategoryFolder = SafeCategoryFolder;
-    // Temp 子目录（2026-10-28 修订）：Temp 资产在各自分类目录下再建一层 Temp ——
-    // Kits/Temp、Props/Temp、Objects/Temp、MEGA/Temp、Destructible/Temp。
-    // 只对**非 Zion 资产**生效：Zion 资产（zionTags 非空）走用户自选的二级目录体系。
-    const bool bTempCategory = !bIsZionAsset && EnvironmentProfile.bTemp;
-    if (bTempCategory) {
-      ZionCategoryFolder =
-          ResolveTempCategoryFolder(ZionCategoryFolder, true, false);
-    }
-    if (bIsZionAsset && !ZionSubfolder.IsEmpty()) {
+    // Zion 二级目录（2026-10-29 修订）：显式 Zion 先落 Objects/<zionSubfolder>，
+    // Temp 变体再在**其后**追加 Temp 层 —— 组合结果为 Objects/<zionSubfolder>/Temp/…；
+    // 普通 Temp 资产则是 <分类>/Temp（Kits/Temp、Props/Temp、MEGA/Temp、Destructible/Temp）。
+    if (bExplicitZionAsset && !ZionSubfolder.IsEmpty()) {
       ZionCategoryFolder = ZionCategoryFolder.IsEmpty()
                                ? ZionSubfolder
                                : ZionCategoryFolder / ZionSubfolder;
+    }
+    const bool bTempCategory = bTempAsset;
+    if (bTempCategory) {
+      ZionCategoryFolder =
+          ResolveTempCategoryFolder(ZionCategoryFolder, true, false);
     }
     // 第三方目录（2026-10-27）：在原本导出路径的末尾追加一层 ThirdParty ——
     // 3D Assets → Objects/ThirdParty；3D Plants → Vegetation/<子类>/ThirdParty。
@@ -8771,27 +8780,22 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
               ResolveEnvironmentAssetProfile(MakeTags(TEXT("MEGA"))).FolderName,
               FString(TEXT("MEGA")));
 
-    // Temp + Props（2026-10-28 定稿）：走 Dressing 流程 —— Objects/Temp、命名不带 Prop 段、
-    // 高分辨率预设，并套 Dressing 的 Nanite 减面预算（bScanSourceAsset 认 Dressing 档）。
+    // Temp + Props（2026-10-29 定稿）：Temp 是 Zion 变体 —— 分类仍按 Props，
+    // 导出规格跟随 Zion（无 _<ID>、命名从文件夹名派生），目录进 Props/Temp。
     TArray<FString> TempPropsTags;
     TempPropsTags.Add(TEXT("Props"));
     TempPropsTags.Add(TEXT("Temp"));
     const FEnvironmentAssetProfile TempPropsProfile =
         ResolveEnvironmentAssetProfile(TempPropsTags);
-    TestEqual(TEXT("Temp + Props 走 Dressing 档"), TempPropsProfile.TypeKey,
-              FString(TEXT("Dressing")));
-    TestEqual(TEXT("Temp + Props 分类目录为 Objects"),
-              TempPropsProfile.FolderName, FString(TEXT("Objects")));
-    TestTrue(TEXT("Temp + Props 使用高分辨率预设"),
-             TempPropsProfile.bHighResPreset);
-    TestEqual(TEXT("Temp + Props 命名不带 Prop 段"),
-              BuildEnvironmentObjectStem(TempPropsProfile, TEXT("Bucket"),
-                                         TEXT("abc123")),
-              FString(TEXT("Env_Temp_Bucket_abc123")));
-    TestEqual(TEXT("Temp + Props 落 Objects/Temp"),
-              ResolveTempCategoryFolder(TEXT("Objects"), TempPropsProfile.bTemp,
+    TestEqual(TEXT("Temp + Props 分类档仍为 Props"), TempPropsProfile.TypeKey,
+              FString(TEXT("Props")));
+    TestEqual(TEXT("Temp + Props 分类目录为 Props"),
+              TempPropsProfile.FolderName, FString(TEXT("Props")));
+    TestEqual(TEXT("Temp + Props 落 Props/Temp"),
+              ResolveTempCategoryFolder(TEXT("Props"), TempPropsProfile.bTemp,
                                         false),
-              FString(TEXT("Objects/Temp")));
+              FString(TEXT("Props/Temp")));
+    TestTrue(TEXT("Temp 资产带 Temp 标记"), TempPropsProfile.bTemp);
 
     // 目录拼接：追加在原本路径末尾；空分类时 ThirdParty 直接作为分类目录。
     TestEqual(TEXT("3D Assets 第三方目录为 Objects/ThirdParty"),
@@ -8826,35 +8830,59 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                                               true),
               FString(TEXT("Objects/Temp")));
 
-    // Dressing 规则是绝对兜底（2026-10-29 修订）：取不到分类固定档就按 30/55 万收敛。
-    // Zion 资产仍按 Zion 规则：只有 Dressing 分类吃 300k/550k。
-    TestTrue(TEXT("无固定档的 Objects 资产按 Dressing 兜底"),
-             ShouldApplyDressingTriangleBudget(true, false, 0, TEXT("Objects")));
-    TestTrue(TEXT("Dressing 分类按兜底档减面"),
-             ShouldApplyDressingTriangleBudget(true, false, 0, TEXT("Dressing")));
-    TestTrue(TEXT("Zion Dressing 资产同样套兜底档"),
-             ShouldApplyDressingTriangleBudget(true, true, 0, TEXT("Dressing")));
-    TestFalse(TEXT("Zion 非 Dressing 资产不套兜底档"),
-              ShouldApplyDressingTriangleBudget(true, true, 0, TEXT("Objects")));
-    TestFalse(TEXT("Props 固定档不吃兜底档"),
+    // 减面档位与 tag 规则对齐（2026-10-29 定稿）：
+    //   第三方 asset tag（ThirdParty / Megascans / PBRMAX）统一走 Dressing 档；
+    //   只有非第三方资产才按 Props/Kits/MEGA/Destructible 分档；
+    //   取不到固定档的一律 Dressing 兜底（单边 ≥5m 55 万、否则 30 万）。
+    TestTrue(TEXT("第三方资产即使带 Props 也走 Dressing 档"),
+             ShouldApplyDressingTriangleBudget(
+                 true, true, UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles()));
+    TestTrue(TEXT("第三方资产带 Kits 也走 Dressing 档"),
+             ShouldApplyDressingTriangleBudget(
+                 true, true, UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles()));
+    TestFalse(TEXT("非第三方 Props 吃自己的固定档"),
               ShouldApplyDressingTriangleBudget(
                   true, false,
-                  UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles(),
-                  TEXT("Props")));
-    TestFalse(TEXT("Kits 固定档不吃兜底档"),
+                  UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles()));
+    TestFalse(TEXT("非第三方 Kits 吃自己的固定档"),
               ShouldApplyDressingTriangleBudget(
                   true, false,
-                  UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles(),
-                  TEXT("Kits")));
-    TestFalse(TEXT("非 3D 资产不套兜底档"),
-              ShouldApplyDressingTriangleBudget(false, false, 0, TEXT("Objects")));
-    // 第三方 + Props：分类折叠成 Dressing（无固定档）→ 走兜底档。
+                  UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles()));
+    TestTrue(TEXT("无固定档的资产按 Dressing 兜底"),
+             ShouldApplyDressingTriangleBudget(true, false, 0));
+    TestFalse(TEXT("非 3D 资产不套减面档"),
+              ShouldApplyDressingTriangleBudget(false, false, 0));
+    // 固定档由 tag 推导（顺序：MEGA → Kits → Destructible → Props）。
+    TestEqual(TEXT("Props 固定档 15 万"),
+              ResolveFixedTriangleBudgetFromTags(MakeTags(TEXT("Props"))),
+              UAssetHiveSettings::GetAsset3DPropsMaxLOD0Triangles());
+    TestEqual(TEXT("Kits 固定档 10 万"),
+              ResolveFixedTriangleBudgetFromTags(MakeTags(TEXT("Kits"))),
+              UAssetHiveSettings::GetAsset3DKitsMaxLOD0Triangles());
+    TestEqual(TEXT("MEGA 固定档 10 万"),
+              ResolveFixedTriangleBudgetFromTags(MakeTags(TEXT("MEGA"))),
+              UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles());
+    TestEqual(TEXT("Destructible 固定档 10 万"),
+              ResolveFixedTriangleBudgetFromTags(MakeTags(TEXT("Destructible"))),
+              UAssetHiveSettings::GetAsset3DDestructibleMaxLOD0Triangles());
+    TestEqual(TEXT("MEGA 优先于 Props"), ResolveFixedTriangleBudgetFromTags(
+                                           MakeTags(TEXT("MEGA"), TEXT("Props"))),
+              UAssetHiveSettings::GetAsset3DMegaMaxLOD0Triangles());
+    TestEqual(TEXT("Dressing 没有固定档（走兜底）"),
+              ResolveFixedTriangleBudgetFromTags(MakeTags(TEXT("Dressing"))), 0);
+    TestEqual(TEXT("无分类标签没有固定档（走兜底）"),
+              ResolveFixedTriangleBudgetFromTags(TArray<FString>()), 0);
+    // 第三方 + Props：profile 折叠成 Dressing 档；tag 判定也确认是第三方。
     TArray<FString> ThirdPartyPropsTags;
     ThirdPartyPropsTags.Add(TEXT("Props"));
     ThirdPartyPropsTags.Add(TEXT("ThirdParty"));
     TestEqual(TEXT("第三方 Props 折叠成 Dressing 档"),
               ResolveEnvironmentAssetProfile(ThirdPartyPropsTags).TypeKey,
               FString(TEXT("Dressing")));
+    TestTrue(TEXT("Props + ThirdParty 判定为第三方资产"),
+             IsThirdPartyAsset(ThirdPartyPropsTags));
+    TestFalse(TEXT("纯 Props 不算第三方资产"),
+              IsThirdPartyAsset(MakeTags(TEXT("Props"))));
     // zionTags 解析：空对象不算 Zion，非空即算。
     const TSharedPtr<FJsonObject> PlainAssetObject = MakeShared<FJsonObject>();
     TestFalse(TEXT("无 zionTags 的不是 Zion 资产"),
