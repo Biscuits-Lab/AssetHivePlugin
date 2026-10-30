@@ -13,7 +13,7 @@ UAssetHiveSettings::UAssetHiveSettings()
     SurfaceMetallicParameter = TEXT("Metallic_VT");
     SurfaceAOParameter = TEXT("AO_VT");
     SurfaceEmissiveParameter = TEXT("Emissive_Tex_VT");
-    SurfaceUseMetallicSwitch = TEXT("UseMetallic");
+    SurfaceUseMetallicSwitch = TEXT("UseMetallicTex");
     SurfaceUseEmissiveSwitch = TEXT("UseEmissive");
     SurfaceTilingParameter = TEXT("Tiling_Offset");
     DecalParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Decal/MI_Env_Decal_VT.MI_Env_Decal_VT")));
