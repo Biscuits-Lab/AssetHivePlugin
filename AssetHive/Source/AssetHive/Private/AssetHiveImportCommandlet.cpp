@@ -6338,10 +6338,10 @@ static UMaterialInterface *LoadDecalMaterialParent(
 
 static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
     const FString &MaterialFolder, const FString &AssetName, int32 GroupId,
-    UTexture *BCRTexture, UTexture *NormalTexture, UTexture *MetallicTexture,
-    UTexture *EmissiveTexture, double BaseTiling) {
+    UTexture *BCRTexture, UTexture *NormalTexture, UTexture *AOTexture,
+    UTexture *MetallicTexture, UTexture *EmissiveTexture, double BaseTiling) {
   UMaterialInterface *ParentMaterial = LoadSurfaceMaterialParent(
-      {BCRTexture, NormalTexture, MetallicTexture, EmissiveTexture});
+      {BCRTexture, NormalTexture, AOTexture, MetallicTexture, EmissiveTexture});
   if (!ParentMaterial) {
     return nullptr;
   }
@@ -6364,6 +6364,7 @@ static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
 
   const FString BCRParameter = Settings->SurfaceBCRParameter.TrimStartAndEnd();
   const FString NormalParameter = Settings->SurfaceNormalParameter.TrimStartAndEnd();
+  const FString AOParameter = Settings->SurfaceAOParameter.TrimStartAndEnd();
   const FString MetallicParameter = Settings->SurfaceMetallicParameter.TrimStartAndEnd();
   const FString EmissiveParameter = Settings->SurfaceEmissiveParameter.TrimStartAndEnd();
   const FString MetallicSwitch = Settings->SurfaceUseMetallicSwitch.TrimStartAndEnd();
@@ -6378,6 +6379,11 @@ static UMaterialInstanceConstant *CreateSurfaceMaterialInstance(
     MaterialInstance->SetTextureParameterValueEditorOnly(
         FMaterialParameterInfo(FName(*NormalParameter)), NormalTexture);
   }
+  if (AOTexture && !AOParameter.IsEmpty()) {
+    MaterialInstance->SetTextureParameterValueEditorOnly(
+        FMaterialParameterInfo(FName(*AOParameter)), AOTexture);
+  }
+  // Metallic 由导出侧判定"存在且非全 0"后才下发；没有时保留母材质默认值。
   if (MetallicTexture && !MetallicParameter.IsEmpty()) {
     MaterialInstance->SetTextureParameterValueEditorOnly(
         FMaterialParameterInfo(FName(*MetallicParameter)), MetallicTexture);
@@ -7613,14 +7619,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
              SlotName == TEXT("opacity") || SlotName == TEXT("emissive") ||
              SlotName == TEXT("metalness") || SlotName == TEXT("roughness") ||
              SlotName == TEXT("ao") || SlotName == TEXT("displacement") ||
-             SlotName == TEXT("fuzz") || SlotName == TEXT("subsurfacecolor") ||
+             SlotName == TEXT("subsurfacecolor") ||
              SlotName == TEXT("translucency"));
         const bool bAllowPlantSlots =
             bIsPlant &&
             (SlotName == TEXT("albedo") || SlotName == TEXT("normal") ||
              SlotName == TEXT("orm") || SlotName == TEXT("opacity") ||
              SlotName == TEXT("ao") || SlotName == TEXT("metalness") ||
-             SlotName == TEXT("emissive") || SlotName == TEXT("fuzz") ||
+             SlotName == TEXT("emissive") ||
              SlotName == TEXT("mask") || SlotName == TEXT("roughness") ||
              SlotName == TEXT("subsurfacecolor") ||
              ((SlotName == TEXT("displacement") ||
@@ -7633,9 +7639,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             SlotName == TEXT("displacement");
         const bool bAllowHdriSlots = SlotName == TEXT("hdr");
         // Surface 的 Height / Displacement（2026-10-27）：只作为独立纹理导入
-        // （后缀 _Dis），不参与材质实例参数；其余槽位仍按 BCR / N / M / E。
+        // （后缀 _Dis），不参与材质实例参数；其余槽位按 BCR / N / AO / M（可选）。
         const bool bAllowSurfaceSlots =
             bIsSurface && (SlotName == TEXT("bcr") || SlotName == TEXT("normal") ||
+                           SlotName == TEXT("ao") ||
                            SlotName == TEXT("metalness") ||
                            SlotName == TEXT("emissive") ||
                            SlotName == TEXT("displacement"));
@@ -7702,7 +7709,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (SlotName == TEXT("normal")) {
             Factory->CompressionSettings = TC_Normalmap;
             Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
-          } else if (bIsSurface && SlotName == TEXT("metalness")) {
+          } else if (bIsSurface &&
+                     (SlotName == TEXT("metalness") || SlotName == TEXT("ao"))) {
             Factory->CompressionSettings = TC_Masks;
             Factory->ColorSpaceMode = ETextureSourceColorSpace::Linear;
           } else if (bIsDecal && (SlotName == TEXT("opacity") || SlotName == TEXT("orm"))) {
@@ -7774,7 +7782,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 Texture->LODGroup = TEXTUREGROUP_World;
                 Texture->LossyCompressionAmount = TLCA_Medium;
                 Texture->MaxTextureSize = 2048;
-              } else if (bIsSurface && SlotName == TEXT("metalness")) {
+              } else if (bIsSurface &&
+                         (SlotName == TEXT("metalness") ||
+                          SlotName == TEXT("ao"))) {
                 Texture->CompressionSettings = TC_Masks;
                 Texture->SRGB = false;
                 Texture->CompressionNoAlpha = true;
@@ -7939,6 +7949,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             MaterialFolder, AssetStem, GroupId,
             TextureBySlot.FindRef(TEXT("bcr")),
             TextureBySlot.FindRef(TEXT("normal")),
+            TextureBySlot.FindRef(TEXT("ao")),
             TextureBySlot.FindRef(TEXT("metalness")),
             TextureBySlot.FindRef(TEXT("emissive")), SurfaceBaseTiling);
       } else if (bIs3DAsset) {

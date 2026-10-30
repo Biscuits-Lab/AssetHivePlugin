@@ -11,6 +11,7 @@ UAssetHiveSettings::UAssetHiveSettings()
     SurfaceBCRParameter = TEXT("BCR_VT");
     SurfaceNormalParameter = TEXT("NRM_VT");
     SurfaceMetallicParameter = TEXT("Metallic_VT");
+    SurfaceAOParameter = TEXT("AO_VT");
     SurfaceEmissiveParameter = TEXT("Emissive_Tex_VT");
     SurfaceUseMetallicSwitch = TEXT("UseMetallicTex");
     SurfaceUseEmissiveSwitch = TEXT("UseEmissive");

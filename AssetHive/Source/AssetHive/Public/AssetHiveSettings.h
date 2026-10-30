@@ -152,6 +152,9 @@ public:
     UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Normal Texture Parameter", ToolTip="Texture parameter receiving the Normal texture."))
     FString SurfaceNormalParameter;
 
+    UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="AO Texture Parameter", ToolTip="Texture parameter receiving the AO texture. Default: AO_VT"))
+    FString SurfaceAOParameter;
+
     UPROPERTY(EditAnywhere, config, Category="4. Surface|Material", meta=(DisplayName="Metallic Texture Parameter", ToolTip="Texture parameter receiving the Metallic texture."))
     FString SurfaceMetallicParameter;
 
