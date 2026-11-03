@@ -7138,7 +7138,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           GroupId = FMath::Max(1, GroupId);
           const FString SourceKey = NormalizePathLower(SourceFile);
           FString NormalizedSlotName = SlotName.ToLower();
+          // Decal 基础色（2026-11-03）：导出侧按源叫法给 _D（Diffuse/BaseColor）或 _AL（Albedo），
+          // 两种叫法都必须归一成 albedo，否则从 Albedo 源来的贴花会丢 diffuse。
           if (bIsDecal && (NormalizedSlotName == TEXT("d") ||
+                           NormalizedSlotName == TEXT("al") ||
+                           NormalizedSlotName == TEXT("bc") ||
                            NormalizedSlotName == TEXT("diffuse") ||
                            NormalizedSlotName == TEXT("albedo") ||
                            NormalizedSlotName == TEXT("basecolor"))) {
