@@ -12235,7 +12235,14 @@ bool FAssetHiveWindProjectImportTest::RunTest(const FString &Parameters) {
   bool bCheckedOpaque = false;
   bool bCheckedMicro = false;
   TSet<bool> CheckedTextureBanks;
-  for (const FString &Folder : Folders) {
+  // Each fixture entry has its own destination. Read expected asset-wide
+  // capabilities from the job rather than assuming Ripple requires Branch2.
+  const auto& Inputs = Job->GetArrayField(TEXT("assets"));
+  if (!TestEqual(TEXT("One destination per fixture entry"), Folders.Num(), Inputs.Num())) return false;
+  for (int32 Index = 0; Index < Inputs.Num(); ++Index) {
+    const FString &Folder = Folders[Index];
+    const TSharedPtr<FJsonObject>* Layers = nullptr;
+    Inputs[Index]->AsObject()->TryGetObjectField(TEXT("plantWindLayers"), Layers);
     TArray<FAssetData> Assets;
     Registry.GetAssetsByPath(FName(*Folder), Assets, true);
     for (const auto &Asset : Assets) {
@@ -12293,11 +12300,16 @@ bool FAssetHiveWindProjectImportTest::RunTest(const FString &Parameters) {
         TestTrue(Name + TEXT(" imported albedo matches the active sampler"), MI->TextureParameterValues.ContainsByPredicate(
             [&](const FTextureParameterValue &P) { return P.ParameterInfo.Name == DiffuseName && P.ParameterValue &&
                 static_cast<bool>(P.ParameterValue->VirtualTextureStreaming) == bVirtual; }));
-        const bool bBranch2 = bTree || bBush || Style==TEXT("Herb");
+        bool bBranch2 = bTree || bBush || Style==TEXT("Herb");
+        bool bRipple = bBranch2;
+        if (Layers && Layers->IsValid()) {
+          (*Layers)->TryGetBoolField(TEXT("hasSecondary"), bBranch2);
+          (*Layers)->TryGetBoolField(TEXT("hasTerminal"), bRipple);
+        }
         for (const TPair<FName, bool> &Switch : TArray<TPair<FName, bool>>{
              {TEXT("Interactive"), true}, {TEXT("SharedEnable"), true}, {TEXT("Branch1Enable"), true},
              {TEXT("Branch2Enable"), bBranch2}, {TEXT("HasBranch2Data_Internal"), bBranch2},
-             {TEXT("Use Remapped UV3"), bBranch2}, {TEXT("RippleEnable"), bBranch2}}) {
+             {TEXT("Use Remapped UV3"), bBranch2}, {TEXT("RippleEnable"), bRipple}}) {
           bool Value = false;
           FGuid Id;
           TestTrue(Name + TEXT(" ") + Switch.Key.ToString(), MI->GetStaticSwitchParameterValue(
