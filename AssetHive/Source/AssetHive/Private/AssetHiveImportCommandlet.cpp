@@ -892,6 +892,116 @@ struct FPlantWindCardSurface {
     return BestCard;
   }
 
+  struct FSourcePoint {
+    bool bAssigned = false;
+    int32 Card = INDEX_NONE;
+    int32 Triangle = INDEX_NONE;
+    FVector3f Barycentric = FVector3f::ZeroVector;
+    double ErrorSquared = TNumericLimits<double>::Max();
+  };
+
+  // Both position and UV0 are affine on the original FBX face. Find the point
+  // satisfying both in one barycentric frame, including points on a UV seam.
+  FSourcePoint ProjectCutPoint(const FVector3f& Point, const FVector2f& UV, int32 PreferredCard, int32 RequiredCard = INDEX_NONE) const {
+    FSourcePoint Best;
+    if (TriangleUVs.Num() != TriangleIndices.Num()) return Best;
+    // Express UV and position errors in mesh units before comparing faces.
+    const double UVScale = FMath::Max(double(GetDiagonal()), UE_DOUBLE_SMALL_NUMBER);
+    const float Radius = CellSize * 0.25f;
+    const double MaxError = FMath::Square(double(Radius));
+    const double Tie = FMath::Square(UVScale * 1.e-7);
+    const auto Visit = [&](int32 T) {
+      if (RequiredCard != INDEX_NONE && CardOfTriangle[T] != RequiredCard) return;
+      const int32 I = T * 3;
+      const FVector3d A(Positions[TriangleIndices[I]]);
+      const FVector3d AB = FVector3d(Positions[TriangleIndices[I+1]]) - A;
+      const FVector3d AC = FVector3d(Positions[TriangleIndices[I+2]]) - A;
+      const FVector3d AP = FVector3d(Point) - A;
+      const FVector2d U(TriangleUVs[I]);
+      const FVector2d UB = (FVector2d(TriangleUVs[I+1]) - U) * UVScale;
+      const FVector2d UC = (FVector2d(TriangleUVs[I+2]) - U) * UVScale;
+      const FVector2d UP = (FVector2d(UV) - U) * UVScale;
+      const double BB = AB.SquaredLength() + UB.SquaredLength();
+      const double CC = AC.SquaredLength() + UC.SquaredLength();
+      const double BC = AB.Dot(AC) + UB.Dot(UC);
+      const double BP = AB.Dot(AP) + UB.Dot(UP);
+      const double CP = AC.Dot(AP) + UC.Dot(UP);
+      const auto Consider = [&](double B, double C) {
+        const double E = (AP - AB*B - AC*C).SquaredLength() + (UP - UB*B - UC*C).SquaredLength();
+        if (E > MaxError) return;
+        const bool bTie = FMath::Abs(E-Best.ErrorSquared) <= Tie;
+        const bool bPreferred = CardOfTriangle[T] == PreferredCard;
+        const bool bBestPreferred = Best.Triangle != INDEX_NONE && CardOfTriangle[Best.Triangle] == PreferredCard;
+        const bool bWinsTie = (bPreferred != bBestPreferred) ? bPreferred : T < Best.Triangle;
+        if ((!bTie && E < Best.ErrorSquared) || (bTie && bWinsTie)) {
+          Best.Triangle = T;
+          Best.Card = CardOfTriangle[T];
+          Best.Barycentric = FVector3f(1.-B-C,B,C);
+          Best.ErrorSquared = E;
+        }
+      };
+      const double Det = BB*CC - BC*BC;
+      if (Det > BB*CC*1.e-14) {
+        const double B = (BP*CC - CP*BC) / Det;
+        const double C = (CP*BB - BP*BC) / Det;
+        if (B >= 0. && C >= 0. && B+C <= 1.) { Consider(B,C); return; }
+      }
+      // Outside or degenerate: the closest point is on one of the three edges.
+      const auto Segment = [](double P, double L2) { return L2 > 0. ? FMath::Clamp(P/L2,0.,1.) : 0.; };
+      Consider(Segment(BP,BB),0.);
+      Consider(0.,Segment(CP,CC));
+      const double C = Segment(CP-BP+BB-BC,BB+CC-2.*BC);
+      Consider(1.-C,C);
+    };
+    const FIntVector Lo = GetCellKey(Point-FVector3f(Radius)), Hi = GetCellKey(Point+FVector3f(Radius));
+    for (int32 X=Lo.X; X<=Hi.X; ++X) {
+      for (int32 Y=Lo.Y; Y<=Hi.Y; ++Y) {
+        for (int32 Z=Lo.Z; Z<=Hi.Z; ++Z) {
+          if (const auto* Triangles = TriangleGrid.Find(FIntVector(X,Y,Z))) {
+            for (const int32 Triangle : *Triangles) Visit(Triangle);
+          }
+        }
+      }
+    }
+    return Best;
+  }
+
+  // Fit the entire face. An overlapping card may pass almost exactly through
+  // the centroid but fit none of the three corners of the decimated triangle.
+  int32 ResolveCutFace(const FVector3f (&P)[3], const FVector2f (&UV)[3], int32 IslandCard,
+                       FSourcePoint (&Out)[3]) const {
+    const FVector3f Center = (P[0]+P[1]+P[2])/3.f;
+    const FVector2f CenterUV = (UV[0]+UV[1]+UV[2])/3.f;
+    const auto Middle = ProjectCutPoint(Center,CenterUV,IslandCard);
+    const int32 Preferred = Middle.Card != INDEX_NONE ? Middle.Card : IslandCard;
+    TArray<int32,TInlineAllocator<5>> Candidates;
+    if (Preferred != INDEX_NONE) Candidates.Add(Preferred);
+    FSourcePoint Nearest[3];
+    for (int32 K=0; K<3; ++K) {
+      Nearest[K] = ProjectCutPoint(P[K],UV[K],Preferred);
+      if (Nearest[K].Card != INDEX_NONE) Candidates.AddUnique(Nearest[K].Card);
+    }
+    if (IslandCard != INDEX_NONE) Candidates.AddUnique(IslandCard);
+    const double Miss = FMath::Square(double(CellSize)*.25);
+    const double Tie = FMath::Square(double(GetDiagonal())*1.e-7);
+    double Best = TNumericLimits<double>::Max();
+    int32 Owner = INDEX_NONE;
+    for (const int32 Card : Candidates) {
+      const auto C = Middle.Card == Card ? Middle : ProjectCutPoint(Center,CenterUV,Card,Card);
+      double Score = .25 * FMath::Min(C.ErrorSquared,Miss);
+      FSourcePoint Hits[3];
+      for (int32 K=0; K<3; ++K) {
+        Hits[K] = Nearest[K].Card == Card ? Nearest[K] : ProjectCutPoint(P[K],UV[K],Card,Card);
+        Score += FMath::Min(Hits[K].ErrorSquared,Miss);
+      }
+      if (Score < Best - Tie) {
+        Best = Score; Owner = Card;
+        for (int32 K=0; K<3; ++K) Out[K] = Hits[K];
+      }
+    }
+    return Owner;
+  }
+
   // 点到三角形的最近距离平方（Ericson, Real-Time Collision Detection）。
   float PointTriangleDistanceSquared(const FVector3f &Point, int32 Triangle) const {
     const FVector3f &A = Positions[TriangleIndices[Triangle * 3 + 0]];
@@ -4410,7 +4520,8 @@ static FPlantBranch2Bounds GetPlantBranch2Bounds(const FJsonObject& Variants) {
 
 static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSyntheticWind Style,
                                         const FPlantWindCardReference *CardReference,
-                                        FString &OutSummary, const FPlantBranch2Bounds& DecodeBounds = {}) {
+                                        FString &OutSummary, const FPlantBranch2Bounds& DecodeBounds = {},
+                                        bool bOpaqueCut = false) {
   OutSummary.Reset();
   if (!StaticMesh || StaticMesh->GetNumSourceModels() == 0) {
     return false;
@@ -4456,6 +4567,7 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
   int32 TotalCardFallbackIslands = 0;
   int32 RawCardHitVertices = 0;
   int32 TotalUVMigratedVertices = 0;
+  int32 ProjectedCutCorners = 0, FallbackCutCorners = 0;
   float MaxCardMatchDistance = 0.0f;
   TSet<int32> UsedCards;
   int32 TotalConsistencyGroups = 0;
@@ -5285,6 +5397,71 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
             /*TouchDistance=*/FernStructure.JoinDistance);
       }
     }
+    // Choose a single source card per cut face: anchors/directions are discrete.
+    // Only scalar weights may be interpolated, on original triangles of that card.
+    using FSourcePoint = AssetHivePlantWind::FPlantWindCardSurface::FSourcePoint;
+    TArray<FSourcePoint> CutSourcePoints;
+    if (bOpaqueCut && bUseCardReference && !CardReference->Surface.TriangleUVs.IsEmpty() && UVs.GetNumChannels() > 0) {
+      const auto& Surface = CardReference->Surface;
+      CutSourcePoints.SetNum(Mesh->VertexInstances().GetArraySize());
+      TMap<TPair<FVertexInstanceID,int32>,FVertexInstanceID> SplitCorners;
+      for (const FPolygonID Polygon : Mesh->Polygons().GetElementIDs()) {
+        const auto Triangles = Mesh->GetPolygonTriangles(Polygon);
+        if (Triangles.IsEmpty()) continue;
+        // FBX is triangulated. For an n-gon use the largest interior triangle.
+        FTriangleID Interior = Triangles[0];
+        double MaxArea = -1.;
+        for (const FTriangleID T : Triangles) {
+          const auto V = Mesh->GetTriangleVertices(T);
+          const double Area = FVector3d::CrossProduct(FVector3d(Positions[V[1]]-Positions[V[0]]),
+                                                     FVector3d(Positions[V[2]]-Positions[V[0]])).SquaredLength();
+          if (Area > MaxArea) { MaxArea = Area; Interior = T; }
+        }
+        const auto Corners = Mesh->GetTriangleVertexInstances(Interior);
+        FVector3f P[3]; FVector2f TextureUV[3]; FSourcePoint CornerHits[3];
+        for (int32 K=0; K<3; ++K) {
+          P[K] = Positions[Mesh->GetVertexInstanceVertex(Corners[K])];
+          TextureUV[K] = UVs.Get(Corners[K],0);
+        }
+        const int32 Island = IslandParameters.IslandOfVertex[Mesh->GetVertexInstanceVertex(Corners[0]).GetValue()];
+        const int32 IslandCard = IslandResolvedCardIndex.IsValidIndex(Island) ? IslandResolvedCardIndex[Island] : INDEX_NONE;
+        const int32 FaceCard = Surface.ResolveCutFace(P,TextureUV,IslandCard,CornerHits);
+        const auto Perimeter = Mesh->GetPolygonVertexInstances<TInlineAllocator<4>>(Polygon);
+        for (int32 K=0; K<Perimeter.Num(); ++K) {
+          const FVertexInstanceID Original = Perimeter[K];
+          FVertexInstanceID VI = Original;
+          const FVertexID Vertex = Mesh->GetVertexInstanceVertex(Original);
+          if (CutSourcePoints[Original.GetValue()].bAssigned && CutSourcePoints[Original.GetValue()].Card != FaceCard) {
+            // A welded FBX corner shared by different source cards needs a wind UV seam.
+            const TPair<FVertexInstanceID,int32> Key(Original,FaceCard);
+            if (const auto* Existing = SplitCorners.Find(Key)) {
+              VI = *Existing;
+            } else {
+              VI = Mesh->CreateVertexInstance(Vertex);
+              Attributes.GetVertexInstanceNormals()[VI] = Attributes.GetVertexInstanceNormals()[Original];
+              Attributes.GetVertexInstanceTangents()[VI] = Attributes.GetVertexInstanceTangents()[Original];
+              Attributes.GetVertexInstanceBinormalSigns()[VI] = Attributes.GetVertexInstanceBinormalSigns()[Original];
+              Attributes.GetVertexInstanceColors()[VI] = Attributes.GetVertexInstanceColors()[Original];
+              for (int32 Channel=0; Channel<UVs.GetNumChannels(); ++Channel) UVs.Set(VI,Channel,UVs.Get(Original,Channel));
+              SplitCorners.Add(Key,VI);
+              if (!CutSourcePoints.IsValidIndex(VI.GetValue())) CutSourcePoints.SetNum(VI.GetValue()+1);
+            }
+            Mesh->SetPolygonVertexInstance(Polygon,K,VI);
+          }
+          auto& Hit = CutSourcePoints[VI.GetValue()];
+          if (!Hit.bAssigned) {
+            if (Triangles.Num() == 1) Hit = CornerHits[K];
+            else if (FaceCard != INDEX_NONE) Hit = Surface.ProjectCutPoint(Positions[Vertex],UVs.Get(VI,0),FaceCard,FaceCard);
+            Hit.Card = FaceCard;
+            Hit.bAssigned = true;
+          }
+        }
+      }
+      for (const auto VI : Mesh->VertexInstances().GetElementIDs()) {
+        if (CutSourcePoints[VI.GetValue()].Triangle != INDEX_NONE) ++ProjectedCutCorners;
+        else ++FallbackCutCorners;
+      }
+    }
     if (UVs.GetNumChannels() < RequiredChannels) {
       UVs.SetNumChannels(RequiredChannels);
     }
@@ -5296,7 +5473,9 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
           IslandParameters.IslandOfVertex.IsValidIndex(VertexIndex)
               ? IslandParameters.IslandOfVertex[VertexIndex]
               : INDEX_NONE;
-      const int32 VertexCardIndex =
+      const FSourcePoint* Hit = CutSourcePoints.IsValidIndex(VertexInstanceID.GetValue()) ? &CutSourcePoints[VertexInstanceID.GetValue()] : nullptr;
+      const bool bHasSourceFace = Hit && Hit->Triangle != INDEX_NONE;
+      const int32 VertexCardIndex = Hit && Hit->bAssigned ? Hit->Card :
           IslandResolvedCardIndex.IsValidIndex(VertexIslandIndex)
               ? IslandResolvedCardIndex[VertexIslandIndex]
               : INDEX_NONE;
@@ -5307,11 +5486,23 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
         float Weight=0.f, ChildWeight=0.f, Ripple=0.f;
         if (M) {
           const auto& B=M->Binding;
-          const float Primary=B.PrimaryAttachment<0.f ? B.Primary.Along(P) : B.PrimaryAttachment;
-          const float Secondary=B.SecondaryAttachment<0.f ? B.Secondary.Along(P) : B.SecondaryAttachment;
-          Weight=.70f * FMath::SmoothStep(.025f,1.f,Primary);
-          ChildWeight=.64f * FMath::SmoothStep(.035f,1.f,Secondary);
-          Ripple=M->Ripple * FMath::SmoothStep(.30f,1.f,B.Blade.Along(P));
+          const auto WeightsAt = [&](const FVector3f& Position) {
+            const float Primary = B.PrimaryAttachment < 0.f ? B.Primary.Along(Position) : B.PrimaryAttachment;
+            const float Child = B.SecondaryAttachment < 0.f ? B.Secondary.Along(Position) : B.SecondaryAttachment;
+            return FVector3f(.70f * FMath::SmoothStep(.025f,1.f,Primary),
+                             .64f * FMath::SmoothStep(.035f,1.f,Child),
+                             M->Ripple * FMath::SmoothStep(.30f,1.f,B.Blade.Along(Position)));
+          };
+          FVector3f Weights = FVector3f::ZeroVector;
+          if (bHasSourceFace) {
+            const auto& Surface = CardReference->Surface;
+            for (int32 K=0; K<3; ++K) {
+              Weights += Hit->Barycentric[K] * WeightsAt(Surface.Positions[Surface.TriangleIndices[3*Hit->Triangle+K]]);
+            }
+          } else {
+            Weights = WeightsAt(P);
+          }
+          Weight = Weights.X; ChildWeight = Weights.Y; Ripple = Weights.Z;
         }
         UVs.Set(VertexInstanceID,1,FVector2f(M ? M->Position : 0.f,M ? M->Direction : 0.f));
         UVs.Set(VertexInstanceID,2,FVector2f(Weight,Ripple));
@@ -5448,6 +5639,10 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
           : FString();
   // UE5 的 FString::Printf 使用 TCheckedFormatString，格式串必须是编译期字面量，
   // 不能是三元表达式——Fern / Grass 两种文案分开调用。
+  if (ProjectedCutCorners + FallbackCutCorners > 0) {
+    UE_LOG(LogTemp, Display, TEXT("AssetHive wind %s: %d cut corners bound to source triangles, %d used card fallback"),
+           *StaticMesh->GetName(), ProjectedCutCorners, FallbackCutCorners);
+  }
   FString FrondSummary;
   if (TotalConsolidatedFronds > 0) {
     if (MergeMode == EPlantWindFrondMergeMode::ConnectedCluster) {
@@ -8037,6 +8232,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       UE_LOG(LogTemp, Error, TEXT("AssetHive: third-party plant '%s' has no library ID"), *AssetName);
       continue;
     }
+    const auto WindOriginals = GetZionWindObject(AssetObject,TEXT("plantWindOriginals"));
     const auto LayerSource=GetZionWindObject(AssetObject,TEXT("plantWindLayers"));
     TSharedPtr<FJsonObject> LayerVariants, LayerSources;
     FPlantBranch2Bounds DecodeBounds;
@@ -9016,18 +9212,51 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     TSet<FName> ZionPlantUsedMaterialNames;
     const bool bUseZionSlotMaterials = AssetType == TEXT("3dplant") && bIsZionAsset && !bMicroPlant &&
         (!ZionPlantParentMaterialPath.IsEmpty() || bHasZionNativeWind);
-    // Variants that share one material group use the median mesh height. A cut and its
-    // masked source count once, so adding an opaque duplicate does not change amplitude.
-    TArray<float> Heights, CutHeights;
+    // A material group uses the median original LOD0 height. A pure Opaque
+    // job must use the same source measurements as its masked counterpart.
+    TMap<UStaticMesh*,UStaticMesh*> PreloadedWindSources;
+    TMap<UStaticMesh*,FString> WindReferenceFiles;
+    TMap<FString,float> HeightBySource;
     if (PlantProfile.SyntheticWind != EPlantSyntheticWind::None) {
-      for (UStaticMesh *Mesh : ImportedMeshes) {
+      for (UStaticMesh* Mesh : ImportedMeshes) {
         if (!Mesh) continue;
-        const float Height = Mesh->GetBoundingBox().GetSize().Z;
-        if (Height <= KINDA_SMALL_NUMBER) continue;
-        (IsOpaqueModelVariantKey(VariantKeyByMesh.FindRef(Mesh)) ? CutHeights : Heights).Add(Height);
+        const FString Key = VariantKeyByMesh.FindRef(Mesh);
+        FString SourceFile = SourceFileByMesh.FindRef(Mesh);
+        const bool bCut = IsOpaqueModelVariantKey(Key) || OpaqueModelVariantKeys.Contains(NormalizeModelVariantKey(Key));
+        float Height = Mesh->GetBoundingBox().GetSize().Z;
+        FString LayerName, Original;
+        const auto Source = GetZionWindObject(LayerSources,*Key);
+        if (Source) {
+          Source->TryGetStringField(TEXT("name"),LayerName);
+          Source->TryGetStringField(TEXT("original"),Original);
+        }
+        if (bCut) {
+          if (Original.IsEmpty() && WindOriginals) WindOriginals->TryGetStringField(Key,Original);
+          if (Original.IsEmpty()) Original = ResolveOpaquePlantWindReferenceFile(SourceFile);
+          WindReferenceFiles.Add(Mesh,Original);
+        }
+        const auto Variant = GetZionWindObject(LayerVariants,*LayerName);
+        const auto Frame = GetZionWindObject(Variant,TEXT("frame"));
+        const TArray<TSharedPtr<FJsonValue>>* Size = nullptr;
+        double Z = 0.;
+        if (Frame && Frame->TryGetArrayField(TEXT("sizeCm"),Size) && Size->Num()==3 &&
+            (*Size)[2]->TryGetNumber(Z) && FMath::IsFinite(Z) && Z > KINDA_SMALL_NUMBER) {
+          Height = float(Z);
+          SourceFile = Original;
+        } else if (bCut && !Original.IsEmpty() && (!LayerSources || Variant)) {
+          UStaticMesh* Base = ImportStaticMeshAsset(AssetToolsModule, Original, AssetFolder,
+              FString::Printf(TEXT("TEMP_WINDCARDS_%s"),*Mesh->GetName()),Variant.IsValid() && PlantProfile.bNanite);
+          PreloadedWindSources.Add(Mesh,Base);
+          if (Base) {
+            Height = Base->GetBoundingBox().GetSize().Z;
+            SourceFile = Original;
+          }
+        }
+        if (Height > KINDA_SMALL_NUMBER) HeightBySource.Add(SourceFile,Height);
       }
     }
-    if (Heights.IsEmpty()) Heights = MoveTemp(CutHeights);
+    TArray<float> Heights;
+    HeightBySource.GenerateValueArray(Heights);
     Heights.Sort();
     const int32 Count = Heights.Num();
     const float PlantHeightCm = Count ? (Heights[(Count - 1) / 2] + Heights[Count / 2]) * 0.5f : 0.f;
@@ -9416,13 +9645,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         UStaticMesh *TempWindReferenceMesh = nullptr;
         if (bOpaqueWindMesh) {
           const FString WindSourceFile = SourceFileByMesh.FindRef(StaticMesh);
-          const FString ReferenceFile =
-              LayerVariant ? LayerOriginal : ResolveOpaquePlantWindReferenceFile(WindSourceFile);
+          const FString ReferenceFile = WindReferenceFiles.FindRef(StaticMesh);
           if (!ReferenceFile.IsEmpty()) {
-            TempWindReferenceMesh = ImportStaticMeshAsset(
-                AssetToolsModule, ReferenceFile, AssetFolder,
-                FString::Printf(TEXT("TEMP_WINDCARDS_%s"), *StaticMesh->GetName()),
-                LayerVariant.IsValid() && PlantProfile.bNanite);
+            if (!PreloadedWindSources.RemoveAndCopyValue(StaticMesh,TempWindReferenceMesh)) {
+              TempWindReferenceMesh = ImportStaticMeshAsset(AssetToolsModule, ReferenceFile, AssetFolder,
+                  FString::Printf(TEXT("TEMP_WINDCARDS_%s"), *StaticMesh->GetName()), LayerVariant.IsValid() && PlantProfile.bNanite);
+            }
             if (!TempWindReferenceMesh) {
               UE_LOG(LogTemp, Warning,
                      TEXT("AssetHive import: %s 原始 FBX %s 导入失败，回退碎片级合成风"),
@@ -9477,7 +9705,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         if (!ApplySyntheticSpeedTreeWind(
                 StaticMesh, PlantProfile.SyntheticWind,
                 WindCardReference.IsValid() ? &WindCardReference : nullptr,
-                WindSummary, DecodeBounds)) {
+                WindSummary, DecodeBounds, bOpaqueWindMesh)) {
           GAssetHiveImportFailed = true;
           UE_LOG(LogTemp, Error,
                  TEXT("AssetHive import: %s 合成 SpeedTree 风数据写入失败（无可用 LOD）"),
@@ -11428,6 +11656,31 @@ bool FAssetHivePlantWindCardReferenceTest::RunTest(const FString &Parameters) {
                                                FVector3f(5.0f, 0.0f, 5.0f),
                                                UVLookupDistance),
             INDEX_NONE);
+  // Two coplanar cards use the same atlas region but different UV parameterizations.
+  // A nearest-3D vote cannot distinguish them; the barycentric UV witness can.
+  AssetHivePlantWind::FPlantWindCardSurface Overlap;
+  Overlap.Positions = {FVector3f(0,0,0),FVector3f(10,0,0),FVector3f(0,10,0)};
+  Overlap.TriangleIndices = {0,1,2,0,1,2};
+  Overlap.CardOfTriangle = {0,1};
+  Overlap.TriangleUVs = {FVector2f(0,0),FVector2f(1,0),FVector2f(0,1),
+                         FVector2f(1,0),FVector2f(0,0),FVector2f(0,1)};
+  Overlap.BuildGrid();
+  const auto SourceHit = Overlap.ProjectCutPoint(FVector3f(2,3,0),FVector2f(.5f,.3f),0);
+  TestEqual(TEXT("Cut corner follows its original leaf even if the fragment voted for its neighbour"),SourceHit.Triangle,1);
+  TestTrue(TEXT("Cut corner preserves original face weights"),SourceHit.Barycentric.Equals(FVector3f(.5f,.2f,.3f),1.e-5f));
+  TestEqual(TEXT("A neighbouring face cannot steal a corner from the assigned card"),
+            Overlap.ProjectCutPoint(FVector3f(2,3,0),FVector2f(.5f,.3f),0,0).Triangle,INDEX_NONE);
+  const FVector3f CutP[3] = {FVector3f(2,3,0),FVector3f(6,2,0),FVector3f(3,3,0)};
+  const FVector2f CutUV[3] = {FVector2f(.5f,.3f),FVector2f(.2f,.2f),FVector2f(.4f,.3f)};
+  AssetHivePlantWind::FPlantWindCardSurface::FSourcePoint CutHits[3];
+  TestEqual(TEXT("The centroid lies on two overlapping cards and alone prefers card zero"),
+            Overlap.ProjectCutPoint((CutP[0]+CutP[1]+CutP[2])/3.f,(CutUV[0]+CutUV[1]+CutUV[2])/3.f,0).Card,0);
+  TestEqual(TEXT("All three corners identify card one notwithstanding the centroid tie"),
+            Overlap.ResolveCutFace(CutP,CutUV,0,CutHits),1);
+  const auto SharedEdge = Overlap.ProjectCutPoint(FVector3f(5,0,0),FVector2f(.5f,0),1);
+  TestEqual(TEXT("Coincident edge uses the parent of the face interior"),SharedEdge.Triangle,1);
+  TestEqual(TEXT("Geometry outside the source projection radius has no face witness"),
+            Overlap.ProjectCutPoint(FVector3f(2,3,2),FVector2f(.5f,.3f),1).Triangle,INDEX_NONE);
   // 裁切碎片：卡片顶端的一小块（0..0.2cm 宽、9.8..10cm 高）。
   UStaticMesh *CutMesh = NewObject<UStaticMesh>(
       GetTransientPackage(), FName(TEXT("AssetHiveWindCutProbe")), RF_Transient);
