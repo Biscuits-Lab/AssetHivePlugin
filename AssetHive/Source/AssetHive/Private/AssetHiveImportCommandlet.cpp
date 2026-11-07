@@ -268,12 +268,9 @@ static FString BuildPlantObjectStem(const TArray<FString> &Tags,
 //
 // 项目材质 MF_Foliage_Wind_ST 的读取约定（材质侧已确认）：
 //   Branch1：UV1=(PackedPosition, PackedDirection)，UV2.r=Weight（恒定读取）
-//   Branch2：勾选 "Use Remapped UV3" 后读 UV3=(lo, hi)，HLSL 解码：
-//     lo = round(UV.x * 16383); hi = floor(UV.y * 16383 + 0.001);
-//     xq = floor(hi / 16); yqHigh = fmod(hi, 16); yqLow = floor(lo / 256); wq = fmod(lo, 256);
-//     yq = yqHigh * 64 + yqLow;
-//     x = XMin + (xq / 1023) * XRange; y = YMin + (yq / 1023) * YRange; w = WMin + (wq / 255) * WRange;
-//   Bounds Mode=1 时材质用 (Max-Min) 还原数据，六个端点必须与烘焙网格配套。
+//   Remapped UV3 mode 2: each exact FP32 word uses the top 14 mantissa bits for
+//   the original Branch2 codes. The two sign/exponent nibbles carry 8-bit Ripple.
+//   UV2.g also retains Ripple for native and legacy material paths.
 //
 // PackedPosition 按 UnpackInteger3（系数 6/6/7）解码为 (s1/5, q1/5, q0/6)，即归一化
 //   锚点位置 x/y 各 6 档、z 7 档；编码时写回 (q0*36 + q1*6 + s1)/256。
@@ -590,15 +587,30 @@ inline int32 ToUV3Code(float Value, float Min, float Range, int32 CodeMax) {
 
 // UV3.x = lo：方向低 6 位在高 8 位、权重在低 8 位；
 // UV3.y = hi：位置 10 位在高 10 位、方向高 4 位在低 4 位。
-inline FVector2f EncodeUV3(int32 PositionCode, int32 DirectionCode, int32 WeightCode) {
-  const int32 Low = (DirectionCode % 64) * 256 + WeightCode;
-  const int32 High = PositionCode * 16 + (DirectionCode / 64);
-  // Zion decodes the high word with floor(y * 16383 + .001). Nanite's
-  // normalized UV grid has 16384 steps. A half-cell offset survives that
-  // conversion while also preserving the conventional round decoder on FBX.
-  const float HighUV = High == 0 ? 0.f : FMath::Min((High + .499f) / 16383.f, 1.f);
-  return FVector2f(static_cast<float>(Low) / 16383.0f, HighUV);
+inline float PackUV3Word(int32 Word, int32 RippleNibble, int32 ExponentBias) {
+  const float Magnitude = (1.f + Word / 16384.f) * (1 << (ExponentBias + (RippleNibble & 7)));
+  return (RippleNibble & 8) ? -Magnitude : Magnitude;
 }
+
+inline FVector2f EncodeUV3(int32 PositionCode, int32 DirectionCode, int32 WeightCode, float Ripple) {
+  const int32 Low = (DirectionCode % 64) * 256 + WeightCode;
+  const int32 High = PositionCode * 16 + DirectionCode / 64;
+  const int32 RippleCode = FMath::RoundToInt(FMath::Clamp(Ripple, 0.f, 1.f) * 255.f);
+  return FVector2f(PackUV3Word(Low, RippleCode & 15, 1), PackUV3Word(High, RippleCode >> 4, 0));
+}
+
+#if WITH_DEV_AUTOMATION_TESTS
+inline uint32 UV3Bits(float Value) {
+  uint32 Bits;
+  FMemory::Memcpy(&Bits, &Value, sizeof(Bits));
+  return Bits;
+}
+inline int32 UV3Word(float Value) { return (UV3Bits(Value) >> 9) & 16383; }
+inline int32 RippleNibble(float Value, int32 Bias) {
+  const uint32 Bits = UV3Bits(Value);
+  return int32((Bits >> 23) & 255) - 127 - Bias + int32(Bits >> 31) * 8;
+}
+#endif
 
 // 位置焊接：把距离 <= WeldEpsilon 的重复顶点并入同一并查集组，返回被合并的顶点数量。
 // 只用于连通片判定（合成风按片写数据），不修改网格顶点；共享顶点已正常的网格不会有任何变化。
@@ -4456,7 +4468,7 @@ static int32 PlantWindConsistencyGroupCap(EPlantWindFrondMergeMode MergeMode) {
   return MergeMode == EPlantWindFrondMergeMode::ConnectedCluster ? 512 : 32;
 }
 
-// UV3 是 16383 进制编码，必须 32bit UV 精度，因此同时把该 LOD 的 UV 精度设为全精度。
+// UV3 是带 Ripple 的打包数据，必须 32bit UV 精度，因此同时把该 LOD 的 UV 精度设为全精度。
 // Atlas and Opaque variants can share an MI. Derive one decoding domain from
 // the complete source asset, including variants outside the current export.
 struct FPlantBranch2Bounds {
@@ -5509,7 +5521,7 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
         UVs.Set(VertexInstanceID,2,FVector2f(Weight,Ripple));
         if (bWriteBranch2)
           UVs.Set(VertexInstanceID,3,AssetHivePlantWind::EncodeUV3(M ? M->ChildPosition : 0,M ? M->ChildDirection : 0,
-              AssetHivePlantWind::ToUV3Code(ChildWeight,DecodeBounds.Min.Z,DecodeBounds.Max.Z-DecodeBounds.Min.Z,AssetHivePlantWind::UV3WeightCodeMax)));
+              AssetHivePlantWind::ToUV3Code(ChildWeight,DecodeBounds.Min.Z,DecodeBounds.Max.Z-DecodeBounds.Min.Z,AssetHivePlantWind::UV3WeightCodeMax), Ripple));
         continue;
       }
       const FPlantWindIsland *Source = nullptr;
@@ -5589,7 +5601,7 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
         const float ChildPeak = Style == EPlantSyntheticWind::Palm ? 0.89f : Style == EPlantSyntheticWind::Tree ? 0.80f : 0.64f;
         const float ChildWeight = ChildSupport * Axial * ChildPeak;
         const int32 WeightCode = FMath::RoundToInt(ChildWeight * AssetHivePlantWind::UV3WeightCodeMax);
-        UVs.Set(VertexInstanceID, 3, AssetHivePlantWind::EncodeUV3(Source->PositionCode, Source->DirectionCode, WeightCode));
+        UVs.Set(VertexInstanceID, 3, AssetHivePlantWind::EncodeUV3(Source->PositionCode, Source->DirectionCode, WeightCode, BlendedRippleWeight));
       }
     }
 
@@ -7813,7 +7825,7 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
         {AssetHivePlantWind::ScalarDirectionRange, DecodeBounds.Max.Y},
         {AssetHivePlantWind::ScalarWeightMin, DecodeBounds.Min.Z},
         {AssetHivePlantWind::ScalarWeightRange, DecodeBounds.Max.Z},
-        {TEXT("UV3 Remap Bounds Mode"), 1.f},
+        {TEXT("UV3 Remap Bounds Mode"), bSyntheticWindBranch2 ? 2.f : 1.f},
         {TEXT("SharedStartHeight"), Motion.SharedStartHeight},
         {TEXT("Branch1StretchLimit"), Motion.Primary.Stretch * Scale},
         {TEXT("Branch2StretchLimit"), Motion.Secondary.Stretch * Scale},
@@ -10974,9 +10986,9 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                                       AssetHivePlantWind::DirectionMin,
                                       AssetHivePlantWind::DirectionRange,
                                       AssetHivePlantWind::UV3CodeMax),
-        AssetHivePlantWind::UV3WeightCodeMax);
-    const int32 Low = FMath::RoundToInt(Encoded.X * 16383.0f);
-    const int32 High = FMath::RoundToInt(Encoded.Y * 16383.0f);
+        AssetHivePlantWind::UV3WeightCodeMax, 0.5f);
+    const int32 Low = AssetHivePlantWind::UV3Word(Encoded.X);
+    const int32 High = AssetHivePlantWind::UV3Word(Encoded.Y);
     const float DecodedPosition =
         AssetHivePlantWind::PositionMin +
         (static_cast<float>(High / 16) / 1023.0f) * AssetHivePlantWind::PositionRange;
@@ -10992,13 +11004,14 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
     TestTrue(TEXT("UV3 round-trips packed direction"),
              FMath::Abs(DecodedDirection - PackedDirection) < 0.02f);
     TestTrue(TEXT("UV3 round-trips weight"), FMath::Abs(DecodedWeight - 1.0f) < 0.001f);
-    int32 BrokenHighWords = 0;
-    for (int32 Word=0; Word<16384; ++Word) {
-      const float V = AssetHivePlantWind::EncodeUV3(Word / 16, (Word % 16)*64, 0).Y;
-      const float NaniteV = FMath::RoundToFloat(V * 16384.f) / 16384.f;
-      if (FMath::FloorToInt(NaniteV * 16383.f + .001f) != Word) ++BrokenHighWords;
+    bool bExact = true;
+    for (int32 Word = 0; Word < 16384; ++Word) {
+      const int32 R = Word & 255;
+      const FVector2f UV = AssetHivePlantWind::EncodeUV3(Word / 16, (Word % 16) * 64, Word & 255, R / 255.f);
+      bExact &= AssetHivePlantWind::UV3Word(UV.Y) == Word && (AssetHivePlantWind::UV3Word(UV.X) & 255) == (Word & 255)
+             && AssetHivePlantWind::RippleNibble(UV.X, 1) + 16 * AssetHivePlantWind::RippleNibble(UV.Y, 0) == R;
     }
-    TestEqual(TEXT("All Branch2 high words survive Nanite UV quantization and the Zion floor decoder"), BrokenHighWords, 0);
+    TestTrue(TEXT("UV3 preserves every high word and every Ripple code"), bExact);
     TestTrue(TEXT("Packed direction decodes back to up vector"),
              FVector3f::DotProduct(AssetHivePlantWind::DecodeDirection(DecodedDirection),
                                    FVector3f(0.0f, 0.0f, 1.0f)) > 0.96f);
@@ -12155,7 +12168,7 @@ bool FAssetHivePlantWindGrassHeightWeightTest::RunTest(const FString &Parameters
   float MaxChildWeight = 0.f;
   for (const FVertexInstanceID Id : Bush->VertexInstances().GetElementIDs()) {
     const float ParentWeight = BushUVs.Get(Id, 2).X;
-    const float ChildWeight = (FMath::RoundToInt(BushUVs.Get(Id, 3).X * 16383.f) % 256) / 255.f;
+    const float ChildWeight = (AssetHivePlantWind::UV3Word(BushUVs.Get(Id, 3).X) % 256) / 255.f;
     MaxChildWeight = FMath::Max(MaxChildWeight, ChildWeight);
     LargestDifference = FMath::Max(LargestDifference, FMath::Abs(ParentWeight - ChildWeight));
     if (BushAttributes.GetVertexPositions()[Bush->GetVertexInstanceVertex(Id)].Z == 0.f) {
@@ -12377,9 +12390,10 @@ bool FAssetHiveWindFbxSamplesTest::RunTest(const FString &Parameters) {
         RippleMax = FMath::Max(RippleMax, Weights.Y);
         if (bBush) {
           const auto Packed = UVs.Get(Id, 3);
-          bValid &= !Packed.ContainsNaN() && FMath::IsWithinInclusive(Packed.X, 0.f, 1.f)
-              && FMath::IsWithinInclusive(Packed.Y, 0.f, 1.f);
-          const float Child = (FMath::RoundToInt(Packed.X * 16383.f) % 256) / 255.f;
+          const int32 RippleCode = AssetHivePlantWind::RippleNibble(Packed.X, 1)
+              + 16 * AssetHivePlantWind::RippleNibble(Packed.Y, 0);
+          bValid &= !Packed.ContainsNaN() && RippleCode == FMath::RoundToInt(Weights.Y * 255.f);
+          const float Child = (AssetHivePlantWind::UV3Word(Packed.X) % 256) / 255.f;
           ChildMax = FMath::Max(ChildMax, Child);
           LayerDifference = FMath::Max(LayerDifference, FMath::Abs(Child - Weights.X));
         }
