@@ -77,6 +77,7 @@ void FAssetHiveModule::Reply(const FString& RequestId, const FString& Type, cons
     Response->SetStringField(TEXT("type"), Type);
     Response->SetStringField(TEXT("requestId"), RequestId);
     Response->SetStringField(TEXT("message"), Message);
+    if (Type == TEXT("error")) Response->SetBoolField(TEXT("rejectedBeforeImport"), true);
     SendJson(Response);
 }
 
@@ -189,14 +190,16 @@ void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJso
     // Read the project setting for each NEW import. Desktop payloads cannot override it.
     const FString Root = UAssetHiveSettings::GetImportRootPath();
     TArray<FString> ImportedFolders;
+    TArray<TSharedPtr<FJsonValue>> AssetResults;
     const int32 ExitCode = Importer->ImportJob(Job, Root, [this, RequestId](int32 Percent, const FString& Stage, bool bShowInEditor)
     {
         RecordProgress(RequestId, Percent, Stage, bShowInEditor);
-    }, &ImportedFolders);
+    }, &ImportedFolders, &AssetResults);
     auto Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("type"), ExitCode == 0 ? TEXT("complete") : TEXT("error"));
     Result->SetStringField(TEXT("requestId"), RequestId);
     Result->SetStringField(TEXT("destinationPath"), Root);
+    Result->SetArrayField(TEXT("assetResults"), AssetResults);
     Result->SetStringField(TEXT("message"), ExitCode == 0 ? TEXT("Unreal 导入完成") : TEXT("导入失败，请查看 Unreal Output Log"));
     RequestStates.Add(RequestId, Result);
     CompletedRequests.Add(RequestId);
@@ -211,7 +214,7 @@ void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJso
     if (ImportProgressHandle.IsValid())
         FSlateNotificationManager::Get().CancelProgressNotification(*ImportProgressHandle);
     ImportProgressHandle.Reset();
-    if (ExitCode == 0 && !ImportedFolders.IsEmpty() && !IsRunningCommandlet())
+    if (!ImportedFolders.IsEmpty() && !IsRunningCommandlet())
     {
         FContentBrowserModule& ContentBrowser = FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser"));
         ContentBrowser.Get().SyncBrowserToFolders(ImportedFolders, false, true);

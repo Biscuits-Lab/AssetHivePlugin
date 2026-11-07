@@ -39,6 +39,7 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopeExit.h"
 #include "Misc/PackageName.h"
 #include "ObjectTools.h"
 #include "PixelFormat.h"
@@ -1748,8 +1749,8 @@ static bool HasZionTaggedAsset(const TSharedPtr<FJsonObject> &AssetObject) {
   }
   for (const TSharedPtr<FJsonValue> &Value : *ZionTagValues) {
     FString Tag;
-    if (Value.IsValid() && Value->TryGetString(Tag) &&
-        !Tag.TrimStartAndEnd().IsEmpty()) {
+    if (Value.IsValid() && Value->Type == EJson::String &&
+        Value->TryGetString(Tag) && !Tag.TrimStartAndEnd().IsEmpty()) {
       return true;
     }
   }
@@ -1843,7 +1844,7 @@ static FString ResolveZionPlantParentMaterialPath(
       StandardTags) {
     for (const TSharedPtr<FJsonValue> &Value : *StandardTags) {
       FString Tag;
-      if (Value.IsValid() && Value->TryGetString(Tag)) {
+      if (Value.IsValid() && Value->Type == EJson::String && Value->TryGetString(Tag)) {
         Tag.TrimStartAndEndInline();
         bBush |= Tag.Equals(TEXT("Bush"), ESearchCase::IgnoreCase);
         bGrass |= Tag.Equals(TEXT("Grass"), ESearchCase::IgnoreCase);
@@ -7984,7 +7985,8 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params) {
 
 int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const FString& DestinationPath, TFunction<void(int32, const FString&, bool)> OnProgress,
-    TArray<FString>* OutImportedFolders) {
+    TArray<FString>* OutImportedFolders, TArray<TSharedPtr<FJsonValue>>* OutAssetResults) {
+  if (OutAssetResults) OutAssetResults->Reset();
   TGuardValue<bool> ImportFailureGuard(GAssetHiveImportFailed, false);
   if (OutImportedFolders) OutImportedFolders->Reset();
   if (!Root.IsValid() || !UAssetHiveSettings::IsValidImportRootPath(DestinationPath)) {
@@ -8025,6 +8027,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
   }
 #endif
 
+  bool bAnyAssetFailed = false;
   const int32 AssetCount = AssetsJson->Num();
   int32 AssetIndex = 0;
   for (const TSharedPtr<FJsonValue> &AssetValue : *AssetsJson) {
@@ -8044,6 +8047,20 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     FString AssetId = TEXT("");
     AssetObject->TryGetStringField(TEXT("name"), AssetName);
     AssetObject->TryGetStringField(TEXT("id"), AssetId);
+    const FString ResultId = AssetId;
+    FString FailureMessage;
+    TGuardValue<bool> AssetFailureGuard(GAssetHiveImportFailed, false);
+    ON_SCOPE_EXIT {
+      ++AssetIndex;
+      bAnyAssetFailed |= GAssetHiveImportFailed;
+      if (OutAssetResults) {
+        auto Item = MakeShared<FJsonObject>();
+        Item->SetStringField(TEXT("assetId"), ResultId);
+        Item->SetStringField(TEXT("status"), GAssetHiveImportFailed ? TEXT("failed") : TEXT("success"));
+        if (!FailureMessage.IsEmpty()) Item->SetStringField(TEXT("message"), FailureMessage);
+        OutAssetResults->Add(MakeShared<FJsonValueObject>(Item));
+      }
+    };
     FString AssetType = TEXT("");
     AssetObject->TryGetStringField(TEXT("assetType"), AssetType);
     FString AssetSource = TEXT("");
@@ -8564,6 +8581,52 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
 
+    const auto TextureSlotForFile = [&](const FString& SourceKey, const FString& SourceFile, int32 GroupId) {
+      const auto* Group = SourceTextureSlotMapByGroup.Find(GroupId);
+      const FString* ExplicitSlot = Group ? Group->Find(SourceKey) : nullptr;
+      return ExplicitSlot ? *ExplicitSlot : DetectTextureSlot(SourceFile);
+    };
+
+    // Resolve the parents this asset will use before creating any mesh or texture packages.
+    TOptional<FString> MissingParent;
+    if (bIsSurface && !UAssetHiveSettings::GetSurfaceParentMaterial()) {
+      MissingParent = UAssetHiveSettings::GetSurfaceParentMaterialPath();
+    } else if (bIsDecal && !UAssetHiveSettings::GetDecalParentMaterial(DecalParentMode)) {
+      MissingParent = UAssetHiveSettings::GetDecalParentMaterialPath(DecalParentMode);
+    } else if (bIs3DAsset) {
+      TMap<int32, bool> MaskedByGroup;
+      const TArray<TSharedPtr<FJsonValue>>* Files = nullptr;
+      if (EnvironmentProfile.bBaseFamily && AssetObject->TryGetArrayField(TEXT("textureFiles"), Files)) {
+        for (const auto& File : *Files) {
+          if (!File.IsValid() || File->Type != EJson::String) continue;
+          const FString SourceFile = File->AsString();
+          if (!FPaths::FileExists(SourceFile)) continue;
+          const FString Key = NormalizePathLower(SourceFile);
+          const int32 GroupId = FMath::Max(1, SourceTextureGroupByPath.FindRef(Key));
+          const FString Slot = TextureSlotForFile(Key, SourceFile, GroupId);
+          if (!Slot.IsEmpty()) MaskedByGroup.FindOrAdd(GroupId) |= Slot == TEXT("opacity");
+        }
+      }
+      if (MaskedByGroup.IsEmpty()) MaskedByGroup.Add(1, false);
+      TSet<bool> CheckedModes;
+      for (const auto& Group : MaskedByGroup) {
+        if (CheckedModes.Contains(Group.Value)) continue;
+        CheckedModes.Add(Group.Value);
+        if (!UAssetHiveSettings::GetAssetParentMaterial(EnvironmentProfile.TypeKey, Group.Value)) {
+          MissingParent = UAssetHiveSettings::GetAssetParentMaterialPath(EnvironmentProfile.TypeKey, Group.Value);
+          break;
+        }
+      }
+    }
+    if (MissingParent.IsSet()) {
+      GAssetHiveImportFailed = true;
+      FailureMessage = MissingParent->IsEmpty()
+          ? FString::Printf(TEXT("%s 未配置父材质"), *AssetName)
+          : FString::Printf(TEXT("缺少父材质：%s"), **MissingParent);
+      UE_LOG(LogTemp, Error, TEXT("AssetHive: %s: %s"), *AssetName, *FailureMessage);
+      continue;
+    }
+
     TArray<UStaticMesh *> ImportedMeshes;
     TMap<UStaticMesh *, FString> SourceFileByMesh;
     // Model variant key per imported mesh; keys ending with OPAQUE mark cut
@@ -8896,11 +8959,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             continue;
           }
         }
-        const TMap<FString, FString> &GroupSlotMap =
-            SourceTextureSlotMapByGroup.FindOrAdd(GroupId);
-        const FString SlotName = GroupSlotMap.Contains(SourceKey)
-                                     ? GroupSlotMap[SourceKey]
-                                     : DetectTextureSlot(SourceFile);
+        const FString SlotName = TextureSlotForFile(SourceKey, SourceFile, GroupId);
         const bool bNormalSlot = SlotName == TEXT("normal");
         const bool bFlipGreenForOpenGL =
             bNormalSlot &&
@@ -9964,12 +10023,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // The import target is authoritative here. AssetRegistry visibility can lag
     // behind synchronous imports until later in the frame, so gating this on
     // HasAssets may suppress the post-import Content Browser navigation.
-    if (OutImportedFolders) {
+    if (OutImportedFolders && !GAssetHiveImportFailed) {
       OutImportedFolders->AddUnique(AssetFolder);
     }
     SetStageProgress(static_cast<float>(AssetEndProgress),
                      FString::Printf(TEXT("资产完成: %s"), *AssetName), false);
-    AssetIndex++;
   }
   SetStageProgress(100.0f, TEXT("导入完成"), false);
 #if (ENGINE_MAJOR_VERSION >= 5 && ENGINE_MINOR_VERSION >= 4)
@@ -9986,14 +10044,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 #endif
   UE_LOG(LogTemp, Display, TEXT("AssetHive import completed: %s"),
          *DestinationPath);
-  return GAssetHiveImportFailed ? 1 : 0;
+  return bAnyAssetFailed || GAssetHiveImportFailed ? 1 : 0;
 }
 
 
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Misc/AutomationTest.h"
 #include "Misc/CommandLine.h"
-#include "Misc/ScopeExit.h"
 #include "PackageTools.h"
 #include "StaticMeshCompiler.h"
 #include "MeshDescription.h"
@@ -11121,10 +11178,10 @@ bool FZionAssetHiveBushParentMaterialTest::RunTest(const FString &Parameters) {
   Asset->SetArrayField(TEXT("tags"), {MakeShared<FJsonValueString>(TEXT("Bush"))});
   Asset->SetArrayField(TEXT("standardAssetTags"),
                       {MakeShared<FJsonValueString>(TEXT("Tree"))});
-  TestEqual(TEXT("Standard Tree remains Tree despite Bush category and ordinary tags"),
+  TestEqual(TEXT("Standard Tree uses its trunk/branch parent despite Bush category and ordinary tags"),
             ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset,
                                                TEXT("Rose_Branch")),
-            FString(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Tree_ST_VT.MI_Env_Tree_ST_VT")));
+            FString(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Tree_ST_TrunkBranch_VT.MI_Env_Tree_ST_TrunkBranch_VT")));
   Asset->SetArrayField(TEXT("standardAssetTags"),
                       {MakeShared<FJsonValueString>(TEXT("Grass"))});
   TestEqual(TEXT("Grass keeps its own parent even with a Branch slot"),
