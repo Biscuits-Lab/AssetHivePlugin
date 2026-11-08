@@ -348,6 +348,8 @@ constexpr int32 UV3CodeMax = 1023;
 constexpr int32 UV3WeightCodeMax = 255;
 
 const TCHAR *const SwitchUseRemappedUV3 = TEXT("Use Remapped UV3");
+const FName ScalarUV3BoundsMode(TEXT("UV3 Remap Bounds Mode"));
+constexpr float DefaultUV3BoundsMode = 2.f;
 const TCHAR *const SwitchBranch1Enable = TEXT("Branch1Enable");
 const TCHAR *const SwitchBranch2Enable = TEXT("Branch2Enable");
 const TCHAR *const SwitchHasBranch2Data = TEXT("HasBranch2Data_Internal");
@@ -689,6 +691,8 @@ struct FHerbWindAxis {
 };
 struct FHerbWindBinding {
   FHerbWindAxis Primary, Secondary, Blade;
+  FVector3f RootContact = FVector3f::ZeroVector;
+  float RootInner = 0.f, RootOuter = 0.f;
   float PrimaryAttachment = 0.f, SecondaryAttachment = 0.f;
   bool bTerminal = false;
 };
@@ -1456,9 +1460,12 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
       CategoryToken == TEXT("fern") || CategoryToken == TEXT("herb") ||
       CategoryToken == TEXT("gardenplant") || CategoryToken == TEXT("weed") ||
       CategoryToken == TEXT("groundcover") || CategoryToken == TEXT("houseplant");
-  // 类别优先于 tag：Megascans 植被的 standardAssetTags 通常只有 "Megascans"，
-  // 分档信息只在 category 字段里，靠 tag 判断会全部落到默认分支。
-  if (bShrubCategory) {
+  // 标准植被子类优先；仅来源标签的旧 Bridge 记录再按库分类分档。
+  const bool bExplicitTree = HasAssetTag(Tags, TEXT("Tree"));
+  const bool bExplicitHero = HasAssetTag(Tags, TEXT("HeroFoliage"));
+  const bool bExplicitBush = HasAssetTag(Tags, TEXT("Bush"));
+  const bool bExplicitGrass = HasAssetTag(Tags, TEXT("Grass"));
+  if (bShrubCategory && !(bExplicitTree || bExplicitHero || bExplicitBush || bExplicitGrass)) {
     Profile.SubtypeFolder = TEXT("Bush");
     Profile.MaxLOD0Triangles = 35000;
     Profile.MaxLOD0TrianglesOpaque = 300000;
@@ -1468,14 +1475,15 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
     }
     return Profile;
   }
-  if (HasAssetTag(Tags, TEXT("Tree"))) {
+  if (bExplicitTree || (!bExplicitHero && !bExplicitBush && !bExplicitGrass &&
+      (CategoryToken == TEXT("tree") || CategoryToken == TEXT("palm")))) {
     Profile.SubtypeFolder = TEXT("Tree");
     Profile.MaxLOD0Triangles = 100000;
     Profile.bHandleCollision = true;
     Profile.bTrunkCollision = true;
     return Profile;
   }
-  if (HasAssetTag(Tags, TEXT("Bush"))) {
+  if (bExplicitBush && !bExplicitHero) {
     Profile.SubtypeFolder = TEXT("Bush");
     Profile.MaxLOD0Triangles = 35000;
     Profile.MaxLOD0TrianglesOpaque = 300000;
@@ -1485,7 +1493,7 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
     }
     return Profile;
   }
-  if (HasAssetTag(Tags, TEXT("Grass"))) {
+  if (bExplicitGrass && !bExplicitHero) {
     Profile.SubtypeFolder = TEXT("Grass");
     Profile.MaxLOD0Triangles = 10000;
     Profile.MaxLOD0TrianglesOpaque = 150000;
@@ -1496,7 +1504,7 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
     return Profile;
   }
 
-  if (HasAssetTag(Tags, TEXT("HeroFoliage"))) {
+  if (bExplicitHero || CategoryToken == TEXT("herofoliage")) {
     Profile.SubtypeFolder = TEXT("HeroFoliage");
     Profile.MaxLOD0Triangles = 200000;
     Profile.bHandleCollision = true;
@@ -1805,12 +1813,18 @@ static FString NormalizeZionTreeSlotSuffix(const FString &SlotName) {
   Name.ReplaceInline(TEXT("_tiling"), TEXT("tiling"), ESearchCase::CaseSensitive);
   int32 Separator = INDEX_NONE;
   const FString Tail = Name.FindLastChar(TEXT('_'), Separator) ? Name.Mid(Separator + 1) : Name;
-  const FString &Alias = Tail;
-  for (const TCHAR *Prefix : {TEXT("trunkbranch"), TEXT("trunk"), TEXT("branch"), TEXT("bark"), TEXT("tb")}) {
-    const FString Root(Prefix);
-    if (Alias == Root + TEXT("tilingpom")) return TEXT("TrunkBranchTilingPOM");
-    if (Alias == Root + TEXT("tiling")) return TEXT("TrunkBranchTiling");
-    if (Alias == Root) return TEXT("TrunkBranch");
+  // A source role may be followed by a section name. Keep the old TB/Bark aliases
+  // terminal-only and choose the most specific role even if several tokens occur.
+  TArray<FString> Parts;
+  Name.ParseIntoArray(Parts, TEXT("_"), true);
+  for (const TCHAR *Modifier : {TEXT("tilingpom"), TEXT("tiling"), TEXT("")}) {
+    const FString Mod(Modifier);
+    bool bMatch = Tail == TEXT("tb") + Mod || Tail == TEXT("bark") + Mod;
+    for (const TCHAR *Root : {TEXT("trunkbranch"), TEXT("trunk"), TEXT("branch")}) {
+      bMatch |= Parts.Contains(FString(Root) + Mod);
+    }
+    if (bMatch) return Mod.IsEmpty() ? TEXT("TrunkBranch")
+        : Mod == TEXT("tiling") ? TEXT("TrunkBranchTiling") : TEXT("TrunkBranchTilingPOM");
   }
   return FString();
 }
@@ -1831,24 +1845,44 @@ static FString ResolveTreeWindParent(const FString &MaterialSlotName,
   return TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Tree_ST_VT.MI_Env_Tree_ST_VT");
 }
 
-// Zion 原生 ST 父材质只认标准标签；材质槽的角色后缀决定专用父材质。
+static FString ThirdPartyWindMode(const TSharedPtr<FJsonObject>& Asset) {
+  FString Mode;
+  Asset->TryGetStringField(TEXT("plantSyntheticWind"), Mode);
+  Mode = Mode.TrimStartAndEnd().ToLower();
+  if (Mode != TEXT("auto")) return Mode;
+  const TSharedPtr<FJsonObject>* Layers = nullptr;
+  if (Asset->TryGetObjectField(TEXT("plantWindLayers"), Layers) && Layers && Layers->IsValid() &&
+      (*Layers)->TryGetStringField(TEXT("form"), Mode)) return Mode.TrimStartAndEnd().ToLower();
+  FString Category;
+  Asset->TryGetStringField(TEXT("plantCategory"), Category);
+  Category = Category.TrimStartAndEnd().ToLower();
+  if (Category == TEXT("tree") || Category == TEXT("palm")) return Category;
+  const auto Profile = ResolvePlantAssetProfile({TEXT("Megascans")}, Category);
+  if (Profile.SyntheticWind == EPlantSyntheticWind::Branch1Branch2UV3) return TEXT("bush");
+  if (Profile.SyntheticWind == EPlantSyntheticWind::Fern) return TEXT("fern");
+  return TEXT("grass");
+}
+
+static FString ThirdPartyWindSubtype(const FString& Mode) {
+  if (Mode == TEXT("bush")) return TEXT("Bush");
+  if (Mode == TEXT("tree")) return TEXT("Tree");
+  if (Mode == TEXT("grass") || Mode == TEXT("herb") || Mode == TEXT("fern") ||
+      Mode == TEXT("palm") || Mode == TEXT("groundcover")) return TEXT("Grass");
+  return FString();
+}
+
 static FString ResolveZionPlantParentMaterialPath(
     const FString &AssetType, const TSharedPtr<FJsonObject> &AssetObject,
     const FString &MaterialSlotName = FString(),
     const FString &ImportedMaterialSlotName = FString(),
     FString *OutMaterialSuffix = nullptr) {
   if (OutMaterialSuffix) OutMaterialSuffix->Reset();
-  if (!AssetType.Equals(TEXT("3dplant"), ESearchCase::IgnoreCase) ||
-      !HasZionTaggedAsset(AssetObject)) {
-    return FString();
-  }
-  // 新 job 区分真实标签与导出端为目录规则补的 Zion 占位；旧 job 沿用其 zionTags。
-  bool bHasExplicitZionTags = true;
-  AssetObject->TryGetBoolField(TEXT("hasExplicitZionTags"), bHasExplicitZionTags);
-  if (!bHasExplicitZionTags) {
+  if (!AssetType.Equals(TEXT("3dplant"), ESearchCase::IgnoreCase) || !AssetObject.IsValid()) {
     return FString();
   }
   const TArray<TSharedPtr<FJsonValue>> *StandardTags = nullptr;
+  bool bMicro = false;
+  bool bThirdParty = false;
   bool bBush = false;
   bool bGrass = false;
   bool bTree = false;
@@ -1858,12 +1892,25 @@ static FString ResolveZionPlantParentMaterialPath(
       FString Tag;
       if (Value.IsValid() && Value->Type == EJson::String && Value->TryGetString(Tag)) {
         Tag.TrimStartAndEndInline();
+        bMicro |= Tag.Equals(TEXT("Micro"), ESearchCase::IgnoreCase) ||
+                  Tag.Equals(TEXT("MicroFoliage"), ESearchCase::IgnoreCase);
+        bThirdParty |= Tag.Equals(TEXT("ThirdParty"), ESearchCase::IgnoreCase) ||
+                       Tag.Equals(TEXT("Megascans"), ESearchCase::IgnoreCase) ||
+                       Tag.Equals(TEXT("PBRMAX"), ESearchCase::IgnoreCase) || Tag == TEXT("第三方");
         bBush |= Tag.Equals(TEXT("Bush"), ESearchCase::IgnoreCase);
         bGrass |= Tag.Equals(TEXT("Grass"), ESearchCase::IgnoreCase);
         bTree |= Tag.Equals(TEXT("Tree"), ESearchCase::IgnoreCase) ||
                  Tag.Equals(TEXT("HeroFoliage"), ESearchCase::IgnoreCase);
       }
     }
+  }
+  if (bMicro) return TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Micro_ST_VT.MI_Env_Micro_ST_VT");
+  if (bThirdParty) {
+    const FString Subtype = ThirdPartyWindSubtype(ThirdPartyWindMode(AssetObject));
+    if (Subtype.IsEmpty()) return TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Foliage_ThirdParty_VT.MI_Env_Foliage_ThirdParty_VT");
+    bTree = Subtype == TEXT("Tree");
+    bBush = Subtype == TEXT("Bush");
+    bGrass = Subtype == TEXT("Grass");
   }
   if (bTree) {
     return ResolveTreeWindParent(MaterialSlotName, ImportedMaterialSlotName, OutMaterialSuffix);
@@ -3957,6 +4004,7 @@ static float NormalizePlantWindCardReferenceYaw(
     Card.SupportDirection = RotatePlantWindYaw(Card.SupportDirection, AppliedYaw);
   }
   for (auto& B : Reference.LayerBindings) {
+    if (B.RootOuter > 0.f) B.RootContact = RotatePlantWindYaw(B.RootContact, AppliedYaw);
     for (auto* A : {&B.Primary,&B.Secondary,&B.Blade}) {
       A->Base=RotatePlantWindYaw(A->Base,AppliedYaw); A->Tip=RotatePlantWindYaw(A->Tip,AppliedYaw);
     }
@@ -4280,6 +4328,19 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
     }
     B.PrimaryAttachment=B.Primary.Length()>SMALL_NUMBER ? float(W1) : 0.f;
     B.SecondaryAttachment=B.Secondary.Length()>SMALL_NUMBER ? float(W2) : 0.f;
+    if (Row.HasField(TEXT("rootContact"))) {
+      const TSharedPtr<FJsonObject>* Contact = nullptr;
+      double Inner = 0., Outer = 0.;
+      if (!Row.TryGetObjectField(TEXT("rootContact"), Contact) || !Contact || !Contact->IsValid() ||
+          !(*Contact)->HasField(TEXT("center")) || !Vector((*Contact)->Values.FindChecked(TEXT("center")), B.RootContact) ||
+          !(*Contact)->TryGetNumberField(TEXT("innerHeight"), Inner) || !(*Contact)->TryGetNumberField(TEXT("outerHeight"), Outer) ||
+          !FMath::IsFinite(Inner) || !FMath::IsFinite(Outer) || Inner < 0. || Outer <= Inner) {
+        Error = TEXT("invalid root contact"); return false;
+      }
+      B.RootContact = Islands.MeshMin + B.RootContact * Size;
+      B.RootInner = float(Inner * Size.Z);
+      B.RootOuter = float(Outer * Size.Z);
+    }
     Matched[Best]=true;
   }
   return true;
@@ -5502,7 +5563,8 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
           const auto WeightsAt = [&](const FVector3f& Position) {
             const float Primary = B.PrimaryAttachment < 0.f ? B.Primary.Along(Position) : B.PrimaryAttachment;
             const float Child = B.SecondaryAttachment < 0.f ? B.Secondary.Along(Position) : B.SecondaryAttachment;
-            return FVector3f(.70f * FMath::SmoothStep(.025f,1.f,Primary),
+            const float Root = B.RootOuter > 0.f ? FMath::SmoothStep(B.RootInner, B.RootOuter, FVector3f::Dist(Position, B.RootContact)) : 1.f;
+            return Root * FVector3f(.70f * FMath::SmoothStep(.025f,1.f,Primary),
                              .64f * FMath::SmoothStep(.035f,1.f,Child),
                              M->Ripple * FMath::SmoothStep(.30f,1.f,B.Blade.Along(Position)));
           };
@@ -7486,6 +7548,12 @@ static void ApplyZionNativeWindParameters(
   Instance->Parent->GetAllStaticSwitchParameterInfo(Switches, SwitchIds);
   TSet<FString> Missing;
   int32 Applied = 0;
+  // Reset stale instance overrides on reimport. Explicit file and slot formats take precedence below.
+  const FMaterialParameterInfo ModeParameter(AssetHivePlantWind::ScalarUV3BoundsMode);
+  if (Scalars.Contains(ModeParameter)) {
+    Instance->SetScalarParameterValueEditorOnly(ModeParameter, AssetHivePlantWind::DefaultUV3BoundsMode);
+    ++Applied;
+  }
   const FName OpacitySwitch(*UAssetHiveSettings::GetPlantUseOpacityMaskedSwitch());
   for (const auto &Source : {Profile, Material}) {
     if (const auto Values = GetZionWindObject(Source, TEXT("scalarParameters"))) {
@@ -7825,7 +7893,7 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
         {AssetHivePlantWind::ScalarDirectionRange, DecodeBounds.Max.Y},
         {AssetHivePlantWind::ScalarWeightMin, DecodeBounds.Min.Z},
         {AssetHivePlantWind::ScalarWeightRange, DecodeBounds.Max.Z},
-        {TEXT("UV3 Remap Bounds Mode"), bSyntheticWindBranch2 ? 2.f : 1.f},
+        {AssetHivePlantWind::ScalarUV3BoundsMode, AssetHivePlantWind::DefaultUV3BoundsMode},
         {TEXT("SharedStartHeight"), Motion.SharedStartHeight},
         {TEXT("Branch1StretchLimit"), Motion.Primary.Stretch * Scale},
         {TEXT("Branch2StretchLimit"), Motion.Secondary.Stretch * Scale},
@@ -8170,7 +8238,21 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // category 里（Shrub / Grass / Fern …），靠 tag 会全部落到默认分支。
       FString PlantCategory;
       AssetObject->TryGetStringField(TEXT("plantCategory"), PlantCategory);
-      PlantProfile = ResolvePlantAssetProfile(AssetStandardTags, PlantCategory);
+      TArray<FString> ProfileTags = EnvironmentProfileTags;
+      const bool bThirdPartyProfile = IsThirdPartyAsset(AssetStandardTags);
+      FString SyntheticWindMode;
+      if (bThirdPartyProfile) {
+        SyntheticWindMode = ThirdPartyWindMode(AssetObject);
+        if (!HasMicroPlantTag(ProfileTags)) {
+          const FString Subtype = ThirdPartyWindSubtype(SyntheticWindMode);
+          ProfileTags = {Subtype.IsEmpty() ? FString(TEXT("Grass")) : Subtype};
+        }
+      } else {
+        AssetObject->TryGetStringField(TEXT("plantSyntheticWind"), SyntheticWindMode);
+      }
+      // Search tags are free text; keep only provenance from them when a standard tag list exists.
+      if (HasAssetTag(AssetStandardTags, TEXT("Megascans"))) ProfileTags.AddUnique(TEXT("Megascans"));
+      PlantProfile = ResolvePlantAssetProfile(ProfileTags, PlantCategory);
       if (bNaniteMasked) PlantProfile.bNanite = true;
       // 合成 SpeedTree 风由导入时选择（grass / bush / fern / auto / 不选），随 job 传入：未选择时
       // 不写风动 UV、也不切换 ST 风母材质；选择后写入的即导出到引擎的那个网格
@@ -8178,8 +8260,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // "auto" = 预设分类 v3：不覆盖，保留 ResolvePlantAssetProfile 按库类别给出的预设
       // （蕨类/草本类 → Fern，灌木 → Bush，草类 → Grass），并把最终选择打进导入日志，
       // 便于美术按资产核对，无需逐个人工挑选。
-      FString SyntheticWindMode;
-      AssetObject->TryGetStringField(TEXT("plantSyntheticWind"), SyntheticWindMode);
       SyntheticWindMode.TrimStartAndEndInline();
       SyntheticWindMode = SyntheticWindMode.ToLower();
       if (PlantProfile.SubtypeFolder == TEXT("Micro") || !AssetHasFbxPlantModels(AssetObject)) {
@@ -8332,8 +8412,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             : FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
     const bool bFbxPlantNaming = AssetType == TEXT("3dplant") && AssetHasFbxPlantModels(AssetObject);
     const bool bUsePlantNaming = bThirdPartyPlant || bFbxPlantNaming;
+    TArray<FString> AuthoredPlantTags;
+    const bool bHasNamingTags = bThirdPartyPlant &&
+        AssetObject->TryGetStringArrayField(TEXT("plantNamingTags"), AuthoredPlantTags);
     const FString PlantObjectStem = bUsePlantNaming
-        ? BuildPlantObjectStem(AssetStandardTags, SafeAssetId, SafeAssetFolderName, bIsZionAsset)
+        ? BuildPlantObjectStem(bHasNamingTags ? AuthoredPlantTags : AssetStandardTags,
+                               SafeAssetId, SafeAssetFolderName, bIsZionAsset)
         : FString();
     const bool bOpaquePlantSet = bFbxPlantNaming && IsOpaquePlantModelSet(AssetObject);
     // Both representations belong to the same Name_ID asset directory.
@@ -9281,7 +9365,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     TMap<FString, UMaterialInstanceConstant *> ZionPlantSlotInstances;
     TMap<FString, FString> ZionPlantNamesByIdentity;
     TSet<FName> ZionPlantUsedMaterialNames;
-    const bool bUseZionSlotMaterials = AssetType == TEXT("3dplant") && bIsZionAsset && !bMicroPlant &&
+    const bool bUseZionSlotMaterials = AssetType == TEXT("3dplant") && !bMicroPlant &&
         (!ZionPlantParentMaterialPath.IsEmpty() || bHasZionNativeWind);
     // A material group uses the median original LOD0 height. A pure Opaque
     // job must use the same source measurements as its masked counterpart.
@@ -9556,7 +9640,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (PlantWindStyle != EPlantSyntheticWind::None || !ZionPlantParentMaterialPath.IsEmpty()) {
             MatchPlantWindTextureStreaming({DiffuseTexture, NormalTexture, ORMTexture, SubsurfaceTexture, OpacityMaskTexture});
           }
-          if (bSyntheticTreeSlots || (bHasMaskedModelVariant && bUseZionSlotMaterials)) {
+          if (bSyntheticTreeSlots || bUseZionSlotMaterials) {
             FZionPlantMaterialInputs Inputs;
             Inputs.MaterialStem = PlantMaterialStem;
             Inputs.ParentPath = ZionPlantParentMaterialPath;
@@ -9578,7 +9662,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 ZionPlantParentMaterialPath, bIsZionAsset, PlantHeightCm,LayerSource.Get(),DecodeBounds, bNaniteMasked);
           }
           // md §5.2：OPAQUE 裁切变体不创建 billboard 材质实例。
-          if (bHasOpaqueModelVariant && !bSyntheticTreeSlots &&
+          if (bHasOpaqueModelVariant && !bSyntheticTreeSlots && !bUseZionSlotMaterials &&
               !MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
             // 勾选不透明剪切 + 合成风时，裁切变体的材质同样使用 ST 风母材质
             // （CreatePlantMaterialInstance 内部保持 Blend=Opaque 覆盖）。
@@ -9857,7 +9941,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         GetMutableNaniteSettings(StaticMesh)->bEnabled = true;
       }
       TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
-      const bool bUseZionSlotsForMesh = (bUseZionSlotMaterials && !bOpaqueMesh) || bSyntheticTreeSlots;
+      const bool bUseZionSlotsForMesh = bUseZionSlotMaterials || bSyntheticTreeSlots;
       const bool bUseOpaqueMaterialSet =
           OpaqueMaterialInstances.Num() > 0 &&
           (bOpaqueMesh || (MaterialInstances.Num() == 0 && !bUseZionSlotsForMesh));
@@ -9910,7 +9994,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               FMath::Min(Index, ZionPlantMaterialGroups.Num() - 1)];
           const FZionPlantMaterialInputs &Inputs = ZionPlantInputsByGroup.FindChecked(GroupId);
           FString RoleSuffix;
-          if (bSyntheticTreeSlots && BillboardSlotIndexes.Contains(Index)) continue;
+          if (BillboardSlotIndexes.Contains(Index)) continue;
           const FString SlotName = Slots[Index].MaterialSlotName.ToString();
           const FString ImportedSlotName = Slots[Index].ImportedMaterialSlotName.ToString();
           FString ParentPath = bSyntheticTreeSlots
@@ -11056,19 +11140,19 @@ bool FZionAssetHiveGrassParentMaterialTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("Null asset never uses the plant override"),
            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), nullptr).IsEmpty());
   Asset->SetBoolField(TEXT("hasExplicitZionTags"), false);
-  TestTrue(TEXT("Synthesized Zion naming placeholder does not count as a tag"),
-           ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset).IsEmpty());
+  TestEqual(TEXT("Grass is independent of Zion naming placeholders"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset), GrassParent);
   Asset->RemoveField(TEXT("hasExplicitZionTags"));
   TestEqual(TEXT("Legacy job keeps support for explicit Zion tags"),
             ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset), GrassParent);
   Asset->SetArrayField(TEXT("zionTags"),
                       {MakeShared<FJsonValueString>(TEXT(" ")),
                        MakeShared<FJsonValueNumber>(42)});
-  TestTrue(TEXT("Blank or non-string Zion tags do not match"),
-           ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset).IsEmpty());
+  TestEqual(TEXT("Grass is independent of malformed Zion tags"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset), GrassParent);
   Asset->RemoveField(TEXT("zionTags"));
-  TestTrue(TEXT("Missing Zion tags do not match"),
-           ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset).IsEmpty());
+  TestEqual(TEXT("Grass without any Zion tag uses ST"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset), GrassParent);
   Asset->SetArrayField(TEXT("zionTags"),
                       {MakeShared<FJsonValueString>(TEXT("Zion"))});
   Asset->SetStringField(TEXT("plantCategory"), TEXT("Grass"));
@@ -11082,6 +11166,21 @@ bool FZionAssetHiveGrassParentMaterialTest::RunTest(const FString &Parameters) {
   Asset->RemoveField(TEXT("standardAssetTags"));
   TestTrue(TEXT("Missing standard tags never fall back to category or ordinary tags"),
            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset).IsEmpty());
+  Asset->SetArrayField(TEXT("standardAssetTags"), {MakeShared<FJsonValueString>(TEXT("ThirdParty"))});
+  Asset->SetStringField(TEXT("plantCategory"), TEXT("Ground Cover"));
+  Asset->SetStringField(TEXT("plantSyntheticWind"), TEXT("none"));
+  TestEqual(TEXT("Third party without wind uses the generic parent"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset),
+            FString(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Foliage_ThirdParty_VT.MI_Env_Foliage_ThirdParty_VT")));
+  Asset->SetStringField(TEXT("plantCategory"), TEXT("Shrub"));
+  Asset->SetStringField(TEXT("plantSyntheticWind"), TEXT("bush"));
+  TestEqual(TEXT("Legacy shrub resolves its original branch slot"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset, TEXT("Slot0"), TEXT("Rose_Branch_01")),
+            FString(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Bush_Branch_ST_VT.MI_Env_Bush_Branch_ST_VT")));
+  Asset->SetArrayField(TEXT("standardAssetTags"), {MakeShared<FJsonValueString>(TEXT("Grass")), MakeShared<FJsonValueString>(TEXT("ThirdParty"))});
+  Asset->SetStringField(TEXT("plantSyntheticWind"), TEXT("herb"));
+  TestEqual(TEXT("Herb preset uses Grass despite the legacy shrub category"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset), GrassParent);
   return true;
 }
 
@@ -11179,12 +11278,12 @@ bool FZionAssetHiveBushParentMaterialTest::RunTest(const FString &Parameters) {
            ResolveZionPlantParentMaterialPath(TEXT("3d"), Asset,
                                               TEXT("Rose_Branch")).IsEmpty());
   Asset->SetBoolField(TEXT("hasExplicitZionTags"), false);
-  TestTrue(TEXT("Automatic Zion naming placeholder does not select Bush"),
-           ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset).IsEmpty());
+  TestEqual(TEXT("Bush is independent of the naming placeholder"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset), BushParent);
   Asset->SetBoolField(TEXT("hasExplicitZionTags"), true);
   Asset->RemoveField(TEXT("zionTags"));
-  TestTrue(TEXT("Bush requires real Zion tags"),
-           ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset).IsEmpty());
+  TestEqual(TEXT("Bush without a Zion tag uses ST"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset), BushParent);
   Asset->SetArrayField(TEXT("zionTags"),
                       {MakeShared<FJsonValueString>(TEXT("Zion"))});
   Asset->SetStringField(TEXT("plantCategory"), TEXT("Bush"));
@@ -11241,8 +11340,8 @@ bool FZionAssetHiveTreeSlotParentTest::RunTest(const FString &Parameters) {
          TPair<FString, FString>(TEXT("Oak_TrunkBranchTillingPOM"), TEXT("MI_Env_Tree_ST_TrunkBranchTilingPOM_VT")),
          TPair<FString, FString>(TEXT("Oak_Leaf"), TEXT("MI_Env_Tree_ST_VT")),
          TPair<FString, FString>(TEXT("Oak_TBLeaf"), TEXT("MI_Env_Tree_ST_VT")),
-         TPair<FString, FString>(TEXT("Oak_TrunkTilling_Leaf"), TEXT("MI_Env_Tree_ST_VT")),
-         TPair<FString, FString>(TEXT("Oak_TrunkBranchTilingPOM_Leaf"), TEXT("MI_Env_Tree_ST_VT")),
+         TPair<FString, FString>(TEXT("Oak_TrunkTilling_Leaf"), TEXT("MI_Env_Tree_ST_TrunkBranchTiling_VT")),
+         TPair<FString, FString>(TEXT("Oak_TrunkBranchTilingPOM_Leaf"), TEXT("MI_Env_Tree_ST_TrunkBranchTilingPOM_VT")),
          TPair<FString, FString>(TEXT("Oak_TrunkBranching"), TEXT("MI_Env_Tree_ST_VT"))}) {
       TestEqual(TEXT("Tree and HeroFoliage select the exact parent by terminal slot role"),
                 ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset, Case.Key),
@@ -11253,8 +11352,8 @@ bool FZionAssetHiveTreeSlotParentTest::RunTest(const FString &Parameters) {
     }
   }
   Asset->SetBoolField(TEXT("hasExplicitZionTags"), false);
-  TestTrue(TEXT("Zion naming placeholders do not select Tree parents"),
-           ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset).IsEmpty());
+  TestEqual(TEXT("Tree material selection does not require Zion tags"),
+            ResolveZionPlantParentMaterialPath(TEXT("3dplant"), Asset), ExpectedPath(TEXT("MI_Env_Tree_ST_VT")));
   Asset->SetBoolField(TEXT("hasExplicitZionTags"), true);
   TestTrue(TEXT("Other asset types do not select Tree parents"),
            ResolveZionPlantParentMaterialPath(TEXT("3d"), Asset).IsEmpty());
@@ -12271,9 +12370,18 @@ bool FAssetHiveWindProjectImportTest::RunTest(const FString &Parameters) {
           }
           continue;
         }
-        const bool bTree = Style == TEXT("Tree") || Style == TEXT("Palm");
+        if (ThirdPartyWindSubtype(ThirdPartyWindMode(Inputs[Index]->AsObject())).IsEmpty() && Style.IsEmpty()) {
+          TestEqual(TEXT("Untargeted wind uses generic ThirdParty MI"), MI->Parent->GetPathName(),
+                    FString(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Foliage_ThirdParty_VT.MI_Env_Foliage_ThirdParty_VT")));
+          continue;
+        }
+        const bool bTree = Style == TEXT("Tree");
         const bool bBush = Style.StartsWith(TEXT("Bush"));
         TestFalse(TEXT("Generated wind preset recorded"), Style.IsEmpty());
+        float BoundsMode = 0.f;
+        TestTrue(TEXT("Every synthetic plant family defaults to UV3 mode 2, including meshes without Branch2"),
+            MI->GetScalarParameterValue(FMaterialParameterInfo(AssetHivePlantWind::ScalarUV3BoundsMode), BoundsMode)
+            && BoundsMode == 2.f);
         const FString Name = Slot.ImportedMaterialSlotName.ToString();
         FString Base = bTree ? TEXT("M_Env_Tree_ST") : bBush ? TEXT("M_Env_Bush_ST") : TEXT("M_Env_Grass_ST");
         if (bTree && Name.EndsWith(TEXT("_Trunk"))) Base = TEXT("M_Env_Tree_TrunkBranch_ST");
@@ -12300,7 +12408,7 @@ bool FAssetHiveWindProjectImportTest::RunTest(const FString &Parameters) {
         TestTrue(Name + TEXT(" imported albedo matches the active sampler"), MI->TextureParameterValues.ContainsByPredicate(
             [&](const FTextureParameterValue &P) { return P.ParameterInfo.Name == DiffuseName && P.ParameterValue &&
                 static_cast<bool>(P.ParameterValue->VirtualTextureStreaming) == bVirtual; }));
-        bool bBranch2 = bTree || bBush || Style==TEXT("Herb");
+        bool bBranch2 = bTree || bBush || Style==TEXT("Palm") || Style==TEXT("Herb");
         bool bRipple = bBranch2;
         if (Layers && Layers->IsValid()) {
           (*Layers)->TryGetBoolField(TEXT("hasSecondary"), bBranch2);
