@@ -217,8 +217,16 @@ static void CollectEnvironmentProfileTags(
 
 // FBX 植被命名：SM_/T_/MI_Env_<标准AssetTag>_<标识>，Zion 用资产名，第三方用资产 ID。
 // 网格与材质另带变体号，纹理另带类型缩写且不带分辨率。
-// 不透明裁切整批导入时，_OPAQUE 只加在**资产文件夹**上（…/<文件夹>_OPAQUE/），网格与
-// 普通版本同名；材质实例名保留 _OPAQUE，因为同一次导入里 masked 与裁切两套 MI 可能并存。
+// 不透明裁切整批导入时使用 Op 表示：第三方放到资产目录下的 Op 子目录，其他资产目录加 _Op。
+// 网格保留原变体名；材质实例加 _Op，便于 masked 与裁切两套 MI 并存。
+static FString BuildPlantRepresentationFolder(const FString &AssetFolder,
+                                               bool bThirdPartyPlant,
+                                               bool bOpaquePlantSet) {
+  if (!bOpaquePlantSet) return AssetFolder;
+  return bThirdPartyPlant ? AssetFolder / TEXT("Op")
+                         : AssetFolder + TEXT("_Op");
+}
+
 static bool HasMicroPlantTag(const TArray<FString> &Tags) {
   return HasAssetTag(Tags, TEXT("Micro")) || HasAssetTag(Tags, TEXT("MicroFoliage"));
 }
@@ -6456,10 +6464,9 @@ static FString NormalizeModelSourceKey(const FString &SourceFile) {
       .ToLower();
 }
 
-// 整批模型变体是否都是 _OPAQUE 裁切：决定把 _OPAQUE 后缀放在**资产文件夹**上，而不是
-// 对象名上（2026-10-16 约定：剪切资产与普通版本同名，只有文件夹区分两者）。
+// 整批模型变体是否都是内部 _OPAQUE 裁切：决定使用 Op 目录标识，网格保留原变体名。
 // 判据与导入循环内保持一致：modelVariants 的 opaque 标志 / 变体键后缀优先，其次看文件名后缀；
-// 只要有一项不是裁切变体（混合批次），就返回 false，命名退回逐对象加后缀的老行为。
+// 只要有一项不是裁切变体（混合批次），就返回 false，不把整个资产目录标为 Op。
 static bool IsOpaquePlantModelSet(const TSharedPtr<FJsonObject> &AssetObject);
 
 static bool ReadModelVariantKey(const TSharedPtr<FJsonObject> &Object,
@@ -8589,12 +8596,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                                SafeAssetId, SafeAssetFolderName, bIsZionAsset)
         : FString();
     const bool bOpaquePlantSet = bFbxPlantNaming && IsOpaquePlantModelSet(AssetObject);
-    // Both representations belong to the same Name_ID asset directory.
-    FString PlantFolderName = SafeAssetFolderName;
-    if (bOpaquePlantSet) {
-      PlantFolderName = bThirdPartyPlant ? SafeAssetFolderName / TEXT("OPAQUE")
-                                        : SafeAssetFolderName + TEXT("_OPAQUE");
-    }
+    // 第三方的两种表示放在同一 Name_ID 资产目录下。
+    const FString PlantFolderName = BuildPlantRepresentationFolder(
+        SafeAssetFolderName, bThirdPartyPlant, bOpaquePlantSet);
     // 对象名词干直接复用资产文件夹名：Zion 的"去 Env_ / 不带 ID"与 Temp 的
     // "Temp_ 前缀"只在文件夹名这一处计算，SM_/T_/MI_ 与文件夹因此天然一致，
     // 不会出现 ID 重复或 "__"。
@@ -11042,7 +11046,7 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("Plant masked mesh name"),
             FString::Printf(TEXT("SM_%s_%s"), *PlantStem, TEXT("01")),
             FString(TEXT("SM_Env_Grass_abc123_01")));
-  // 裁切网格与 masked 同名（后缀在文件夹上）：名称不应再出现 _OPAQUE。
+  // 裁切网格与 masked 同名，使用 Op 目录标识区分。
   TestEqual(TEXT("Plant cut mesh keeps the plain name"),
             FString::Printf(TEXT("SM_%s_%s"), *PlantStem, TEXT("01")),
             FString(TEXT("SM_Env_Grass_abc123_01")));
@@ -11054,11 +11058,11 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                 FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), false,
                 false),
             FString(TEXT("MI_Env_Grass_abc123_01")));
-  TestEqual(TEXT("Plant opaque material name uses _OPAQUE suffix"),
+  TestEqual(TEXT("Plant opaque material name uses _Op suffix"),
             UAssetHiveSettings::GetPlantMaterialName(
                 FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), false,
                 true),
-            FString(TEXT("MI_Env_Grass_abc123_01_OPAQUE")));
+            FString(TEXT("MI_Env_Grass_abc123_01_Op")));
   TestEqual(TEXT("Plant billboard material keeps prefix"),
             UAssetHiveSettings::GetPlantMaterialName(
                 FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), true,
@@ -11089,7 +11093,16 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
             HasMaskedPlantModelVariant(OpaqueSuffixPlantVariants,
                                        NoOpaquePlantVariantKeys));
 
-  // _OPAQUE 后缀只落在资产文件夹上（2026-10-16 约定）：整批裁切才加后缀，混合批次不加。
+  TestEqual(TEXT("Third-party cut plants use the Op representation directory"),
+            BuildPlantRepresentationFolder(TEXT("Fern_abc123"), true, true),
+            FString(TEXT("Fern_abc123/Op")));
+  TestEqual(TEXT("Other cut plants use the _Op folder suffix"),
+            BuildPlantRepresentationFolder(TEXT("Fern"), false, true),
+            FString(TEXT("Fern_Op")));
+  TestEqual(TEXT("Masked and mixed plants keep the asset directory"),
+            BuildPlantRepresentationFolder(TEXT("Fern_abc123"), true, false),
+            FString(TEXT("Fern_abc123")));
+  // 源文件和变体键继续识别内部 OPAQUE 标记；整批裁切才使用 Op 目录。
   {
     auto OpaqueOnlySet = MakeShared<FJsonObject>();
     auto OpaqueVariant = MakeShared<FJsonObject>();
@@ -11097,7 +11110,7 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
     OpaqueVariant->SetStringField(TEXT("variantKey"), TEXT("01OPAQUE"));
     OpaqueOnlySet->SetArrayField(TEXT("modelVariants"),
                                  {MakeShared<FJsonValueObject>(OpaqueVariant)});
-    TestTrue(TEXT("All-cut plant set puts _OPAQUE on the asset folder"),
+    TestTrue(TEXT("All-cut plant set selects the Op representation"),
              IsOpaquePlantModelSet(OpaqueOnlySet));
 
     auto OpaqueFlagSet = MakeShared<FJsonObject>();
@@ -11121,7 +11134,7 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
         TEXT("modelVariants"),
         {MakeShared<FJsonValueObject>(CutVariant),
          MakeShared<FJsonValueObject>(MaskedVariant)});
-    TestFalse(TEXT("Mixed plant set keeps per-asset _OPAQUE suffix"),
+    TestFalse(TEXT("Mixed plant set does not mark the whole asset as Op"),
               IsOpaquePlantModelSet(MixedSet));
 
     auto LegacySet = MakeShared<FJsonObject>();

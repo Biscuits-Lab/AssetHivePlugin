@@ -13,6 +13,7 @@ The older 1.1.0 release included Windows x64 editor binaries for Unreal Engine 5
 - Support original layer manifests, root contact attenuation and UV3 mode 2. Reject incomplete or stale source bindings.
 - Restore float precision splits only when the declared island count and individual bounds remain consistent; replay the same partition during baking.
 - Keep measured root volumes fixed after interpolation creates new Opaque or lower-LOD vertices, without changing the original LOD0 weights.
+- Use `Op` for exported cut representations and `_Op` for their material instances; continue reading existing library `_OPAQUE` sources.
 
 ## Editor connection recovery
 

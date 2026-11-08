@@ -557,8 +557,8 @@ FString UAssetHiveSettings::GetPlantMaterialName(const FString& AssetName, bool 
     const FString Prefix = ConfiguredPrefix.TrimStartAndEnd().IsEmpty()
         ? DefaultPrefix
         : ConfiguredPrefix.TrimStartAndEnd();
-    // 2026-09-30 定稿：Opaque 变体使用固定 _OPAQUE 后缀（不再用 MI_Opaque_ 前缀）。
-    return bOpaque ? Prefix + SafeAssetName + TEXT("_OPAQUE")
+    // Opaque 导出材质实例使用 _Op 后缀，与裁切表示目录的命名一致。
+    return bOpaque ? Prefix + SafeAssetName + TEXT("_Op")
                    : Prefix + SafeAssetName;
 }
 
