@@ -2472,7 +2472,8 @@ struct FPlantWindIslandParameters {
 };
 
 static bool ComputePlantWindIslands(FMeshDescription &Mesh,
-                                    FPlantWindIslandParameters &Out, bool bLayerSource = false) {
+                                    FPlantWindIslandParameters &Out, bool bLayerSource = false,
+                                    float LayerPrecisionWeldEpsilon = 0.f) {
   Out = FPlantWindIslandParameters();
   const int32 VertexCount = Mesh.Vertices().Num();
   if (VertexCount == 0 || Mesh.Triangles().Num() == 0) {
@@ -2537,6 +2538,12 @@ static bool ComputePlantWindIslands(FMeshDescription &Mesh,
         Parents[FindRoot(I)]=FindRoot(*First);
         ++Out.WeldMergedVertices;
       } else FirstAt.Add(Cell,I);
+    }
+    // FBX 双精度坐标转为 FVector3f 后可能跨过量化格边界；仅按显式微米容差补焊。
+    if (LayerPrecisionWeldEpsilon > 0.f) {
+      Out.WeldMergedVertices += AssetHivePlantWind::WeldCoincidentVertices(
+          VertexCount, [&Positions](int32 I) { return Positions[FVertexID(I)]; }, Parents,
+          LayerPrecisionWeldEpsilon);
     }
   } else {
     Out.WeldMergedVertices = AssetHivePlantWind::WeldCoincidentVertices(
@@ -2651,6 +2658,24 @@ static bool ComputePlantWindIslands(FMeshDescription &Mesh,
         FMath::Max(Out.MaxProjection[IslandIndex], Projection);
   }
   return IslandCount > 0;
+}
+
+// 原始量化口径优先；仅在浮点拆岛且补焊后精确恢复声明数量时采用微米容差。
+static bool ComputePlantLayerSourceIslands(FMeshDescription& Mesh, int32 Expected,
+    FPlantWindIslandParameters& Out, float& UsedEpsilon) {
+  UsedEpsilon=0.f;
+  if (!ComputePlantWindIslands(Mesh,Out,true)) return false;
+  if (Expected<=0 || Out.Num()<=Expected) return true;
+  for (const float Epsilon : {1e-4f,2e-4f}) {
+    FPlantWindIslandParameters Candidate;
+    if (!ComputePlantWindIslands(Mesh,Candidate,true,Epsilon)) return false;
+    if (Candidate.Num()==Expected) {
+      Out=MoveTemp(Candidate); UsedEpsilon=Epsilon; return true;
+    }
+    if (Candidate.Num()<Expected) break;
+  }
+  // 数量不符时保留原结果，让完整绑定校验给出错误，不能强行合并到目标数量。
+  return true;
 }
 
 // 风单元合并模式（2026-10-07）：
@@ -3902,6 +3927,7 @@ struct FPlantWindCardReference {
   TOptional<bool> bAssetUsesBranch2;
   bool bFromLayerFile = false;
   const FMeshDescription* OriginalDescription = nullptr;
+  float LayerPrecisionWeldEpsilon = 0.f;
   TArray<AssetHivePlantWind::FPlantWindCard> Cards;
   AssetHivePlantWind::FPlantWindCardSurface Surface;
   // SpeedTree branch1 权重按整簇高度归一化（ST9 实测）。不透明裁切网格只剩上部叶片，
@@ -3921,6 +3947,7 @@ struct FPlantWindCardReference {
     bAssetUsesBranch2.Reset();
     bFromLayerFile=false;
     OriginalDescription=nullptr;
+    LayerPrecisionWeldEpsilon=0.f;
     StructuralCardPairs.Reset();
     Surface = AssetHivePlantWind::FPlantWindCardSurface();
     MeshMin = FVector3f::ZeroVector;
@@ -4261,7 +4288,7 @@ static void BindHerbWindHierarchy(const FMeshDescription& Mesh,
 // vertex instances do not change the binding; ambiguous or stale files fail.
 static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescription& Mesh,
     const FPlantWindIslandParameters& Islands,TArray<FHerbWindBinding>& Result,FString& Error,
-    const FString& LayerDirectory) {
+    const FString& LayerDirectory, float PrecisionWeldEpsilon = 0.f) {
   const TArray<TSharedPtr<FJsonValue>> *Rows=nullptr, *Chunks=nullptr;
   const bool bInline=Variant.TryGetArrayField(TEXT("bindings"),Rows);
   int32 RowCount=bInline ? Rows->Num() : -1;
@@ -4350,6 +4377,14 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
       }
     }
     if (Best==INDEX_NONE) { Error=FString::Printf(TEXT("no original island matches centroid %s"),*C.ToString()); return false; }
+    if (PrecisionWeldEpsilon > 0.f) {
+      // 精度补焊后逐岛复核微米级中心误差，不能只靠数量相等接受错误归并。
+      const FVector3f Delta=(Centers[Best]-C)*SafeSize;
+      const FVector3f Limit=SafeSize*2e-6f+FVector3f(2.f*PrecisionWeldEpsilon);
+      if (FMath::Abs(Delta.X)>Limit.X || FMath::Abs(Delta.Y)>Limit.Y || FMath::Abs(Delta.Z)>Limit.Z) {
+        Error=TEXT("precision weld changes an original island bound"); return false;
+      }
+    }
     auto& B=Result[Best]; double W1,W2;
     bool Review=false, Influence=true;
     Row.TryGetBoolField(TEXT("review"),Review); Row.TryGetBoolField(TEXT("influence"),Influence);
@@ -4405,6 +4440,7 @@ static bool BuildPlantWindCardReference(const UStaticMesh *ReferenceMesh,
   Out.Cards.Reset();
   Out.LayerBindings.Reset();
   Out.OriginalDescription=nullptr;
+  Out.LayerPrecisionWeldEpsilon=0.f;
   Out.bFromLayerFile = LayerVariant != nullptr;
   Out.Surface.Positions.Reset();
   Out.Surface.TriangleIndices.Reset();
@@ -4422,7 +4458,14 @@ static bool BuildPlantWindCardReference(const UStaticMesh *ReferenceMesh,
     return false;
   }
   FPlantWindIslandParameters IslandParameters;
-  if (!ComputePlantWindIslands(*Mesh, IslandParameters, Out.bFromLayerFile)) {
+  int32 ExpectedIslands=0;
+  const TArray<TSharedPtr<FJsonValue>>* InlineRows=nullptr;
+  if (LayerVariant) {
+    if (LayerVariant->TryGetArrayField(TEXT("bindings"),InlineRows)) ExpectedIslands=InlineRows->Num();
+    else LayerVariant->TryGetNumberField(TEXT("bindingCount"),ExpectedIslands);
+  }
+  if (!(Out.bFromLayerFile ? ComputePlantLayerSourceIslands(*Mesh,ExpectedIslands,IslandParameters,
+          Out.LayerPrecisionWeldEpsilon) : ComputePlantWindIslands(*Mesh,IslandParameters))) {
     return false;
   }
   Out.MeshMin = IslandParameters.MeshMin;
@@ -4450,10 +4493,14 @@ static bool BuildPlantWindCardReference(const UStaticMesh *ReferenceMesh,
   FPlantWindFrondParameters Supports;
   if (LayerVariant) {
     FString Error;
-    if (bHasFronds || !ReadPlantLayerBindings(*LayerVariant,*Mesh,IslandParameters,Out.LayerBindings,Error,LayerDirectory)) {
+    if (bHasFronds || !ReadPlantLayerBindings(*LayerVariant,*Mesh,IslandParameters,Out.LayerBindings,Error,LayerDirectory,
+        Out.LayerPrecisionWeldEpsilon)) {
       UE_LOG(LogTemp,Error,TEXT("AssetHive hierarchy rejected: %s"),*Error);
       Out.Reset(); return false;
     }
+    if (Out.LayerPrecisionWeldEpsilon > 0.f)
+      UE_LOG(LogTemp,Display,TEXT("AssetHive hierarchy %s: restored %d islands with %.7f cm float precision weld"),
+          *ReferenceMesh->GetName(),IslandParameters.Num(),Out.LayerPrecisionWeldEpsilon);
   } else if (bHerb) BindHerbWindHierarchy(*Mesh,IslandParameters,Out.LayerBindings);
   else if (bWoodyHierarchy) {
     ComputePlantWindFronds(*Mesh, IslandParameters, EPlantWindFrondMergeMode::ConnectedCluster, Supports);
@@ -4746,7 +4793,8 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
     }
     FPlantWindIslandParameters IslandParameters;
     const bool bOriginalLayerMesh = bUseCardReference && CardReference->bFromLayerFile && CardReference->OriginalDescription==Mesh;
-    if (!ComputePlantWindIslands(*Mesh, IslandParameters, bOriginalLayerMesh)) {
+    if (!ComputePlantWindIslands(*Mesh, IslandParameters, bOriginalLayerMesh,
+        bOriginalLayerMesh ? CardReference->LayerPrecisionWeldEpsilon : 0.f)) {
       continue;
     }
     // Grass / Fern 按 SpeedTree frond 规则共享风单元；Bush（branch2->UV3）保留逐片记录。
@@ -12455,6 +12503,44 @@ bool FAssetHivePlantWindGrassHeightWeightTest::RunTest(const FString &Parameters
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindLayerPrecisionTest, "AssetHive.Plants.SyntheticWindLayerFloatPrecision",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveWindLayerPrecisionTest::RunTest(const FString &Parameters) {
+  auto MakeMesh=[](double SecondX) {
+    FMeshDescription Mesh;
+    FStaticMeshAttributes Attributes(Mesh); Attributes.Register();
+    auto Positions=Attributes.GetVertexPositions();
+    const auto Group=Mesh.CreatePolygonGroup();
+    const FVector3f Points[2][3]={
+        {FVector3f(float(100.000049),0,0),FVector3f(101,0,0),FVector3f(100,0,1)},
+        {FVector3f(float(SecondX),0,0),FVector3f(99,0,0),FVector3f(100,0,-1)}};
+    for (int32 Face=0; Face<2; ++Face) {
+      TArray<FVertexInstanceID> Corners;
+      for (const auto& P : Points[Face]) {
+        const auto V=Mesh.CreateVertex(); Positions[V]=P;
+        Corners.Add(Mesh.CreateVertexInstance(V));
+      }
+      Mesh.CreateTriangle(Group,Corners);
+    }
+    return Mesh;
+  };
+  auto Mesh=MakeMesh(100.0000499);
+  FPlantWindIslandParameters Strict,Restored,Replay;
+  TestTrue(TEXT("Compute strict source cells"),ComputePlantWindIslands(Mesh,Strict,true));
+  TestEqual(TEXT("Float conversion splits a shared detector cell"),Strict.Num(),2);
+  float Epsilon=0.f;
+  TestTrue(TEXT("Restore exact declared island count"),ComputePlantLayerSourceIslands(Mesh,1,Restored,Epsilon));
+  TestEqual(TEXT("Micron weld restores one component"),Restored.Num(),1);
+  TestTrue(TEXT("Precision recovery is explicit and bounded"),Epsilon>0.f && Epsilon<=2e-4f);
+  ComputePlantWindIslands(Mesh,Replay,true,Epsilon);
+  TestTrue(TEXT("Bake replays the identical partition"),Restored.IslandOfVertex==Replay.IslandOfVertex);
+  auto Separate=MakeMesh(100.001);
+  ComputePlantLayerSourceIslands(Separate,1,Restored,Epsilon);
+  TestEqual(TEXT("Real separate geometry remains separate"),Restored.Num(),2);
+  TestEqual(TEXT("Unrecoverable count keeps strict rejection"),Epsilon,0.f);
+  return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindLodReuseTest, "AssetHive.Plants.SyntheticWindLod0Reuse",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FAssetHiveWindLodReuseTest::RunTest(const FString &Parameters) {
@@ -12571,6 +12657,15 @@ bool FAssetHiveWindLodImportTest::RunTest(const FString &Parameters) {
     }
     Success&=TestEqual(TEXT("Import every original lower LOD"),
         ImportPlantCustomLods(AssetTools,Mesh,Lods,Folder,Mesh->GetName()),Lods.Num());
+    TArray<TArray<FVector2f>> OriginalUV0;
+    for (int32 Lod=0; Lod<Mesh->GetNumSourceModels(); ++Lod) {
+      TArray<FVector2f>& Saved=OriginalUV0.AddDefaulted_GetRef();
+      const auto* Description=Mesh->GetMeshDescription(Lod);
+      if (!Description) continue;
+      const auto UV=FStaticMeshConstAttributes(*Description).GetVertexInstanceUVs();
+      if (UV.GetNumChannels()>0)
+        for (const auto VI : Description->VertexInstances().GetElementIDs()) Saved.Add(UV.Get(VI,0));
+    }
     FPlantWindCardReference Reference;
     if (!TestTrue(TEXT("Bind original LOD0 JSON"),BuildPlantWindCardReference(Mesh,
         EPlantWindFrondMergeMode::None,Reference,false,false,Layer.Get(),FPaths::GetPath(ManifestFile)))) {
@@ -12594,6 +12689,12 @@ bool FAssetHiveWindLodImportTest::RunTest(const FString &Parameters) {
       const auto UVs=Attributes.GetVertexInstanceUVs();
       const int32 Required=HasSecondary ? 4 : 3;
       Success&=TestTrue(TEXT("Source LOD contains its own wind UV channels"),UVs.GetNumChannels()>=Required);
+      int32 Corner=0;
+      for (const auto VI : Description->VertexInstances().GetElementIDs()) {
+        Success&=TestTrue(TEXT("Wind bake preserves each original texture UV0"),
+            OriginalUV0[Lod].IsValidIndex(Corner) && OriginalUV0[Lod][Corner]==UVs.Get(VI,0));
+        ++Corner;
+      }
       bool Finite=true; float MaxBranch1=0.f, MaxRipple=0.f;
       for (const auto VI : Description->VertexInstances().GetElementIDs()) {
         for (int32 Channel=0; Channel<FMath::Min(Required,UVs.GetNumChannels()); ++Channel)
