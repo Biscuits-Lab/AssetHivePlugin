@@ -12,6 +12,7 @@ The older 1.1.0 release included Windows x64 editor binaries for Unreal Engine 5
 - Export Billboard only in LOD mode, with separate material instances and texture groups. Billboard keeps Shared only; Micro disables all wind and interaction.
 - Support original layer manifests, root contact attenuation and UV3 mode 2. Reject incomplete or stale source bindings.
 - Restore float precision splits only when the declared island count and individual bounds remain consistent; replay the same partition during baking.
+- Keep measured root volumes fixed after interpolation creates new Opaque or lower-LOD vertices, without changing the original LOD0 weights.
 
 ## Editor connection recovery
 

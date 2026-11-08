@@ -5692,6 +5692,13 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
             for (int32 K=0; K<3; ++K) {
               Weights += Hit->Barycentric[K] * WeightsAt(Surface.Positions[Surface.TriangleIndices[3*Hit->Triangle+K]]);
             }
+            // 新角点可能落在原三角形内部的固定根区；角点权重插值不能冲破原有根部约束。
+            if (B.RootOuter > 0.f) {
+              const float Root = FMath::SmoothStep(B.RootInner, B.RootOuter, FVector3f::Dist(P, B.RootContact));
+              Weights.X = FMath::Min(Weights.X, .70f * Root);
+              Weights.Y = FMath::Min(Weights.Y, .64f * Root);
+              Weights.Z = FMath::Min(Weights.Z, M->Ripple * Root);
+            }
           } else {
             Weights = WeightsAt(P);
           }
@@ -12618,6 +12625,54 @@ bool FAssetHiveWindLodReuseTest::RunTest(const FString &Parameters) {
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindRootInterpolationTest, "AssetHive.Plants.SyntheticWindRootInterpolation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveWindRootInterpolationTest::RunTest(const FString &Parameters) {
+  UStaticMesh* Mesh=NewObject<UStaticMesh>(GetTransientPackage(),NAME_None,RF_Transient);
+  FGCObjectScopeGuard Guard(Mesh);
+  const FVector3f Points[2][3]={
+      {FVector3f(0,0,0),FVector3f(1,0,0),FVector3f(0,0,10)},
+      {FVector3f(0,0,.05f),FVector3f(.01f,0,.05f),FVector3f(0,0,.06f)}};
+  for (int32 Lod=0; Lod<2; ++Lod) {
+    Mesh->AddSourceModel(); FMeshDescription Description;
+    FStaticMeshAttributes Attributes(Description); Attributes.Register();
+    auto Positions=Attributes.GetVertexPositions(); auto UV=Attributes.GetVertexInstanceUVs(); UV.SetNumChannels(1);
+    const auto Group=Description.CreatePolygonGroup(); TArray<FVertexInstanceID> Corners;
+    for (const auto& P : Points[Lod]) {
+      const auto V=Description.CreateVertex(); Positions[V]=P;
+      const auto VI=Description.CreateVertexInstance(V); UV.Set(VI,0,FVector2f(P.X,P.Z/10.f)); Corners.Add(VI);
+    }
+    Description.CreateTriangle(Group,Corners); Mesh->CreateMeshDescription(Lod,MoveTemp(Description)); Mesh->CommitMeshDescription(Lod);
+  }
+  const FString Json=TEXT("{\"primaryAxes\":[{\"base\":[0,0,0],\"tip\":[0,0,1]}],")
+      TEXT("\"secondaryAxes\":[{\"base\":[0,0,0],\"tip\":[0,0,1]}],")
+      TEXT("\"bindings\":[{\"island\":0,\"boundsCenter\":[0.5,0,0.5],\"primary\":0,\"secondary\":0,")
+      TEXT("\"primaryAttachment\":1,\"secondaryAttachment\":1,\"terminal\":true,\"blade\":[[0,0,0],[0,0,1]],")
+      TEXT("\"rootContact\":{\"center\":[0,0,0],\"innerHeight\":0.02,\"outerHeight\":0.08}}]}");
+  TSharedPtr<FJsonObject> Layer;
+  if (!TestTrue(TEXT("Read measured root fixture"),FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json),Layer))) return false;
+  FPlantWindCardReference Reference;
+  if (!TestTrue(TEXT("Bind original coarse triangle"),BuildPlantWindCardReference(Mesh,EPlantWindFrondMergeMode::None,
+      Reference,false,false,Layer.Get()))) return false;
+  Reference.bAssetUsesBranch2=true; FPlantBranch2Bounds Bounds; Bounds.Min.Z=0.f; Bounds.Max.Z=.64f;
+  FString Summary;
+  if (!TestTrue(TEXT("Transfer original wind to new interior root vertices"),ApplySyntheticSpeedTreeWind(Mesh,
+      EPlantSyntheticWind::Herb,&Reference,Summary,Bounds))) return false;
+  const auto SourceUV=FStaticMeshConstAttributes(*Mesh->GetMeshDescription(0)).GetVertexInstanceUVs();
+  TestTrue(TEXT("Original triangle retains moving corners outside the measured root"),
+      SourceUV.Get(FVertexInstanceID(1),2).X>.69f && SourceUV.Get(FVertexInstanceID(2),2).X>.69f);
+  const auto TargetUV=FStaticMeshConstAttributes(*Mesh->GetMeshDescription(1)).GetVertexInstanceUVs();
+  for (const auto VI : Mesh->GetMeshDescription(1)->VertexInstances().GetElementIDs()) {
+    TestTrue(TEXT("Interior root stays fixed in Branch1 and Ripple"),TargetUV.Get(VI,2).IsNearlyZero());
+    const auto Packed=TargetUV.Get(VI,3);
+    TestEqual(TEXT("Interior root stays fixed in Branch2"),AssetHivePlantWind::UV3Word(Packed.X)%256,0);
+    TestEqual(TEXT("Interior root stays fixed in remapped Ripple"),
+        AssetHivePlantWind::RippleNibble(Packed.X,1)|(AssetHivePlantWind::RippleNibble(Packed.Y,0)<<4),0);
+    TestEqual(TEXT("Root correction preserves texture UV0"),TargetUV.Get(VI,0),FVector2f(Points[1][VI.GetValue()].X,Points[1][VI.GetValue()].Z/10.f));
+  }
+  return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindLodImportTest, "AssetHive.Plants.SyntheticWindLodReuseImport",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FAssetHiveWindLodImportTest::RunTest(const FString &Parameters) {
@@ -12705,6 +12760,33 @@ bool FAssetHiveWindLodImportTest::RunTest(const FString &Parameters) {
         }
       }
       Success&=TestTrue(TEXT("Baked source LOD wind data is finite"),Finite);
+      bool CheckRootEnvelope=false;
+      Data->TryGetBoolField(TEXT("checkRootEnvelope"),CheckRootEnvelope);
+      int32 RootEnvelopeVertices=0;
+      if (CheckRootEnvelope && Lod>0) {
+        const auto Positions=Attributes.GetVertexPositions();
+        float HighestRoot=-TNumericLimits<float>::Max();
+        for (const auto& Binding : Reference.LayerBindings)
+          if (Binding.RootOuter>0.f) HighestRoot=FMath::Max(HighestRoot,Binding.RootContact.Z+Binding.RootInner);
+        for (const auto VI : Description->VertexInstances().GetElementIDs()) {
+          const auto P=Positions[Description->GetVertexInstanceVertex(VI)];
+          if (P.Z>HighestRoot) continue;
+          float Distance;
+          const int32 Card=Reference.Surface.FindCardByUV(UVs.Get(VI,0),P,Distance);
+          if (!Reference.LayerBindings.IsValidIndex(Card)) continue;
+          const auto& Binding=Reference.LayerBindings[Card];
+          if (Binding.RootOuter<=0.f || FVector3f::Dist(P,Binding.RootContact)>Binding.RootInner*.99f) continue;
+          ++RootEnvelopeVertices;
+          Success&=TestTrue(TEXT("Real cut vertex inside measured root remains fixed"),UVs.Get(VI,2).IsNearlyZero());
+          if (UVs.GetNumChannels()>3) {
+            const auto Packed=UVs.Get(VI,3);
+            Success&=TestEqual(TEXT("Real root has zero Branch2 payload"),AssetHivePlantWind::UV3Word(Packed.X)%256,0);
+            Success&=TestEqual(TEXT("Real root has zero remapped Ripple"),
+                AssetHivePlantWind::RippleNibble(Packed.X,1)|(AssetHivePlantWind::RippleNibble(Packed.Y,0)<<4),0);
+          }
+        }
+        Success&=TestTrue(TEXT("Actual cut fixture covers measured interior root vertices"),RootEnvelopeVertices>0);
+      }
       const bool SharedOnlyProxy=SharedOnlyLods.Contains(Lod);
       Success&=TestTrue(TEXT("Billboard has no Branch1 or Ripple; geometry LODs keep active local weights"),
           SharedOnlyProxy ? MaxBranch1==0.f && MaxRipple==0.f : MaxBranch1>0.f);
@@ -12723,6 +12805,7 @@ bool FAssetHiveWindLodImportTest::RunTest(const FString &Parameters) {
       Row->SetNumberField(TEXT("rippleMax"),MaxRipple);
       Row->SetBoolField(TEXT("finite"),Finite);
       Row->SetBoolField(TEXT("sharedOnlyProxy"),SharedOnlyProxy);
+      Row->SetNumberField(TEXT("rootEnvelopeVertices"),RootEnvelopeVertices);
       Results.Add(MakeShared<FJsonValueObject>(Row));
     }
     ObjectTools::DeleteSingleObject(Mesh,false);
