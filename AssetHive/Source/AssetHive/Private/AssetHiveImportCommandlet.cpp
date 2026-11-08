@@ -1929,6 +1929,42 @@ static FString ResolveZionPlantParentMaterialPath(
   return FString();
 }
 
+// Billboard 沿用普通 LOD 的着色图，通过专用父实例隔离风层开关。
+static FString ResolvePlantBillboardParentPath(const FString &NormalParentPath) {
+  const FString Package = FPackageName::ObjectPathToPackageName(NormalParentPath);
+  FString Name = FPackageName::GetShortName(Package);
+  if (Name.Contains(TEXT("_Billboard"))) return NormalParentPath;
+  int32 Insert = Name.Find(TEXT("_ST"), ESearchCase::CaseSensitive);
+  if (Insert == INDEX_NONE) Insert = Name.Find(TEXT("_VT"), ESearchCase::CaseSensitive);
+  if (Insert == INDEX_NONE) Insert = Name.Len();
+  Name.InsertAt(Insert, TEXT("_Billboard"));
+  return FPaths::GetPath(Package) / Name + TEXT(".") + Name;
+}
+
+static void ApplyPlantBillboardWindPolicy(UMaterialInstanceConstant *MI, bool bStatic) {
+  if (!MI) return;
+  for (const FName Switch : {FName(TEXT("SharedEnable")), FName(TEXT("Branch1Enable")),
+       FName(TEXT("Branch2Enable")), FName(TEXT("HasBranch2Data_Internal")),
+       FName(TEXT("Use Remapped UV3")), FName(TEXT("RippleEnable")),
+       FName(TEXT("RippleShimmerEnable")), FName(TEXT("Interactive"))}) {
+    MI->SetStaticSwitchParameterValueEditorOnly(FMaterialParameterInfo(Switch),
+        !bStatic && Switch == FName(TEXT("SharedEnable")));
+  }
+  if (bStatic) {
+    // 旧第三方父材质通过标量、向量控制风动；静态档还需关闭这些入口及交互。
+    for (const FName Name : {FName(TEXT("SharedBend")), FName(TEXT("SharedOscillation")),
+         FName(TEXT("WindField MaxEffect Scale")), FName(TEXT("InteriWind_MaxWPO")),
+         FName(TEXT("InterWind Rot Intensity")), FName(TEXT("InterWind Velocity Intensity"))}) {
+      float Value;
+      if (MI->GetScalarParameterValue(FMaterialParameterInfo(Name), Value))
+        MI->SetScalarParameterValueEditorOnly(FMaterialParameterInfo(Name), 0.f);
+    }
+    FLinearColor Value;
+    if (MI->GetVectorParameterValue(FMaterialParameterInfo(TEXT("WindBend Range")), Value))
+      MI->SetVectorParameterValueEditorOnly(FMaterialParameterInfo(TEXT("WindBend Range")), FLinearColor::Transparent);
+  }
+}
+
 // 减面档位（2026-10-29 定稿）：3D Assets 里**第三方 asset tag 统一走 Dressing 档**
 // （ThirdParty 标准标签，或 Megascans / PBRMAX 来源标记），只有非第三方资产才按
 // Props / Kits / MEGA / Destructible 这些分类分档；取不到固定档的一律 Dressing 兜底
@@ -4592,10 +4628,26 @@ static FPlantBranch2Bounds GetPlantBranch2Bounds(const FJsonObject& Variants) {
   return Bounds;
 }
 
+static TSet<int32> GetSharedOnlyPlantLods(const TSharedPtr<FJsonObject>& Source) {
+  TSet<int32> Result;
+  const TSharedPtr<FJsonObject>* Lods=nullptr;
+  if (!Source || !Source->TryGetObjectField(TEXT("lods"),Lods) || !Lods || !Lods->IsValid()) return Result;
+  for (const auto& Pair : (*Lods)->Values) {
+    const FString Key(*Pair.Key);
+    const int32 Index=FCString::Atoi(*Key);
+    const auto Record=Pair.Value->AsObject();
+    const TArray<TSharedPtr<FJsonValue>>* Layers=nullptr;
+    if (Index>0 && FString::FromInt(Index)==Key && Record &&
+        Record->TryGetArrayField(TEXT("layers"),Layers) && Layers->Num()==1 &&
+        (*Layers)[0]->AsString()==TEXT("Shared")) Result.Add(Index);
+  }
+  return Result;
+}
+
 static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSyntheticWind Style,
                                         const FPlantWindCardReference *CardReference,
                                         FString &OutSummary, const FPlantBranch2Bounds& DecodeBounds = {},
-                                        bool bOpaqueCut = false) {
+                                        bool bOpaqueCut = false, const TSet<int32>* SharedOnlyLods = nullptr) {
   OutSummary.Reset();
   if (!StaticMesh || StaticMesh->GetNumSourceModels() == 0) {
     return false;
@@ -4676,6 +4728,20 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
     TVertexInstanceAttributesRef<FVector2f> UVs = Attributes.GetVertexInstanceUVs();
     const int32 VertexCount = Mesh->Vertices().Num();
     if (VertexCount == 0) {
+      continue;
+    }
+    if (SharedOnlyLods && SharedOnlyLods->Contains(LodIndex)) {
+      if (UVs.GetNumChannels()<RequiredChannels) UVs.SetNumChannels(RequiredChannels);
+      for (const auto VI : Mesh->VertexInstances().GetElementIDs()) {
+        UVs.Set(VI,1,FVector2f::ZeroVector);
+        UVs.Set(VI,2,FVector2f::ZeroVector);
+        if (bWriteBranch2) UVs.Set(VI,3,AssetHivePlantWind::EncodeUV3(0,0,0,0.f));
+      }
+      StaticMesh->GetSourceModel(LodIndex).BuildSettings.bUseFullPrecisionUVs=true;
+      StaticMesh->CommitMeshDescription(LodIndex);
+      ++ProcessedLods; TotalVertices+=VertexCount;
+      UE_LOG(LogTemp,Display,TEXT("AssetHive wind %s LOD%d: Billboard uses Shared only; Branch1, Branch2 and Ripple weights are zero"),
+             *StaticMesh->GetName(),LodIndex);
       continue;
     }
     FPlantWindIslandParameters IslandParameters;
@@ -5471,11 +5537,13 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
             /*TouchDistance=*/FernStructure.JoinDistance);
       }
     }
-    // Choose a single source card per cut face: anchors/directions are discrete.
+    // 裁切模型和低 LOD 共用 LOD0 风场；锚点与方向属于离散编码，不能插值。
     // Only scalar weights may be interpolated, on original triangles of that card.
     using FSourcePoint = AssetHivePlantWind::FPlantWindCardSurface::FSourcePoint;
     TArray<FSourcePoint> CutSourcePoints;
-    if (bOpaqueCut && bUseCardReference && !CardReference->Surface.TriangleUVs.IsEmpty() && UVs.GetNumChannels() > 0) {
+    if (bUseCardReference && (bOpaqueCut || (LodIndex > 0 && CardReference->bFromLayerFile)) &&
+        !CardReference->Surface.TriangleUVs.IsEmpty() && UVs.GetNumChannels() > 0) {
+      const int32 ProjectedBefore=ProjectedCutCorners, FallbackBefore=FallbackCutCorners;
       const auto& Surface = CardReference->Surface;
       CutSourcePoints.SetNum(Mesh->VertexInstances().GetArraySize());
       TMap<TPair<FVertexInstanceID,int32>,FVertexInstanceID> SplitCorners;
@@ -5535,6 +5603,8 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
         if (CutSourcePoints[VI.GetValue()].Triangle != INDEX_NONE) ++ProjectedCutCorners;
         else ++FallbackCutCorners;
       }
+      UE_LOG(LogTemp, Display, TEXT("AssetHive wind %s LOD%d: %d source corners reuse LOD0 weights, %d use card fallback"),
+             *StaticMesh->GetName(), LodIndex, ProjectedCutCorners-ProjectedBefore, FallbackCutCorners-FallbackBefore);
     }
     if (UVs.GetNumChannels() < RequiredChannels) {
       UVs.SetNumChannels(RequiredChannels);
@@ -5715,7 +5785,7 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
   // UE5 的 FString::Printf 使用 TCheckedFormatString，格式串必须是编译期字面量，
   // 不能是三元表达式——Fern / Grass 两种文案分开调用。
   if (ProjectedCutCorners + FallbackCutCorners > 0) {
-    UE_LOG(LogTemp, Display, TEXT("AssetHive wind %s: %d cut corners bound to source triangles, %d used card fallback"),
+    UE_LOG(LogTemp, Display, TEXT("AssetHive wind %s: %d source corners bound to source triangles, %d used card fallback"),
            *StaticMesh->GetName(), ProjectedCutCorners, FallbackCutCorners);
   }
   FString FrondSummary;
@@ -6446,6 +6516,8 @@ struct FPlantModelLodEntry {
   FString SourceFile;
   FString VariantKey = TEXT("01");
   int32 LodIndex = 0;
+  bool bBillboard = false;
+  int32 MaterialGroupId = INDEX_NONE;
 };
 
 static void CollectPlantModelLodPlan(
@@ -6492,6 +6564,11 @@ static void CollectPlantModelLodPlan(
     Entry.SourceFile = SourceFile;
     Entry.VariantKey = NormalizeModelVariantKey(VariantKey);
     Entry.LodIndex = LodIndex;
+    FString MaterialRole;
+    LodObject->TryGetStringField(TEXT("materialRole"), MaterialRole);
+    Entry.bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
+    double GroupId = INDEX_NONE;
+    if (LodObject->TryGetNumberField(TEXT("materialGroupId"), GroupId)) Entry.MaterialGroupId = FMath::RoundToInt(GroupId);
     OutLodsByVariant.FindOrAdd(Entry.VariantKey).Add(Entry);
   }
   for (TPair<FString, TArray<FPlantModelLodEntry>> &Pair : OutLodsByVariant) {
@@ -6544,6 +6621,31 @@ static int32 ImportPlantCustomLods(FAssetToolsModule &AssetToolsModule,
                                     /*bPerformReferenceCheck=*/false);
   }
   return MergedLodCount;
+}
+
+// LOD0 可能仅有 Atlas 槽；独立 Billboard 槽需同时记录在源网格和 section 映射，保证重建后仍保留。
+static bool AssignPlantBillboardLodMaterial(UStaticMesh *Mesh, int32 Lod,
+                                           UMaterialInstanceConstant *Material) {
+  if (!Mesh || !Material || Lod <= 0 || !Mesh->IsSourceModelValid(Lod)) return false;
+  FMeshDescription *Description = Mesh->GetMeshDescription(Lod);
+  if (!Description || Description->PolygonGroups().Num() == 0) return false;
+  auto &Slots = Mesh->GetStaticMaterials();
+  int32 SlotIndex = Slots.IndexOfByPredicate([&](const FStaticMaterial &Slot) {
+    return Slot.MaterialInterface == Material;
+  });
+  if (SlotIndex == INDEX_NONE) SlotIndex = Slots.Add(FStaticMaterial(Material, Material->GetFName(), Material->GetFName()));
+  const FName SlotName = Slots[SlotIndex].ImportedMaterialSlotName;
+  auto Names = FStaticMeshAttributes(*Description).GetPolygonGroupMaterialSlotNames();
+  for (const FPolygonGroupID Group : Description->PolygonGroups().GetElementIDs()) Names[Group] = SlotName;
+  const int32 Sections = FMath::Max(Mesh->GetSectionInfoMap().GetSectionNumber(Lod), Description->PolygonGroups().Num());
+  for (int32 Section = 0; Section < Sections; ++Section) {
+    FMeshSectionInfo Info = Mesh->GetSectionInfoMap().Get(Lod, Section);
+    Info.MaterialIndex = SlotIndex;
+    Mesh->GetSectionInfoMap().Set(Lod, Section, Info);
+    Mesh->GetOriginalSectionInfoMap().Set(Lod, Section, Info);
+  }
+  Mesh->CommitMeshDescription(Lod);
+  return true;
 }
 
 static UFoliageType_InstancedStaticMesh *
@@ -7667,12 +7769,10 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
                             bool bAutoMasked = false, float PlantHeightCm = 0.f,
                             const FJsonObject* VerifiedLayers = nullptr,
                             const FPlantBranch2Bounds& DecodeBounds = {},
-                            bool bForceMasked = false) {
+                            bool bForceMasked = false, bool bStaticBillboard = false) {
   const bool bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
-  // 合成 SpeedTree 风（导入时选择 Grass/Bush/Fern）：改用带 ST 风的母材质；OPAQUE 裁切
-  // 变体同样使用 ST 风母材质（Blend=Opaque 覆盖保持不变），仅 billboard 不参与。
-  const EPlantSyntheticWind WindStyle =
-      bBillboard ? EPlantSyntheticWind::None : SyntheticWind;
+  // Shared 与普通 LOD 使用相同预设和株高缩放，保证切换时整体运动一致。
+  const EPlantSyntheticWind WindStyle = SyntheticWind;
   const bool bSyntheticWind = WindStyle != EPlantSyntheticWind::None;
   bool bSyntheticWindBranch2 = HasSyntheticBranch2(WindStyle);
   if (bSyntheticWind && VerifiedLayers) VerifiedLayers->TryGetBoolField(TEXT("hasSecondary"),bSyntheticWindBranch2);
@@ -7704,9 +7804,13 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     ParentPath = UAssetHiveSettings::GetPlantOpaqueParentMaterialPath(bUseVT);
     ParentMaterial = UAssetHiveSettings::GetPlantOpaqueParentMaterial(bUseVT);
   } else {
-    ParentPath = UAssetHiveSettings::GetPlantParentMaterialPath(bBillboard);
+    ParentPath = UAssetHiveSettings::GetPlantParentMaterialPath(false);
     ParentMaterial =
-        UAssetHiveSettings::GetPlantParentMaterial(bBillboard, bUseVT);
+        UAssetHiveSettings::GetPlantParentMaterial(false, bUseVT);
+  }
+  if (bBillboard) {
+    ParentPath = ResolvePlantBillboardParentPath(ParentMaterial ? ParentMaterial->GetPathName() : ParentPath);
+    ParentMaterial = LoadObject<UMaterialInterface>(nullptr, *ParentPath);
   }
   if (!ParentMaterial) {
     GAssetHiveImportFailed = true;
@@ -7744,6 +7848,7 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
   MaterialInstance->SetParentEditorOnly(ParentMaterial);
 
   auto &Metadata = PlantPackageMetadata(MaterialPackage->GetMetaData());
+  Metadata.SetValue(MaterialInstance, TEXT("AssetHivePlantMaterialRole"), bBillboard ? TEXT("billboard") : TEXT("atlas"));
   const FName ForcedMaskedTag(TEXT("AssetHiveNaniteMasked"));
   const bool bWasForcedMasked = Metadata.HasValue(MaterialInstance, ForcedMaskedTag);
   if (bForceMasked) Metadata.SetValue(MaterialInstance, ForcedMaskedTag, TEXT("1"));
@@ -7958,6 +8063,7 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     }
   }
 
+  if (bBillboard) ApplyPlantBillboardWindPolicy(MaterialInstance, bStaticBillboard);
   // Publish the complete parameter set once, after texture compilation.
   UMaterialEditingLibrary::UpdateMaterialInstance(MaterialInstance);
   MaterialInstance->MarkPackageDirty();
@@ -8186,6 +8292,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     FPlantAssetProfile PlantProfile;
     bool bNaniteMasked = false;
     if (AssetType == TEXT("3dplant")) AssetObject->TryGetBoolField(TEXT("naniteMasked"), bNaniteMasked);
+    FString PlantExportMode;
+    if (AssetType == TEXT("3dplant")) AssetObject->TryGetStringField(TEXT("plantExportMode"), PlantExportMode);
     TArray<FString> AssetStandardTags;
     // 所有 Asset Type 都收标签：第三方目录判定对 Surface / Decal 同样生效，而这两类的
     // job 只有 tags、没有 standardAssetTags。
@@ -8254,6 +8362,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       if (HasAssetTag(AssetStandardTags, TEXT("Megascans"))) ProfileTags.AddUnique(TEXT("Megascans"));
       PlantProfile = ResolvePlantAssetProfile(ProfileTags, PlantCategory);
       if (bNaniteMasked) PlantProfile.bNanite = true;
+      // 显式 FBX LOD 模式使用常规 LOD 渲染，确保远端能切换到独立的 Billboard。
+      // st9 保留原导入策略；历史未声明模式的载荷也不改变 Nanite 默认值。
+      if (!bNaniteMasked && PlantExportMode.Equals(TEXT("lod"), ESearchCase::IgnoreCase) &&
+          AssetHasFbxPlantModels(AssetObject)) {
+        PlantProfile.bNanite = false;
+      }
       // 合成 SpeedTree 风由导入时选择（grass / bush / fern / auto / 不选），随 job 传入：未选择时
       // 不写风动 UV、也不切换 ST 风母材质；选择后写入的即导出到引擎的那个网格
       // （勾选不透明剪切并导出裁切版本时，裁切资产同样处理）。
@@ -8731,6 +8845,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // Variant keys the library export flagged as cut OPAQUE bases. Newer export
     // payloads keep the plain key (for example 01) and add an explicit flag.
     TSet<FString> OpaqueModelVariantKeys;
+    TSet<FString> NaniteMaskedModelVariantKeys;
     TMap<FString, TArray<FPlantModelLodEntry>> PlantLodsByVariant;
     TMap<FString, bool> FbxSmoothingGroupCache;
     TMap<int32, TMap<FString, UTexture *>> TextureBySlotByGroup;
@@ -8770,6 +8885,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           VariantObject->TryGetBoolField(TEXT("opaque"), bOpaqueVariant);
           if (bOpaqueVariant || IsOpaqueModelVariantKey(VariantKey)) {
             OpaqueModelVariantKeys.Add(NormalizeModelVariantKey(VariantKey));
+          }
+          bool bNaniteMaskedVariant = false;
+          if (VariantObject->TryGetBoolField(TEXT("naniteMasked"), bNaniteMaskedVariant) && bNaniteMaskedVariant && !bOpaqueVariant) {
+            NaniteMaskedModelVariantKeys.Add(NormalizeModelVariantKey(VariantKey));
           }
           ExplicitVariantByFile.Add(NormalizeModelSourceKey(SourceFile), VariantKey);
           bHasExplicitModelVariants = true;
@@ -8830,7 +8949,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           return A.Compare(B) < 0;
         });
 
-        if (!bNaniteMasked) CollectPlantModelLodPlan(AssetObject, PlantLodsByVariant);
+        if (!bNaniteMasked && (PlantExportMode.IsEmpty() || PlantExportMode.Equals(TEXT("lod"), ESearchCase::IgnoreCase)))
+          CollectPlantModelLodPlan(AssetObject, PlantLodsByVariant);
 
         for (const FString &VariantKey : VariantKeys) {
           TArray<FPlantModelEntry> &Entries = ByVariant.FindChecked(VariantKey);
@@ -9027,7 +9147,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         AssetType == TEXT("3dplant") && VariantKeyByMesh.Num() > 0 &&
         !bHasMaskedModelVariant;
     const bool bSuppressBillboardExport =
-        bNaniteMasked || bBillboardExcluded || bAllModelVariantsOpaque;
+        bNaniteMasked || bBillboardExcluded || bAllModelVariantsOpaque ||
+        (!PlantExportMode.IsEmpty() && !PlantExportMode.Equals(TEXT("lod"), ESearchCase::IgnoreCase));
     const TArray<TSharedPtr<FJsonValue>> *TextureFiles = nullptr;
     if (AssetObject->TryGetArrayField(TEXT("textureFiles"), TextureFiles) &&
         TextureFiles != nullptr) {
@@ -9629,18 +9750,12 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 26, 0, 99)),
               FString::Printf(TEXT("创建植被材质实例: %s"), *AssetName), false);
-          // Zion 的默认与专用父材质都延后到槽位阶段选择，避免创建未使用的实例。
-          // 未命中该规则时，合成 SpeedTree 风让 atlas 与 OPAQUE 裁切角色改用
-          // 带 ST 风的母材质（Grass→MI_Env_Grass_ST，Bush→MI_Env_Bush_ST；OPAQUE
-          // 保持 Blend=Opaque 覆盖），billboard 保持原样。
-          const EPlantSyntheticWind PlantWindStyle =
-              MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)
-                  ? EPlantSyntheticWind::None
-                  : PlantProfile.SyntheticWind;
+          // Billboard 共用该类的 Shared 预设，由独立实例关闭局部层级。
+          const EPlantSyntheticWind PlantWindStyle = PlantProfile.SyntheticWind;
           if (PlantWindStyle != EPlantSyntheticWind::None || !ZionPlantParentMaterialPath.IsEmpty()) {
             MatchPlantWindTextureStreaming({DiffuseTexture, NormalTexture, ORMTexture, SubsurfaceTexture, OpacityMaskTexture});
           }
-          if (bSyntheticTreeSlots || bUseZionSlotMaterials) {
+          {
             FZionPlantMaterialInputs Inputs;
             Inputs.MaterialStem = PlantMaterialStem;
             Inputs.ParentPath = ZionPlantParentMaterialPath;
@@ -9654,12 +9769,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             Inputs.WindStyle = PlantWindStyle;
             ZionPlantInputsByGroup.Add(GroupId, MoveTemp(Inputs));
             ZionPlantMaterialGroups.Add(GroupId);
-          } else if (bHasMaskedModelVariant) {
+          }
+          if (!bSyntheticTreeSlots && !bUseZionSlotMaterials && bHasMaskedModelVariant &&
+              !MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
             MaterialInstance = CreatePlantMaterialInstance(
                 MaterialFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
                 ORMTexture, OpacityMaskTexture, SubsurfaceTexture, MaterialRole,
                 bUseVT, /*bOpaque=*/false, PlantWindStyle,
-                ZionPlantParentMaterialPath, bIsZionAsset, PlantHeightCm,LayerSource.Get(),DecodeBounds, bNaniteMasked);
+                ZionPlantParentMaterialPath, bIsZionAsset, PlantHeightCm,LayerSource.Get(),DecodeBounds,
+                bNaniteMasked || !NaniteMaskedModelVariantKeys.IsEmpty());
           }
           // md §5.2：OPAQUE 裁切变体不创建 billboard 材质实例。
           if (bHasOpaqueModelVariant && !bSyntheticTreeSlots && !bUseZionSlotMaterials &&
@@ -9745,7 +9863,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         continue;
       }
       // Reimport can preserve custom source LODs from an earlier Masked + LOD export.
-      if (bNaniteMasked && StaticMesh->GetNumSourceModels() > 1) StaticMesh->SetNumSourceModels(1);
+      const FString MeshVariantKey = VariantKeyByMesh.FindRef(StaticMesh);
+      const bool bMeshNaniteMasked = bNaniteMasked || NaniteMaskedModelVariantKeys.Contains(NormalizeModelVariantKey(MeshVariantKey));
+      if ((bMeshNaniteMasked || bSuppressBillboardExport) && AssetType == TEXT("3dplant") &&
+          StaticMesh->GetNumSourceModels() > 1) StaticMesh->SetNumSourceModels(1);
       // Foliage/3D Plants intentionally do not participate in this rule.
       if (bIs3DAsset && FPaths::GetExtension(SourceFileByMesh.FindRef(StaticMesh))
                               .Equals(TEXT("fbx"), ESearchCase::IgnoreCase)) {
@@ -9776,8 +9897,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         const FString WindMeshVariantKey = VariantKeyByMesh.FindRef(StaticMesh);
         TSharedPtr<FJsonObject> LayerVariant;
         FString LayerOriginal;
+        TSet<int32> SharedOnlyWindLods;
+        if (const auto *Lods = PlantLodsByVariant.Find(WindMeshVariantKey)) {
+          for (const auto &Lod : *Lods) if (Lod.bBillboard) SharedOnlyWindLods.Add(Lod.LodIndex);
+        }
         if (LayerSources) {
           const auto Source=GetZionWindObject(LayerSources,*WindMeshVariantKey);
+          SharedOnlyWindLods.Append(GetSharedOnlyPlantLods(Source));
           FString Name;
           if (Source && Source->TryGetStringField(TEXT("name"),Name) && Source->TryGetStringField(TEXT("original"),LayerOriginal))
             LayerVariant=GetZionWindObject(LayerVariants,*Name);
@@ -9860,7 +9986,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         if (!ApplySyntheticSpeedTreeWind(
                 StaticMesh, PlantProfile.SyntheticWind,
                 WindCardReference.IsValid() ? &WindCardReference : nullptr,
-                WindSummary, DecodeBounds, bOpaqueWindMesh)) {
+                WindSummary, DecodeBounds, bOpaqueWindMesh, &SharedOnlyWindLods)) {
           GAssetHiveImportFailed = true;
           UE_LOG(LogTemp, Error,
                  TEXT("AssetHive import: %s 合成 SpeedTree 风数据写入失败（无可用 LOD）"),
@@ -9879,7 +10005,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // Cut _OPAQUE variants use the opaque material set of the same group.
       // The library export flags them on the variant entry instead of the key.
       // 面数档同样按变体判定：裁切变体走裁切档（见 ResolveOpaquePlantTriangleBudget）。
-      const FString MeshVariantKey = VariantKeyByMesh.FindRef(StaticMesh);
       const bool bOpaqueMesh =
           IsOpaqueModelVariantKey(MeshVariantKey) ||
           OpaqueModelVariantKeys.Contains(
@@ -9924,7 +10049,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         }
         FMeshNaniteSettings *NaniteSettings =
             GetMutableNaniteSettings(StaticMesh);
-        NaniteSettings->bEnabled = PlantProfile.bNanite;
+        NaniteSettings->bEnabled = PlantProfile.bNanite || bMeshNaniteMasked;
         NaniteSettings->ShapePreservation =
             ENaniteShapePreservation::PreserveArea;
         // 原生或合成风动 UV 可能承载编码数据，需要避免 UV 插值和半精度量化。
@@ -9959,11 +10084,18 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // section 会重映射回 Atlas 槽位，槽位本身再从网格材质列表里移除。
       TArray<int32> BillboardSlotIndexes;
       int32 AtlasSlotIndex = INDEX_NONE;
+      for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex) {
+        UMaterialInterface *Existing = Slots[SlotIndex].MaterialInterface;
+        if (Existing && PlantPackageMetadata(Existing->GetPackage()->GetMetaData()).GetValue(
+            Existing, TEXT("AssetHivePlantMaterialRole")) == TEXT("billboard")) {
+          BillboardSlotIndexes.Add(SlotIndex);
+        } else if (AtlasSlotIndex == INDEX_NONE) AtlasSlotIndex = SlotIndex;
+      }
       if (bOpaqueMesh || bSuppressBillboardExport) {
         for (int32 SlotIndex = 0;
              SlotIndex < Slots.Num() && SlotIndex < GroupIds.Num(); ++SlotIndex) {
           if (IsBillboardGroup(GroupIds[SlotIndex])) {
-            BillboardSlotIndexes.Add(SlotIndex);
+            BillboardSlotIndexes.AddUnique(SlotIndex);
           } else if (AtlasSlotIndex == INDEX_NONE) {
             AtlasSlotIndex = SlotIndex;
           }
@@ -9977,8 +10109,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             SourceMaterialGroupIds.IsValidIndex(MaterialIndex)
                 ? SourceMaterialGroupIds[MaterialIndex]
                 : INDEX_NONE;
-        if ((bOpaqueMesh || bSuppressBillboardExport) &&
-            GroupId != INDEX_NONE && IsBillboardGroup(GroupId)) {
+        if (GroupId != INDEX_NONE && IsBillboardGroup(GroupId)) {
           continue;
         }
         MeshMaterials.Add(SourceMaterials[MaterialIndex]);
@@ -9987,11 +10118,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         MeshMaterials = SourceMaterials;
       }
       const bool bNativeMeshHasUV3 = bHasZionNativeWind && HasZionNativeUV3(StaticMesh);
+      TArray<int32> AtlasMaterialGroups = ZionPlantMaterialGroups.FilterByPredicate(
+          [&](int32 Group) { return !IsBillboardGroup(Group); });
       for (int32 Index = 0; Index < Slots.Num(); ++Index) {
+        if (BillboardSlotIndexes.Contains(Index)) continue;
         UMaterialInstanceConstant *Material = nullptr;
-        if (bUseZionSlotsForMesh && ZionPlantMaterialGroups.Num() > 0) {
-          const int32 GroupId = ZionPlantMaterialGroups[
-              FMath::Min(Index, ZionPlantMaterialGroups.Num() - 1)];
+        if (bUseZionSlotsForMesh && AtlasMaterialGroups.Num() > 0) {
+          const int32 GroupId = AtlasMaterialGroups[
+              FMath::Min(Index, AtlasMaterialGroups.Num() - 1)];
           const FZionPlantMaterialInputs &Inputs = ZionPlantInputsByGroup.FindChecked(GroupId);
           FString RoleSuffix;
           if (BillboardSlotIndexes.Contains(Index)) continue;
@@ -10044,7 +10178,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 (bOpaqueMesh || (bSyntheticTreeSlots && !RoleSuffix.IsEmpty())) ? nullptr : Inputs.Opacity,
                 Inputs.Subsurface, Inputs.MaterialRole, Inputs.bUseVT,
                 bOpaqueMesh, Inputs.WindStyle, ParentPath,
-                /*bAutoMasked=*/true, PlantHeightCm,LayerSource.Get(),DecodeBounds, bNaniteMasked);
+                /*bAutoMasked=*/true, PlantHeightCm,LayerSource.Get(),DecodeBounds, bMeshNaniteMasked);
             if (Material) {
               if (bApplyNativeWind) {
                 ApplyZionNativeWindParameters(Material, NativePlantWind, MaterialWind,
@@ -10075,6 +10209,49 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             Candidate = FName(*(Material->GetName() + TEXT("_") + FString::FromInt(++Suffix)));
           }
           Slots[Index].ImportedMaterialSlotName = Candidate;
+        }
+      }
+      if (AssetType == TEXT("3dplant") && !bOpaqueMesh && !bSuppressBillboardExport) {
+        TMap<int32, int32> BillboardGroupsByLod;
+        if (const auto *Lods = PlantLodsByVariant.Find(MeshVariantKey)) {
+          for (const auto &Lod : *Lods) if (Lod.bBillboard) BillboardGroupsByLod.Add(Lod.LodIndex, Lod.MaterialGroupId);
+        }
+        // 旧任务未在 modelLods 声明材质角色时，仍以已核验的层级清单识别 Billboard。
+        for (int32 Lod : GetSharedOnlyPlantLods(GetZionWindObject(LayerSources, *MeshVariantKey))) {
+          if (!BillboardGroupsByLod.Contains(Lod)) BillboardGroupsByLod.Add(Lod, INDEX_NONE);
+        }
+        const TArray<int32> BillboardGroups = ZionPlantMaterialGroups.FilterByPredicate(IsBillboardGroup);
+        for (const auto &Lod : BillboardGroupsByLod) {
+          int32 GroupId = Lod.Value;
+          if (GroupId == INDEX_NONE && BillboardGroups.Num() == 1) GroupId = BillboardGroups[0];
+          const FZionPlantMaterialInputs *Inputs = ZionPlantInputsByGroup.Find(GroupId);
+          if (!Inputs || !IsBillboardGroup(GroupId)) {
+            GAssetHiveImportFailed = true;
+            UE_LOG(LogTemp, Error, TEXT("AssetHive: %s LOD%d requires an unambiguous Billboard texture group"), *StaticMesh->GetName(), Lod.Key);
+            continue;
+          }
+          const FString CacheKey = FString::Printf(TEXT("billboard|%d|%s"), GroupId, *Inputs->ParentPath);
+          UMaterialInstanceConstant *Material = ZionPlantSlotInstances.FindRef(CacheKey);
+          if (!Material) {
+            const bool bStaticBillboard = bMicroPlant ||
+                (!bHasZionNativeWind && PlantProfile.SyntheticWind == EPlantSyntheticWind::None);
+            Material = CreatePlantMaterialInstance(MaterialFolder, Inputs->MaterialStem,
+                Inputs->Diffuse, Inputs->Normal, Inputs->ORM, Inputs->Opacity, Inputs->Subsurface,
+                TEXT("billboard"), Inputs->bUseVT, false, Inputs->WindStyle, Inputs->ParentPath,
+                /*bAutoMasked=*/true, PlantHeightCm, LayerSource.Get(), DecodeBounds, false, bStaticBillboard);
+            if (Material && bHasZionNativeWind) {
+              ApplyZionNativeWindParameters(Material, NativePlantWind, {}, false);
+              ApplyPlantBillboardWindPolicy(Material, bStaticBillboard);
+              UMaterialEditingLibrary::UpdateMaterialInstance(Material);
+              Material->MarkPackageDirty();
+              FinalizeImportedAsset(Material);
+            }
+            if (Material) ZionPlantSlotInstances.Add(CacheKey, Material);
+          }
+          if (!AssignPlantBillboardLodMaterial(StaticMesh, Lod.Key, Material)) {
+            GAssetHiveImportFailed = true;
+            UE_LOG(LogTemp, Error, TEXT("AssetHive: failed to assign %s Billboard material to LOD%d"), *StaticMesh->GetName(), Lod.Key);
+          }
         }
       }
       if ((bOpaqueMesh || bSuppressBillboardExport) &&
@@ -12278,6 +12455,182 @@ bool FAssetHivePlantWindGrassHeightWeightTest::RunTest(const FString &Parameters
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindLodReuseTest, "AssetHive.Plants.SyntheticWindLod0Reuse",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveWindLodReuseTest::RunTest(const FString &Parameters) {
+  UStaticMesh* Mesh = NewObject<UStaticMesh>(GetTransientPackage(), NAME_None, RF_Transient);
+  FGCObjectScopeGuard Guard(Mesh);
+  const FVector3f Points[2][3] = {
+      {FVector3f(0,0,0), FVector3f(10,0,0), FVector3f(0,0,10)},
+      {FVector3f(0,0,4), FVector3f(1,0,4), FVector3f(0,0,5)}};
+  for (int32 Lod=0; Lod<2; ++Lod) {
+    Mesh->AddSourceModel();
+    FMeshDescription Description;
+    FStaticMeshAttributes Attributes(Description);
+    Attributes.Register();
+    auto Positions=Attributes.GetVertexPositions();
+    auto UVs=Attributes.GetVertexInstanceUVs();
+    UVs.SetNumChannels(1);
+    const auto Group=Description.CreatePolygonGroup();
+    TArray<FVertexInstanceID> Corners;
+    for (int32 K=0; K<3; ++K) {
+      const auto V=Description.CreateVertex();
+      Positions[V]=Points[Lod][K];
+      const auto VI=Description.CreateVertexInstance(V);
+      UVs.Set(VI,0,FVector2f(Points[Lod][K].X/10.f,Points[Lod][K].Z/10.f));
+      Corners.Add(VI);
+    }
+    Description.CreateTriangle(Group,Corners);
+    Mesh->CreateMeshDescription(Lod,MoveTemp(Description));
+    Mesh->CommitMeshDescription(Lod);
+  }
+  // 两级源网格仅有 UV0，低 LOD 不含原叶尖；单独拟合局部渐变会改变原始风权重。
+  const FString Json=TEXT("{\"primaryAxes\":[{\"base\":[0,0,0],\"tip\":[0,0,1]}],"
+      "\"secondaryAxes\":[{\"base\":[0,0,0],\"tip\":[0,0,1]}],"
+      "\"bindings\":[{\"island\":0,\"boundsCenter\":[0.5,0,0.5],\"primary\":0,\"secondary\":0,"
+      "\"primaryAttachment\":-1,\"secondaryAttachment\":-1,\"terminal\":true,\"blade\":[[0,0,0],[0,0,1]]}]}");
+  TSharedPtr<FJsonObject> Layer;
+  if (!TestTrue(TEXT("Read LOD0 binding fixture"),FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json),Layer))) return false;
+  FPlantWindCardReference Reference;
+  if (!TestTrue(TEXT("Bind only LOD0"),BuildPlantWindCardReference(Mesh,EPlantWindFrondMergeMode::None,
+      Reference,false,false,Layer.Get()))) return false;
+  Reference.bAssetUsesBranch2=true;
+  FPlantBranch2Bounds Bounds;
+  Bounds.Min.Z=0.f; Bounds.Max.Z=.64f;
+  FString Summary;
+  if (!TestTrue(TEXT("Bake both LODs"),ApplySyntheticSpeedTreeWind(Mesh,EPlantSyntheticWind::Herb,&Reference,Summary,Bounds))) return false;
+  const float Gain=AssetHivePlantWind::PackGrassRippleWeight(FVector3f::ZeroVector);
+  FStaticMeshAttributes Low(*Mesh->GetMeshDescription(1));
+  const auto UVs=Low.GetVertexInstanceUVs();
+  TestEqual(TEXT("LOD1 gains UV0 through UV3"),UVs.GetNumChannels(),4);
+  for (const auto VI : Mesh->GetMeshDescription(1)->VertexInstances().GetElementIDs()) {
+    const auto P=Low.GetVertexPositions()[Mesh->GetMeshDescription(1)->GetVertexInstanceVertex(VI)];
+    const float Fraction=P.Z/10.f;
+    TestTrue(TEXT("LOD1 keeps texture UV0"),UVs.Get(VI,0).Equals(FVector2f(P.X/10.f,Fraction),1.e-6f));
+    TestTrue(TEXT("Branch1 interpolates LOD0 weights"),FMath::IsNearlyEqual(UVs.Get(VI,2).X,.70f*Fraction,1.e-5f));
+    TestTrue(TEXT("Ripple interpolates LOD0 weights"),FMath::IsNearlyEqual(UVs.Get(VI,2).Y,Gain*Fraction,1.e-5f));
+    const auto Packed=UVs.Get(VI,3);
+    const int32 ChildCode=AssetHivePlantWind::UV3Word(Packed.X)%256;
+    const int32 RippleCode=AssetHivePlantWind::RippleNibble(Packed.X,1) |
+        (AssetHivePlantWind::RippleNibble(Packed.Y,0)<<4);
+    TestTrue(TEXT("Branch2 is re-encoded after interpolation"),FMath::Abs(ChildCode/255.f-Fraction)<=1.f/255.f);
+    TestEqual(TEXT("Mode2 carries interpolated Ripple"),RippleCode,FMath::RoundToInt(Gain*Fraction*255.f));
+    for (int32 Channel=0; Channel<4; ++Channel) TestFalse(TEXT("Baked UV is finite"),UVs.Get(VI,Channel).ContainsNaN());
+  }
+  const TSet<int32> SharedOnly={1};
+  TestTrue(TEXT("Billboard policy overrides the reusable local field"),
+      ApplySyntheticSpeedTreeWind(Mesh,EPlantSyntheticWind::Herb,&Reference,Summary,Bounds,false,&SharedOnly));
+  FStaticMeshAttributes Billboard(*Mesh->GetMeshDescription(1));
+  const auto BillboardUV=Billboard.GetVertexInstanceUVs();
+  for (const auto VI : Mesh->GetMeshDescription(1)->VertexInstances().GetElementIDs()) {
+    TestTrue(TEXT("Billboard has zero Branch1 and Ripple"),BillboardUV.Get(VI,2).IsNearlyZero());
+    const auto Packed=BillboardUV.Get(VI,3);
+    TestEqual(TEXT("Billboard has zero Branch2"),AssetHivePlantWind::UV3Word(Packed.X)%256,0);
+    TestEqual(TEXT("Billboard has zero remapped Ripple"),
+        AssetHivePlantWind::RippleNibble(Packed.X,1)|(AssetHivePlantWind::RippleNibble(Packed.Y,0)<<4),0);
+  }
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindLodImportTest, "AssetHive.Plants.SyntheticWindLodReuseImport",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveWindLodImportTest::RunTest(const FString &Parameters) {
+  FString Input;
+  if (!FParse::Value(FCommandLine::Get(),TEXT("AssetHiveLodReuseInputs="),Input)) {
+    AddInfo(TEXT("Supply -AssetHiveLodReuseInputs=<json> to check original Bridge LOD chains."));
+    return true;
+  }
+  FString Json;
+  TSharedPtr<FJsonObject> Fixture;
+  if (!TestTrue(TEXT("Read original LOD inputs"),FFileHelper::LoadFileToString(Json,*Input) &&
+      FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json),Fixture))) return false;
+  const auto& Inputs=Fixture->GetArrayField(TEXT("assets"));
+  auto& AssetTools=FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+  const FString Folder=TEXT("/Game/AssetHiveLodReuse_")+FGuid::NewGuid().ToString(EGuidFormats::Digits);
+  TArray<TSharedPtr<FJsonValue>> Results;
+  bool Success=true;
+  for (int32 Index=0; Index<Inputs.Num(); ++Index) {
+    const auto Data=Inputs[Index]->AsObject();
+    const FString ManifestFile=Data->GetStringField(TEXT("manifest"));
+    const FString VariantName=Data->GetStringField(TEXT("variant"));
+    TSharedPtr<FJsonObject> Manifest;
+    if (!FFileHelper::LoadFileToString(Json,*ManifestFile) ||
+        !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json),Manifest)) { Success=false; continue; }
+    const auto Variants=GetZionWindObject(Manifest,TEXT("variants"));
+    const auto Layer=GetZionWindObject(Variants,*VariantName);
+    if (!Layer) { Success=false; continue; }
+    const auto& Files=Data->GetArrayField(TEXT("files"));
+    UStaticMesh* Mesh=ImportStaticMeshAsset(AssetTools,Files[0]->AsString(),Folder,
+        FString::Printf(TEXT("Source_%d"),Index),false);
+    if (!TestNotNull(TEXT("Import original LOD0"),Mesh)) { Success=false; continue; }
+    FGCObjectScopeGuard MeshGuard(Mesh);
+    TArray<FPlantModelLodEntry> Lods;
+    for (int32 Lod=1; Lod<Files.Num(); ++Lod) {
+      FPlantModelLodEntry Entry; Entry.SourceFile=Files[Lod]->AsString(); Entry.LodIndex=Lod;
+      Lods.Add(Entry);
+    }
+    Success&=TestEqual(TEXT("Import every original lower LOD"),
+        ImportPlantCustomLods(AssetTools,Mesh,Lods,Folder,Mesh->GetName()),Lods.Num());
+    FPlantWindCardReference Reference;
+    if (!TestTrue(TEXT("Bind original LOD0 JSON"),BuildPlantWindCardReference(Mesh,
+        EPlantWindFrondMergeMode::None,Reference,false,false,Layer.Get(),FPaths::GetPath(ManifestFile)))) {
+      Success=false; ObjectTools::DeleteSingleObject(Mesh,false); continue;
+    }
+    bool HasSecondary=false;
+    for (const auto& Pair : Variants->Values) {
+      const auto Counts=GetZionWindObject(Pair.Value->AsObject(),TEXT("counts"));
+      double Number=0.;
+      HasSecondary|=Counts && Counts->TryGetNumberField(TEXT("branch2InfluencedIslands"),Number) && Number>0.;
+    }
+    Reference.bAssetUsesBranch2=HasSecondary;
+    const TSet<int32> SharedOnlyLods=GetSharedOnlyPlantLods(Data);
+    FString Summary;
+    Success&=TestTrue(TEXT("Bake reused LOD0 wind into every source LOD"),
+        ApplySyntheticSpeedTreeWind(Mesh,EPlantSyntheticWind::Herb,&Reference,Summary,GetPlantBranch2Bounds(*Variants),false,&SharedOnlyLods));
+    for (int32 Lod=0; Lod<Mesh->GetNumSourceModels(); ++Lod) {
+      auto* Description=Mesh->GetMeshDescription(Lod);
+      if (!TestNotNull(TEXT("Source LOD exists"),Description)) { Success=false; continue; }
+      FStaticMeshAttributes Attributes(*Description);
+      const auto UVs=Attributes.GetVertexInstanceUVs();
+      const int32 Required=HasSecondary ? 4 : 3;
+      Success&=TestTrue(TEXT("Source LOD contains its own wind UV channels"),UVs.GetNumChannels()>=Required);
+      bool Finite=true; float MaxBranch1=0.f, MaxRipple=0.f;
+      for (const auto VI : Description->VertexInstances().GetElementIDs()) {
+        for (int32 Channel=0; Channel<FMath::Min(Required,UVs.GetNumChannels()); ++Channel)
+          Finite&=!UVs.Get(VI,Channel).ContainsNaN();
+        if (UVs.GetNumChannels()>2) {
+          MaxBranch1=FMath::Max(MaxBranch1,UVs.Get(VI,2).X);
+          MaxRipple=FMath::Max(MaxRipple,UVs.Get(VI,2).Y);
+        }
+      }
+      Success&=TestTrue(TEXT("Baked source LOD wind data is finite"),Finite);
+      const bool SharedOnlyProxy=SharedOnlyLods.Contains(Lod);
+      Success&=TestTrue(TEXT("Billboard has no Branch1 or Ripple; geometry LODs keep active local weights"),
+          SharedOnlyProxy ? MaxBranch1==0.f && MaxRipple==0.f : MaxBranch1>0.f);
+      if (SharedOnlyProxy && UVs.GetNumChannels()>3) {
+        for (const auto VI : Description->VertexInstances().GetElementIDs())
+          Success&=TestEqual(TEXT("Billboard has zero Branch2 payload"),AssetHivePlantWind::UV3Word(UVs.Get(VI,3).X)%256,0);
+      }
+      Success&=TestTrue(TEXT("Packed wind UVs use full precision"),Mesh->GetSourceModel(Lod).BuildSettings.bUseFullPrecisionUVs);
+      auto Row=MakeShared<FJsonObject>();
+      Row->SetStringField(TEXT("id"),Data->GetStringField(TEXT("id")));
+      Row->SetStringField(TEXT("variant"),VariantName);
+      Row->SetNumberField(TEXT("lod"),Lod);
+      Row->SetNumberField(TEXT("uvChannels"),UVs.GetNumChannels());
+      Row->SetNumberField(TEXT("corners"),Description->VertexInstances().Num());
+      Row->SetNumberField(TEXT("branch1Max"),MaxBranch1);
+      Row->SetNumberField(TEXT("rippleMax"),MaxRipple);
+      Row->SetBoolField(TEXT("finite"),Finite);
+      Row->SetBoolField(TEXT("sharedOnlyProxy"),SharedOnlyProxy);
+      Results.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    ObjectTools::DeleteSingleObject(Mesh,false);
+  }
+  FJsonSerializer::Serialize(Results,TJsonWriterFactory<>::Create(&Json));
+  FFileHelper::SaveStringToFile(Json,*(Input+TEXT(".results.json")));
+  return Success;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindMaterialTest, "AssetHive.Plants.SyntheticWindMaterialReimport",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FAssetHiveWindMaterialTest::RunTest(const FString &Parameters) {
@@ -12307,6 +12660,173 @@ bool FAssetHiveWindMaterialTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("Other edits survive reimport"), MI->ScalarParameterValues.ContainsByPredicate(
       [](const FScalarParameterValue &P) { return P.ParameterInfo.Name == TEXT("ArtistAdjustment"); }));
   ObjectTools::DeleteSingleObject(MI, false);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveBillboardMaterialTest, "AssetHive.Plants.BillboardMaterialAndSections",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveBillboardMaterialTest::RunTest(const FString &Parameters) {
+  for (const FString Family : {TEXT("Grass"), TEXT("Bush"), TEXT("Tree"), TEXT("Micro")}) {
+    const FString Root = TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_") + Family;
+    TestEqual(Family + TEXT(" Billboard parent"), ResolvePlantBillboardParentPath(Root + TEXT("_ST_VT.MI_Env_") + Family + TEXT("_ST_VT")),
+        Root + TEXT("_Billboard_ST_VT.MI_Env_") + Family + TEXT("_Billboard_ST_VT"));
+  }
+  const FString Folder = TEXT("/Game/AssetHiveBillboardTest_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+  const FString ParentPath = Folder / TEXT("MI_Probe_ST.MI_Probe_ST");
+  const FString BillboardPath = ResolvePlantBillboardParentPath(ParentPath);
+  UMaterialInterface *Default = UMaterial::GetDefaultMaterial(MD_Surface);
+  auto *Parent = NewObject<UMaterialInstanceConstant>(CreatePackage(*FPackageName::ObjectPathToPackageName(ParentPath)), TEXT("MI_Probe_ST"), RF_Public | RF_Standalone);
+  Parent->SetParentEditorOnly(Default);
+  auto *BillboardParent = NewObject<UMaterialInstanceConstant>(CreatePackage(*FPackageName::ObjectPathToPackageName(BillboardPath)), TEXT("MI_Probe_Billboard_ST"), RF_Public | RF_Standalone);
+  BillboardParent->SetParentEditorOnly(Default);
+  FinalizeImportedAsset(Parent);
+  FinalizeImportedAsset(BillboardParent);
+  UTexture *AtlasTexture = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/DefaultTexture.DefaultTexture"));
+  UTexture *BillboardTexture = LoadObject<UTexture>(nullptr, TEXT("/Engine/EngineResources/WhiteSquareTexture.WhiteSquareTexture"));
+  if (!TestTrue(TEXT("Distinct texture fixtures"), AtlasTexture && BillboardTexture && AtlasTexture != BillboardTexture)) return false;
+  auto *Atlas = CreatePlantMaterialInstance(Folder, TEXT("Probe"), AtlasTexture, nullptr, nullptr, nullptr, nullptr,
+      TEXT("atlas"), false, false, EPlantSyntheticWind::Herb, ParentPath, false, 100.f);
+  const auto Import = [&](bool bMicro) {
+    return CreatePlantMaterialInstance(Folder, TEXT("Probe"), BillboardTexture, nullptr, nullptr, nullptr, nullptr,
+        TEXT("billboard"), false, false, bMicro ? EPlantSyntheticWind::None : EPlantSyntheticWind::Herb,
+        ParentPath, false, 100.f, nullptr, {}, false, bMicro);
+  };
+  auto *Billboard = Import(false);
+  if (!TestTrue(TEXT("Dedicated child and parent"), Atlas && Billboard && Atlas != Billboard && Billboard->Parent == BillboardParent && Atlas->Parent == Parent)) return false;
+  const auto HasSwitch = [&](FName Name, bool Value) {
+    return Billboard->GetStaticParameters().StaticSwitchParameters.ContainsByPredicate([&](const FStaticSwitchParameter &P) {
+      return P.ParameterInfo.Name == Name && P.bOverride && P.Value == Value;
+    });
+  };
+  TestTrue(TEXT("Only Shared enabled"), HasSwitch(TEXT("SharedEnable"), true));
+  for (FName Name : {FName(TEXT("Branch1Enable")), FName(TEXT("Branch2Enable")), FName(TEXT("RippleEnable")), FName(TEXT("RippleShimmerEnable")), FName(TEXT("Interactive"))})
+    TestTrue(Name.ToString() + TEXT(" disabled"), HasSwitch(Name, false));
+  const FMaterialParameterInfo Diffuse{FName(*UAssetHiveSettings::GetPlantDiffuseParameter())};
+  UTexture *A = nullptr, *B = nullptr;
+  TestTrue(TEXT("Billboard owns its texture"), Atlas->GetTextureParameterValue(Diffuse, A) && Billboard->GetTextureParameterValue(Diffuse, B) && A == AtlasTexture && B == BillboardTexture);
+  float AtlasBend = 0.f, BillboardBend = 0.f;
+  TestTrue(TEXT("Shared matches the normal LOD preset"), Atlas->GetScalarParameterValue(FMaterialParameterInfo(TEXT("SharedBend")), AtlasBend) &&
+      Billboard->GetScalarParameterValue(FMaterialParameterInfo(TEXT("SharedBend")), BillboardBend) && AtlasBend == BillboardBend);
+  UStaticMesh *Mesh = NewObject<UStaticMesh>(GetTransientPackage(), NAME_None, RF_Transient);
+  Mesh->GetStaticMaterials().Add(FStaticMaterial(Atlas, TEXT("Atlas"), TEXT("Atlas")));
+  for (int32 Lod = 0; Lod < 2; ++Lod) {
+    Mesh->AddSourceModel();
+    FMeshDescription Description;
+    FStaticMeshAttributes Attributes(Description); Attributes.Register();
+    const auto Group = Description.CreatePolygonGroup();
+    Attributes.GetPolygonGroupMaterialSlotNames()[Group] = TEXT("Atlas");
+    TArray<FVertexInstanceID> Corners;
+    for (int32 K = 0; K < 3; ++K) {
+      const auto V = Description.CreateVertex();
+      Attributes.GetVertexPositions()[V] = FVector3f(K == 1, 0, K == 2);
+      Corners.Add(Description.CreateVertexInstance(V));
+    }
+    Description.CreateTriangle(Group, Corners);
+    Mesh->CreateMeshDescription(Lod, MoveTemp(Description));
+    Mesh->CommitMeshDescription(Lod);
+  }
+  TestTrue(TEXT("Billboard slot assigned"), AssignPlantBillboardLodMaterial(Mesh, 1, Billboard));
+  TestEqual(TEXT("Normal LOD stays on atlas"), Mesh->GetSectionInfoMap().Get(0, 0).MaterialIndex, 0);
+  TestEqual(TEXT("Billboard gets separate slot"), Mesh->GetSectionInfoMap().Get(1, 0).MaterialIndex, 1);
+  TestEqual(TEXT("Original section map agrees"), Mesh->GetOriginalSectionInfoMap().Get(1, 0).MaterialIndex, 1);
+  TestEqual(TEXT("Source slot survives rebuild"), FStaticMeshAttributes(*Mesh->GetMeshDescription(1)).GetPolygonGroupMaterialSlotNames()[FPolygonGroupID(0)], Billboard->GetFName());
+  TestTrue(TEXT("Reimport reuses Billboard MI"), Import(true) == Billboard);
+  TestTrue(TEXT("Micro disables Shared"), HasSwitch(TEXT("SharedEnable"), false));
+  TestTrue(TEXT("Micro disables interaction"), HasSwitch(TEXT("Interactive"), false));
+  ObjectTools::DeleteSingleObject(Atlas, false); ObjectTools::DeleteSingleObject(Billboard, false);
+  ObjectTools::DeleteSingleObject(Parent, false); ObjectTools::DeleteSingleObject(BillboardParent, false);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveBillboardProjectTest, "AssetHive.Plants.BillboardProjectImport",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveBillboardProjectTest::RunTest(const FString &Parameters) {
+  FString File;
+  if (!FParse::Value(FCommandLine::Get(), TEXT("AssetHiveBillboardValidationJob="), File)) {
+    AddInfo(TEXT("Supply -AssetHiveBillboardValidationJob=<job> with project parents in a scratch project."));
+    return true;
+  }
+  FString Json;
+  TSharedPtr<FJsonObject> Job;
+  if (!TestTrue(TEXT("Read Billboard fixture"), FFileHelper::LoadFileToString(Json, *File) &&
+      FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Job))) return false;
+  const auto &Assets = Job->GetArrayField(TEXT("assets"));
+  const FString Root = TEXT("/Game/AssetHiveBillboardTest_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+  auto *Importer = NewObject<UAssetHiveImportCommandlet>();
+  FGCObjectScopeGuard Guard(Importer);
+  TArray<FString> Folders;
+  auto &Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+  for (int32 Pass = 0; Pass < 2; ++Pass) {
+    if (!TestEqual(TEXT("Import Billboard project job"), Importer->ImportJob(Job, Root, {}, &Folders), 0)) return false;
+    if (GShaderCompilingManager) GShaderCompilingManager->FinishAllCompilation();
+    TestEqual(TEXT("Every fixture imported"), Folders.Num(), Assets.Num());
+    for (int32 Index = 0; Index < Folders.Num(); ++Index) {
+      const auto Asset = Assets[Index]->AsObject();
+      const FString Family = Asset->GetStringField(TEXT("billboardTestFamily"));
+      const bool bStatic = Family == TEXT("Micro") || Family == TEXT("Foliage_ThirdParty");
+      const bool bLod = Asset->GetStringField(TEXT("plantExportMode")) == TEXT("lod");
+      TArray<FAssetData> Objects;
+      Registry.GetAssetsByPath(FName(*Folders[Index]), Objects, true);
+      int32 Meshes = 0;
+      for (const auto &Object : Objects) {
+        auto *Mesh = Cast<UStaticMesh>(Object.GetAsset());
+        if (!Mesh) continue;
+        ++Meshes;
+        TestEqual(Family + TEXT(" source LOD count"), Mesh->GetNumSourceModels(), bLod ? 2 : 1);
+        if (bLod) TestFalse(TEXT("Explicit FBX LOD uses conventional LOD rendering"), Mesh->GetNaniteSettings().bEnabled);
+        int32 BillboardSlots = 0;
+        UMaterialInstanceConstant *Atlas = nullptr, *Billboard = nullptr;
+        for (const auto &Slot : Mesh->GetStaticMaterials()) {
+          auto *MI = Cast<UMaterialInstanceConstant>(Slot.MaterialInterface);
+          if (!MI || !MI->Parent) continue;
+          if (MI->Parent->GetName().Contains(TEXT("_Billboard"))) { ++BillboardSlots; Billboard = MI; }
+          else Atlas = MI;
+          if (!GUsingNullRHI) {
+            const auto *Resource = MI->GetMaterialResource(GMaxRHIShaderPlatform);
+            TestTrue(MI->GetName() + TEXT(" compiled permutation"), Resource && Resource->GetGameThreadShaderMap() && Resource->GetCompileErrors().IsEmpty());
+          }
+        }
+        TestEqual(Family + TEXT(" Billboard slot count after reimport"), BillboardSlots, bLod ? 1 : 0);
+        if (!bLod) {
+          TestEqual(TEXT("Nanite Masked has no stale slots"), Mesh->GetStaticMaterials().Num(), 1);
+          TestTrue(TEXT("Fallback uses Nanite"), Mesh->GetNaniteSettings().bEnabled);
+          TestTrue(TEXT("Fallback uses Masked"), Atlas && Atlas->GetBlendMode() == BLEND_Masked);
+          continue;
+        }
+        if (!TestTrue(Family + TEXT(" dedicated materials"), Atlas && Billboard && Atlas != Billboard)) continue;
+        TestEqual(Family + TEXT(" Billboard family"), Billboard->Parent->GetName(), TEXT("MI_Env_") + Family +
+            (Family == TEXT("Foliage_ThirdParty") ? TEXT("_Billboard_VT") : TEXT("_Billboard_ST_VT")));
+        const int32 BillboardSlot = Mesh->GetStaticMaterials().IndexOfByPredicate([&](const FStaticMaterial &Slot) { return Slot.MaterialInterface == Billboard; });
+        const auto *RenderData = Mesh->GetRenderData();
+        TestTrue(TEXT("Built Billboard render sections"), RenderData && RenderData->LODResources.Num() == 2);
+        if (RenderData && RenderData->LODResources.Num() == 2) {
+          for (const auto &Section : RenderData->LODResources[1].Sections) TestEqual(TEXT("Rendered Billboard uses its own MI"), Section.MaterialIndex, BillboardSlot);
+          for (const auto &Section : RenderData->LODResources[0].Sections) TestNotEqual(TEXT("Rendered atlas does not use Billboard"), Section.MaterialIndex, BillboardSlot);
+        }
+        for (FName Name : {FName(TEXT("SharedEnable")), FName(TEXT("Branch1Enable")), FName(TEXT("Branch2Enable")), FName(TEXT("RippleEnable")), FName(TEXT("Interactive"))}) {
+          bool Value = false; FGuid Id;
+          Billboard->GetStaticSwitchParameterValue(FMaterialParameterInfo(Name), Value, Id);
+          TestEqual(Family + TEXT(" ") + Name.ToString(), Value, !bStatic && Name == FName(TEXT("SharedEnable")));
+        }
+        if (Family == TEXT("Foliage_ThirdParty")) {
+          for (const FName Name : {FName(TEXT("WindField MaxEffect Scale")), FName(TEXT("InteriWind_MaxWPO")),
+              FName(TEXT("InterWind Rot Intensity")), FName(TEXT("InterWind Velocity Intensity"))}) {
+            float Value = 1.f;
+            TestTrue(Name.ToString() + TEXT(" disabled on static Billboard"), Billboard->GetScalarParameterValue(FMaterialParameterInfo(Name), Value) && Value == 0.f);
+          }
+          FLinearColor Value;
+          TestTrue(TEXT("Legacy bend range disabled"), Billboard->GetVectorParameterValue(FMaterialParameterInfo(TEXT("WindBend Range")), Value) && Value == FLinearColor::Transparent);
+        }
+        UTexture *AtlasTexture = nullptr, *BillboardTexture = nullptr;
+        bool bVT = false; FGuid Id;
+        Billboard->GetStaticSwitchParameterValue(FMaterialParameterInfo(TEXT("Use VT")), bVT, Id);
+        const FMaterialParameterInfo Diffuse{FName(bVT ? TEXT("Diffuse_VT") : TEXT("Diffuse"))};
+        TestTrue(TEXT("Atlas and Billboard have distinct imported texture references"), Atlas->GetTextureParameterValue(Diffuse, AtlasTexture) &&
+            Billboard->GetTextureParameterValue(Diffuse, BillboardTexture) && AtlasTexture && BillboardTexture && AtlasTexture != BillboardTexture);
+      }
+      TestEqual(Family + TEXT(" imported one mesh"), Meshes, 1);
+    }
+  }
   return true;
 }
 
