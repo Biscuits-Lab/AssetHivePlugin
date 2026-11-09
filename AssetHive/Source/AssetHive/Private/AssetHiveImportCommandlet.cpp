@@ -2144,7 +2144,8 @@ static void Apply3DAssetTexturePreset(UTexture *Texture,
   }
   Texture->MaxTextureSize = FMath::Clamp(DesiredLimit, 256, 8192);
   Texture->MipGenSettings = TMGS_FromTextureGroup;
-  Texture->VirtualTextureStreaming = bUseVT && Texture->MaxTextureSize >= 2048;
+  // 1024 的 ORM 等纹理也使用 VT，保证与同组的 VT 材质采样一致。
+  Texture->VirtualTextureStreaming = bUseVT && Texture->MaxTextureSize >= 1024;
 
   if (SlotName == TEXT("albedo")) {
     Texture->CompressionSettings = TC_Default;
@@ -10551,6 +10552,34 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 #include "StaticMeshAttributes.h"
 #include "UObject/GCObjectScopeGuard.h"
 #include "UObject/SavePackage.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHive3DTextureVTPresetTest,
+    "AssetHive.Import.ThreeDTextureVTPreset",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHive3DTextureVTPresetTest::RunTest(const FString &Parameters) {
+  const TArray<TPair<int32, bool>> Cases = {{512, false}, {1024, true}, {2048, true}};
+  for (const auto &Case : Cases) {
+    UTexture2D *Texture = UTexture2D::CreateTransient(Case.Key, Case.Key, PF_B8G8R8A8);
+    if (!TestNotNull(TEXT("创建 VT 预设测试纹理"), Texture)) return false;
+    FGCObjectScopeGuard TextureGuard(Texture);
+    for (const TCHAR *Tag : {TEXT("Props"), TEXT("Kit"), TEXT("Kits"),
+                             TEXT("Destructible"), TEXT("Dressing"), TEXT("MEGA")}) {
+      const FEnvironmentAssetProfile Profile = ResolveEnvironmentAssetProfile({FString(Tag)});
+      for (const TCHAR *Slot : {TEXT("albedo"), TEXT("normal"), TEXT("orm"), TEXT("mask")}) {
+        const FString Label = FString::Printf(TEXT("%s/%s/%d"), Tag, Slot, Case.Key);
+        Apply3DAssetTexturePreset(Texture, Slot, Profile, true);
+        TestEqual(Label + TEXT(" 的 VT 预设"), static_cast<bool>(Texture->VirtualTextureStreaming), Case.Value);
+        const int32 ExpectedMax = Case.Key == 2048 && !Profile.bHighResPreset &&
+                                     FString(Slot) != TEXT("albedo") && FString(Slot) != TEXT("normal")
+                                     ? 1024 : Case.Key;
+        TestEqual(Label + TEXT(" 保持原有尺寸预设"), Texture->MaxTextureSize, ExpectedMax);
+        Apply3DAssetTexturePreset(Texture, Slot, Profile, false);
+        TestFalse(Label + TEXT(" 遵守工程 VT 导入开关"), Texture->VirtualTextureStreaming);
+      }
+    }
+  }
+  return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveMeshImportPerfTest,
     "AssetHive.Import.HighPolyTiming",

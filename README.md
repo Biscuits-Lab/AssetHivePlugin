@@ -29,6 +29,9 @@ Zion 3D 资产的二级目录接在各自分类目录之后，例如
 `/Game/Environment/Asset/Destructible/Wall/`。
 `Kit` 和 `Kits` 标签均导出到 `Kit` 文件夹；二级目录留空则直接使用分类目录。
 
+3D Assets 的纹理最大尺寸达到 1024 时即开启 VT（含 ORM），同时遵守工程的
+`r.VirtualTextures` 和 `r.VT.EnableAutoImport` 开关；尺寸上限仍按既有分类预设。
+
 The plugin first tries localhost port 13430, then ports 13431 through 13439 so
 multiple editors can run concurrently. If every port is unavailable, startup
 retries every two seconds until a listener starts. Successful startup stops the
