@@ -2481,6 +2481,16 @@ struct FPlantWindIslandParameters {
   int32 Num() const { return BasePosition.Num(); }
 };
 
+static FIntVector PlantLayerSourceVertexCell(const FVector3f& P) {
+  const auto Q=[](float V) { return int32(FMath::RoundHalfToEven(double(V)*10000.)); };
+  return FIntVector(Q(P.X),Q(P.Y),Q(P.Z));
+}
+
+static bool PlantLayerSourceTriangleHasSurface(const FVector3f& A,const FVector3f& B,const FVector3f& C) {
+  const auto One=PlantLayerSourceVertexCell(A), Two=PlantLayerSourceVertexCell(B), Three=PlantLayerSourceVertexCell(C);
+  return One!=Two && Two!=Three && Three!=One;
+}
+
 static bool ComputePlantWindIslands(FMeshDescription &Mesh,
                                     FPlantWindIslandParameters &Out, bool bLayerSource = false,
                                     float LayerPrecisionWeldEpsilon = 0.f) {
@@ -2509,6 +2519,9 @@ static bool ComputePlantWindIslands(FMeshDescription &Mesh,
   for (const FTriangleID TriangleID : Mesh.Triangles().GetElementIDs()) {
     const TArrayView<const FVertexID> Corners = Mesh.GetTriangleVertices(TriangleID);
     if (Corners.Num() < 3) {
+      continue;
+    }
+    if (bLayerSource && !PlantLayerSourceTriangleHasSurface(Positions[Corners[0]],Positions[Corners[1]],Positions[Corners[2]])) {
       continue;
     }
     const int32 First = Corners[0].GetValue();
@@ -2542,8 +2555,7 @@ static bool ComputePlantWindIslands(FMeshDescription &Mesh,
     FirstAt.Reserve(VertexCount);
     for (int32 I=0; I<VertexCount; ++I) {
       const FVector3f P=Positions[FVertexID(I)];
-      const auto Q=[](float V) { return int32(FMath::RoundHalfToEven(double(V)*10000.)); };
-      const FIntVector Cell(Q(P.X),Q(P.Y),Q(P.Z));
+      const FIntVector Cell=PlantLayerSourceVertexCell(P);
       if (const int32* First=FirstAt.Find(Cell)) {
         Parents[FindRoot(I)]=FindRoot(*First);
         ++Out.WeldMergedVertices;
@@ -4306,7 +4318,37 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
       !Variant.TryGetNumberField(TEXT("bindingCount"),RowCount) || LayerDirectory.IsEmpty())) {
     Error=TEXT("missing hierarchy rows or chunk location"); return false;
   }
-  if (RowCount!=Islands.Num()) {
+  // FBX can retain unused control points. Their isolated rows have no corner
+  // payload, and float conversion can merge or remove them independently of
+  // the actual photographed surfaces. Match every real surface one-to-one;
+  // only explicitly declared, disabled noSurface rows may be omitted.
+  int32 DeclaredNoSurface=0;
+  const TSharedPtr<FJsonObject>* CountsObject=nullptr;
+  if (Variant.TryGetObjectField(TEXT("counts"),CountsObject) && CountsObject && CountsObject->IsValid()) {
+    double Count=0.;
+    if ((*CountsObject)->TryGetNumberField(TEXT("noSurfaceIslands"),Count)) {
+      if (!FMath::IsFinite(Count) || Count<0. || Count>RowCount || Count!=FMath::FloorToDouble(Count)) {
+        Error=TEXT("invalid no-surface hierarchy count"); return false;
+      }
+      DeclaredNoSurface=int32(Count);
+    }
+  }
+  const bool bSurfaceOnly=DeclaredNoSurface>0;
+  TBitArray<> HasSurface(false,Islands.Num());
+  const auto SourcePositions=FStaticMeshConstAttributes(Mesh).GetVertexPositions();
+  for (const FTriangleID Triangle : Mesh.Triangles().GetElementIDs()) {
+    const auto Corners=Mesh.GetTriangleVertices(Triangle);
+    if (Corners.Num()<3 || !PlantLayerSourceTriangleHasSurface(SourcePositions[Corners[0]],SourcePositions[Corners[1]],SourcePositions[Corners[2]])) continue;
+    for (const FVertexID Vertex : Corners)
+      HasSurface[Islands.IslandOfVertex[Vertex.GetValue()]]=true;
+  }
+  int32 SurfaceCount=0;
+  for (int32 I=0; I<Islands.Num(); ++I) SurfaceCount+=HasSurface[I] ? 1 : 0;
+  if (bSurfaceOnly && RowCount-DeclaredNoSurface!=SurfaceCount) {
+    Error=FString::Printf(TEXT("source has %d surface islands, hierarchy declares %d"),
+        SurfaceCount,RowCount-DeclaredNoSurface); return false;
+  }
+  if (!bSurfaceOnly && RowCount!=Islands.Num()) {
     Error=FString::Printf(TEXT("source has %d islands, hierarchy declares %d"), Islands.Num(), RowCount); return false;
   }
   const auto Pos=FStaticMeshConstAttributes(Mesh).GetVertexPositions();
@@ -4343,7 +4385,8 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
     if (Counts[I]==0) { Error=TEXT("empty island"); return false; }
     const auto P=bUseBounds ? Bounds[I].GetCenter() : FVector3f(Sums[I]/Counts[I]);
     const auto C=(P-Islands.MeshMin)/SafeSize;
-    Centers.Add(C); Grid.Add(Cell(C),I);
+    Centers.Add(C);
+    if (!bSurfaceOnly || HasSurface[I]) Grid.Add(Cell(C),I);
   }
   const auto Axis=[&](const FJsonObject& Row,const TCHAR* Field,const TCHAR* Table,FHerbWindAxis& A) {
     const auto* Value=Row.Values.Find(Field);
@@ -4368,13 +4411,31 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
     A.Base=Islands.MeshMin+A.Base*Size; A.Tip=Islands.MeshMin+A.Tip*Size; return true;
   };
   Result.SetNum(Islands.Num()); TBitArray<> Matched(false,Islands.Num());
-  int32 BoundCount=0;
+  int32 BoundCount=0, SkippedNoSurface=0;
   auto BindRows = [&](const TArray<TSharedPtr<FJsonValue>>& Batch) {
   for (const auto& Value : Batch) {
     ++BoundCount;
     const TSharedPtr<FJsonObject>* RowPtr=nullptr;
     if (!Value->TryGetObject(RowPtr) || !RowPtr || !RowPtr->IsValid()) { Error=TEXT("invalid binding row"); return false; }
     const auto& Row=**RowPtr;
+    FString Method;
+    if (bSurfaceOnly && Row.TryGetStringField(TEXT("attachMethod"),Method) && Method==TEXT("noSurface")) {
+      bool Influence=true, Terminal=true;
+      if (!Row.TryGetBoolField(TEXT("influence"),Influence) || Influence ||
+          !Row.TryGetBoolField(TEXT("terminal"),Terminal) || Terminal) {
+        Error=TEXT("non-surface hierarchy row carries active wind"); return false;
+      }
+      const TArray<TSharedPtr<FJsonValue>>* Layers=nullptr;
+      if (!Row.TryGetArrayField(TEXT("layers"),Layers)) { Error=TEXT("non-surface row has no layers"); return false; }
+      for (const auto& Layer : *Layers) {
+        FString Name;
+        if (!Layer->TryGetString(Name) || Name!=TEXT("Shared")) {
+          Error=TEXT("non-surface row carries a local wind layer"); return false;
+        }
+      }
+      ++SkippedNoSurface;
+      continue;
+    }
     const auto* Center=Row.Values.Find(bUseBounds ? TEXT("boundsCenter") : TEXT("center")); FVector3f C;
     if (!Center || !Vector(*Center,C)) { Error=TEXT("invalid island centroid"); return false; }
     int32 Best=INDEX_NONE; float D=.0025f*.0025f;
@@ -4387,7 +4448,7 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
       }
     }
     if (Best==INDEX_NONE) { Error=FString::Printf(TEXT("no original island matches centroid %s"),*C.ToString()); return false; }
-    if (PrecisionWeldEpsilon > 0.f) {
+    if (PrecisionWeldEpsilon > 0.f || bSurfaceOnly) {
       // 精度补焊后逐岛复核微米级中心误差，不能只靠数量相等接受错误归并。
       const FVector3f Delta=(Centers[Best]-C)*SafeSize;
       const FVector3f Limit=SafeSize*2e-6f+FVector3f(2.f*PrecisionWeldEpsilon);
@@ -4426,8 +4487,9 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
   }
   return true;
   };
-  if (bInline) return BindRows(*Rows);
-  for (const auto& Item : *Chunks) {
+  if (bInline) {
+    if (!BindRows(*Rows)) return false;
+  } else for (const auto& Item : *Chunks) {
     FString Name, Text;
     TArray<TSharedPtr<FJsonValue>> Batch;
     if (!Item->TryGetString(Name) || Name!=FPaths::GetCleanFilename(Name) || Name.Contains(TEXT("..")) ||
@@ -4438,6 +4500,12 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
     if (!BindRows(Batch)) return false;
   }
   if (BoundCount!=RowCount) { Error=TEXT("incomplete hierarchy chunks"); return false; }
+  if (SkippedNoSurface!=DeclaredNoSurface) { Error=TEXT("incomplete no-surface hierarchy rows"); return false; }
+  for (int32 I=0; I<Islands.Num(); ++I) {
+    if ((!bSurfaceOnly || HasSurface[I]) && !Matched[I]) {
+      Error=TEXT("an original surface island has no hierarchy binding"); return false;
+    }
+  }
   return true;
 }
 
@@ -4558,6 +4626,9 @@ static bool BuildPlantWindCardReference(const UStaticMesh *ReferenceMesh,
     const TArrayView<const FVertexID> Corners =
         Mesh->GetTriangleVertices(TriangleID);
     if (Corners.Num() < 3) {
+      continue;
+    }
+    if (LayerVariant && !PlantLayerSourceTriangleHasSurface(Positions[Corners[0]],Positions[Corners[1]],Positions[Corners[2]])) {
       continue;
     }
     for (int32 Corner = 0; Corner < 3; ++Corner) {
@@ -12716,6 +12787,107 @@ bool FAssetHivePlantWindGrassHeightWeightTest::RunTest(const FString &Parameters
     }
   }
   TestTrue(TEXT("Branch2 has its own active weight gradient"), MaxChildWeight > 0.5f && LargestDifference > 0.25f);
+  return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindUnusedSourceVerticesTest, "AssetHive.Plants.SyntheticWindUnusedSourceVertices",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveWindUnusedSourceVerticesTest::RunTest(const FString &Parameters) {
+  FMeshDescription Mesh;
+  FStaticMeshAttributes Attributes(Mesh); Attributes.Register();
+  auto Positions=Attributes.GetVertexPositions();
+  const auto Group=Mesh.CreatePolygonGroup();
+  const FVector3f Points[2][3]={{FVector3f(0,0,0),FVector3f(1,0,0),FVector3f(0,1,0)},
+      {FVector3f(3,0,1),FVector3f(4,0,1),FVector3f(3,1,1)}};
+  for (const auto& Face : Points) {
+    TArray<FVertexInstanceID> Corners;
+    for (const auto& Point : Face) {
+      const auto Vertex=Mesh.CreateVertex(); Positions[Vertex]=Point;
+      Corners.Add(Mesh.CreateVertexInstance(Vertex));
+    }
+    Mesh.CreateTriangle(Group,Corners);
+  }
+  const auto Unused=Mesh.CreateVertex(); Positions[Unused]=FVector3f(6,0,0);
+  const auto OtherUnused=Mesh.CreateVertex(); Positions[OtherUnused]=FVector3f(5.5,0,0);
+  const auto Duplicate=Mesh.CreateVertex(); Positions[Duplicate]=Positions[Unused];
+  const TArray<FVertexInstanceID> DegenerateCorners{Mesh.CreateVertexInstance(Unused),
+      Mesh.CreateVertexInstance(Duplicate),Mesh.CreateVertexInstance(OtherUnused)};
+  Mesh.CreateTriangle(Group,DegenerateCorners);
+  FPlantWindIslandParameters Islands;
+  if (!TestTrue(TEXT("Compute source with unused control point"),ComputePlantWindIslands(Mesh,Islands,true))) return false;
+  TestEqual(TEXT("Two actual cards and two retained unused points"),Islands.Num(),4);
+  TestTrue(TEXT("A detector-degenerate triangle cannot join unused points"),
+      Islands.IslandOfVertex[Unused.GetValue()]!=Islands.IslandOfVertex[OtherUnused.GetValue()]);
+  auto VectorJson=[](double X,double Y,double Z) {
+    return MakeShared<FJsonValueArray>(TArray<TSharedPtr<FJsonValue>>{
+        MakeShared<FJsonValueNumber>(X),MakeShared<FJsonValueNumber>(Y),MakeShared<FJsonValueNumber>(Z)});
+  };
+  auto MakeVariant=[&]() {
+    auto Variant=MakeShared<FJsonObject>();
+    auto Counts=MakeShared<FJsonObject>(); Counts->SetNumberField(TEXT("noSurfaceIslands"),3);
+    Variant->SetObjectField(TEXT("counts"),Counts);
+    TArray<TSharedPtr<FJsonValue>> Rows;
+    for (int32 I=0; I<5; ++I) {
+      auto Row=MakeShared<FJsonObject>(); Row->SetNumberField(TEXT("island"),I);
+      Row->SetField(TEXT("boundsCenter"),I==0 ? VectorJson(.5/6.,.5,0.) : I==1 ?
+          VectorJson(3.5/6.,.5,1.) : VectorJson(1.,0.,0.));
+      Row->SetStringField(TEXT("attachMethod"),I<2 ? TEXT("support") : TEXT("noSurface"));
+      Row->SetBoolField(TEXT("influence"),I<2); Row->SetBoolField(TEXT("terminal"),I<2);
+      Row->SetArrayField(TEXT("layers"),{MakeShared<FJsonValueString>(TEXT("Shared"))});
+      if (I<2) {
+        const TArray<TSharedPtr<FJsonValue>> Axis{VectorJson(0.,0.,0.),VectorJson(0.,0.,1.)};
+        Row->SetArrayField(TEXT("primary"),Axis); Row->SetArrayField(TEXT("blade"),Axis);
+        Row->SetNumberField(TEXT("secondary"),-1.);
+        Row->SetNumberField(TEXT("primaryAttachment"),I==0 ? .3 : .7);
+        Row->SetNumberField(TEXT("secondaryAttachment"),-1.);
+      }
+      Rows.Add(MakeShared<FJsonValueObject>(Row));
+    }
+    Variant->SetArrayField(TEXT("bindings"),Rows); return Variant;
+  };
+  TArray<FHerbWindBinding> Result; FString Error;
+  auto Variant=MakeVariant();
+  TestTrue(TEXT("Missing unused detector point does not reject real surfaces"),
+      ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,FString()));
+  TestEqual(TEXT("Bindings retain native island indexing"),Result.Num(),4);
+  if (Result.Num()==4) {
+    TestEqual(TEXT("First real card keeps its actual attachment"),
+        Result[Islands.IslandOfVertex[0]].PrimaryAttachment,.3f);
+    TestEqual(TEXT("Second real card keeps its actual attachment"),
+        Result[Islands.IslandOfVertex[3]].PrimaryAttachment,.7f);
+    TestEqual(TEXT("Unused native vertex has no local wind axis"),
+        Result[Islands.IslandOfVertex[Unused.GetValue()]].Primary.Length(),0.f);
+  }
+  Variant=MakeVariant(); Variant->GetObjectField(TEXT("counts"))->SetNumberField(TEXT("noSurfaceIslands"),1);
+  TestFalse(TEXT("A real surface count mismatch remains rejected"),
+      ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,FString()));
+  Variant=MakeVariant(); Variant->GetArrayField(TEXT("bindings"))[2]->AsObject()->SetBoolField(TEXT("influence"),true);
+  TestFalse(TEXT("An active row cannot be discarded as unused"),
+      ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,FString()));
+  Variant=MakeVariant();
+  Variant->GetArrayField(TEXT("bindings"))[1]->AsObject()->SetField(TEXT("boundsCenter"),VectorJson(.5/6.,.5,0.));
+  TestFalse(TEXT("Actual source cards still require unique matches"),
+      ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,FString()));
+  Variant=MakeVariant();
+  const auto Rows=Variant->GetArrayField(TEXT("bindings"));
+  Variant->RemoveField(TEXT("bindings")); Variant->SetNumberField(TEXT("bindingCount"),5);
+  Variant->SetArrayField(TEXT("bindingChunks"),{MakeShared<FJsonValueString>(TEXT("source.json"))});
+  const FString Directory=FPaths::ProjectSavedDir()/TEXT("AssetHiveUnusedSourceTest")/FGuid::NewGuid().ToString(EGuidFormats::Digits);
+  IFileManager::Get().MakeDirectory(*Directory,true);
+  FString Json; FJsonSerializer::Serialize(Rows,TJsonWriterFactory<>::Create(&Json));
+  IFileManager::Get().MakeDirectory(*(Directory/TEXT("_layer_data")),true);
+  const FString File=Directory/TEXT("_layer_data/source.json");
+  FFileHelper::SaveStringToFile(Json,*File);
+  TestTrue(TEXT("Chunked rows use the same surface-only validation"),
+      ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,Directory));
+  TArray<TSharedPtr<FJsonValue>> Truncated=Rows; Truncated.Pop();
+  FJsonSerializer::Serialize(Truncated,TJsonWriterFactory<>::Create(&Json));
+  FFileHelper::SaveStringToFile(Json,*File);
+  TestFalse(TEXT("Truncated chunks cannot hide missing hierarchy rows"),
+      ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,Directory));
+  IFileManager::Get().Delete(*File);
+  IFileManager::Get().DeleteDirectory(*(Directory/TEXT("_layer_data")));
+  IFileManager::Get().DeleteDirectory(*Directory);
   return true;
 }
 
