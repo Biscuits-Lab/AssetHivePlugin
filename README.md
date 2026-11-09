@@ -17,6 +17,18 @@ The older 1.1.0 release included Windows x64 editor binaries for Unreal Engine 5
 
 ## Editor connection recovery
 
+Zion 3D Assets support named material groups: match authored mesh slot names to
+one texture set, create one MI per material identity, and reuse the same MI and
+textures across a batch in the same destination category. Missing names and
+conflicting sets are reported per asset, without positional fallback. Rebuild
+this plugin alongside the desktop change; the hello capability
+`zion3dMaterialNames` prevents named jobs from reaching older plugins.
+
+Zion 3D 资产的二级目录接在各自分类目录之后，例如
+`/Game/Environment/Asset/Kit/Wall/`、
+`/Game/Environment/Asset/Destructible/Wall/`。
+`Kit` 和 `Kits` 标签均导出到 `Kit` 文件夹；二级目录留空则直接使用分类目录。
+
 The plugin first tries localhost port 13430, then ports 13431 through 13439 so
 multiple editors can run concurrently. If every port is unavailable, startup
 retries every two seconds until a listener starts. Successful startup stops the

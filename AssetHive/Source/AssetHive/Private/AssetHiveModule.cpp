@@ -93,6 +93,7 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
     {
         auto Info = MakeShared<FJsonObject>();
         Info->SetStringField(TEXT("type"), TEXT("hello"));
+        Info->SetArrayField(TEXT("capabilities"), {MakeShared<FJsonValueString>(TEXT("zion3dMaterialNames"))});
         Info->SetNumberField(TEXT("protocolVersion"), 2);
         Info->SetStringField(TEXT("sessionId"), SessionId);
         Info->SetStringField(TEXT("projectPath"), FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()));

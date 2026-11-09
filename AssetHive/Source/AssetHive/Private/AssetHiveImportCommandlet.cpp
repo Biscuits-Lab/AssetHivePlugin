@@ -1,6 +1,7 @@
 #include "AssetHiveImportCommandlet.h"
 #include "AssetHiveSettings.h"
 #include "AssetHiveThumbnailRefresh.h"
+#include "AssetHiveZion3DMaterials.h"
 
 #include "AssetImportTask.h"
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -1650,7 +1651,7 @@ static FEnvironmentAssetProfile ResolveEnvironmentAssetProfile(
     if (HasAssetTag(Tags, TEXT("Kits")) || HasAssetTag(Tags, TEXT("Kit"))) {
       Resolved.TypeKey = TEXT("Kits");
       Resolved.TypePrefix = TEXT("Kit");
-      Resolved.FolderName = TEXT("Kits");
+      Resolved.FolderName = TEXT("Kit");
       Resolved.bBaseFamily = true;
       Resolved.bHighResPreset = false;
       return Resolved;
@@ -1741,7 +1742,7 @@ static FString ResolveThirdPartyCategoryFolder(const FString &CategoryFolder,
 }
 
 // Temp 子目录（2026-10-28 修订）：Temp 资产在**各自的分类目录下**再建一层 Temp ——
-//   Temp + Kits → Kits/Temp；Temp + Props → Props/Temp；Temp + Dressing / 第三方 →
+//   Temp + Kits → Kit/Temp；Temp + Props → Props/Temp；Temp + Dressing / 第三方 →
 //   Objects/Temp；Temp + MEGA → MEGA/Temp；Temp + Destructible → Destructible/Temp。
 // 这样既保留分类归属（美术按分类找资产），又能按 Temp 层整批清理。
 // 只对**非 Zion 资产**生效：Zion 资产（zionTags 非空）走用户自选的二级目录体系。
@@ -8275,6 +8276,16 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
   }
 #endif
 
+  struct FSharedZion3DMaterial {
+    FString Signature;
+    FString ParentType;
+    UMaterialInstanceConstant* Instance = nullptr;
+    TMap<FString, UTexture*> Textures;
+  };
+  // Deliberately scoped to this job: unrelated packages are never searched by
+  // short material name. The first owner stores Material/Tex; later meshes
+  // reference those same objects instead of importing duplicate textures.
+  TMap<FString, FSharedZion3DMaterial> SharedZion3DMaterials;
   bool bAnyAssetFailed = false;
   const int32 AssetCount = AssetsJson->Num();
   int32 AssetIndex = 0;
@@ -8387,7 +8398,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           ResolveEnvironmentAssetProfile(EnvironmentProfileTags),
           AssetStandardTags);
       // 导出侧的 categoryFolder 只承载"基础分类目录"。Zion 资产刻意传空串，
-      // 由这里按 Asset Tag 推导（ThirdParty/Dressing → Objects、Kits → Kits、
+      // 由这里按 Asset Tag 推导（ThirdParty/Dressing → Objects、Kits → Kit、
       // Props → Props、Destructible → Destructible、MEGA → MEGA），保持这份映射
       // 只有一处权威定义；非 Zion 资产仍由导出侧给出分类。
       // 用户选定的二级目录走独立的 zionSubfolder 字段，在下面单独拼接。
@@ -8495,10 +8506,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // 且材质实例 / 纹理 / 静态网格体各进独立子目录。第三方资产维持原有命名，
     // 避免与已导入的同名资产互相覆盖。
     // Zion 资产判定（2026-10-29 定稿）：
-    //   - **显式 Zion**（zionTags 非空）→ 落 Objects/<zionSubfolder>/，按 Zion 约定导出；
+    //   - **显式 Zion**（zionTags 非空）→ 落 <分类>/<zionSubfolder>/，按 Zion 约定导出；
     //   - **Temp**（带 Temp 标记）是 Zion 的**变体**：导出规格跟随 Zion（无 _<id> 后缀、
     //     Material/Tex/Mesh 子目录、命名从文件夹名派生），但目录进**自身分类下的 Temp**：
-    //     Props/Temp、Kits/Temp、MEGA/Temp、Destructible/Temp、Objects/Temp。
+    //     Props/Temp、Kit/Temp、MEGA/Temp、Destructible/Temp、Objects/Temp。
     // 两者都不追加 ThirdParty 层（Temp 也不叠第三方层）。
     const bool bExplicitZionAsset = HasZionTaggedAsset(AssetObject);
     const bool bMicroPlant = AssetType == TEXT("3dplant") && PlantProfile.SubtypeFolder == TEXT("Micro");
@@ -8549,7 +8560,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // 按任意叠加顺序全部剥掉，再由下面的规则统一加回（Temp 由 bTemp 决定，
     // Env_ 在对象名前缀处补）。否则 "Env_Temp_stone_rubble_pile" 这类源名
     // 会叠成 Temp_Env_Temp_...。
-    // Zion 资产另有约定：落在 Objects/<用户选定二级目录>/ 下，分类信息由上级目录表达，
+    // Zion 资产另有约定：落在 <分类>/<用户选定二级目录>/ 下，分类信息由上级目录表达，
     // 名字同样不带 Env_（Env_diaodeng -> diaodeng）。
     FString FolderStemSource = MakeSafeObjectName(SafeAssetName);
     for (int32 Guard = 0; Guard < 8; ++Guard) {
@@ -8618,9 +8629,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     FString ZionCategoryFolder = SafeCategoryFolder;
-    // Zion 二级目录（2026-10-29 修订）：显式 Zion 先落 Objects/<zionSubfolder>，
-    // Temp 变体再在**其后**追加 Temp 层 —— 组合结果为 Objects/<zionSubfolder>/Temp/…；
-    // 普通 Temp 资产则是 <分类>/Temp（Kits/Temp、Props/Temp、MEGA/Temp、Destructible/Temp）。
+    // Zion 二级目录：显式 Zion 先落 <分类>/<zionSubfolder>，
+    // Temp 变体再在其后追加 Temp 层，组合结果为 <分类>/<zionSubfolder>/Temp/…；
+    // 普通 Temp 资产则是 <分类>/Temp（Kit/Temp、Props/Temp、MEGA/Temp、Destructible/Temp）。
     if (bExplicitZionAsset && !ZionSubfolder.IsEmpty()) {
       ZionCategoryFolder = ZionCategoryFolder.IsEmpty()
                                ? ZionSubfolder
@@ -8670,6 +8681,37 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                          : (bUsesFoliageFolders ? AssetFolder / TEXT("Meshes")
                                                 : AssetFolder);
     const bool bUseVT = IsAssetVirtualTextureImportEnabled();
+    FString MaterialMatching;
+    AssetObject->TryGetStringField(TEXT("materialMatching"), MaterialMatching);
+    const bool bNamedZion3D = bIs3DAsset && bIsZionAsset && MaterialMatching == TEXT("name");
+    const TArray<TSharedPtr<FJsonValue>>* SharedGroups = nullptr;
+    if (bNamedZion3D && Root->TryGetArrayField(TEXT("namedMaterialGroups"), SharedGroups)) {
+      FString Scope;
+      AssetObject->TryGetStringField(TEXT("materialScope"), Scope);
+      TArray<TSharedPtr<FJsonValue>> Groups, Slots, Files;
+      for (const auto& Value : *SharedGroups) {
+        if (!Value.IsValid() || Value->Type != EJson::Object || Scope.IsEmpty()) continue;
+        const auto Group = Value->AsObject();
+        FString GroupScope;
+        if (!Group->TryGetStringField(TEXT("scope"), GroupScope) || GroupScope != Scope) continue;
+        Groups.Add(Value);
+        const TArray<TSharedPtr<FJsonValue>>* Textures = nullptr;
+        if (!Group->TryGetArrayField(TEXT("textureSlots"), Textures)) continue;
+        for (const auto& Texture : *Textures) {
+          if (!Texture.IsValid() || Texture->Type != EJson::Object) continue;
+          FString File;
+          if (!Texture->AsObject()->TryGetStringField(TEXT("file"), File)) continue;
+          Slots.Add(Texture);
+          Files.Add(MakeShared<FJsonValueString>(File));
+        }
+      }
+      // The per-job catalog is the authority, including for a texture-less
+      // model placed before its shared texture owner in the batch.
+      AssetObject = MakeShared<FJsonObject>(*AssetObject);
+      AssetObject->SetArrayField(TEXT("materialGroups"), Groups);
+      AssetObject->SetArrayField(TEXT("textureSlots"), Slots);
+      AssetObject->SetArrayField(TEXT("textureFiles"), Files);
+    }
     double SurfaceBaseTiling = 1.0;
     FString DecalParentMode = TEXT("decal");
     const TSharedPtr<FJsonObject> *MaterialParams = nullptr;
@@ -8834,6 +8876,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
 
+    TMap<int32, FString> NamedMaterialNames, NamedMaterialSignatures, NamedMaterialCacheKeys;
+    TMap<FString, int32> NamedGroupsByName;
     const TArray<TSharedPtr<FJsonValue>> *MaterialGroups = nullptr;
     if (AssetObject->TryGetArrayField(TEXT("materialGroups"), MaterialGroups) && MaterialGroups != nullptr) {
       for (const TSharedPtr<FJsonValue> &GroupValue : *MaterialGroups) {
@@ -8847,7 +8891,44 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         if (!MaterialRole.IsEmpty()) {
           SourceTextureMaterialRoleByGroup.Add(FMath::Max(1, static_cast<int32>(GroupIdValue)), MaterialRole.ToLower());
         }
+        if (bNamedZion3D) {
+          FString Name, Signature;
+          GroupObject->TryGetStringField(TEXT("materialName"), Name);
+          GroupObject->TryGetStringField(TEXT("textureSignature"), Signature);
+          Name = AssetHiveZion3DMaterials::Stem(Name);
+          const int32 GroupId = FMath::Max(1, static_cast<int32>(GroupIdValue));
+          if (Name.IsEmpty() || MakeSafeObjectName(Name) != Name || Signature.Len() != 64 ||
+              NamedMaterialNames.Contains(GroupId)) {
+            GAssetHiveImportFailed = true;
+            FailureMessage = TEXT("Zion 3D 材质组名称或纹理签名无效");
+            break;
+          }
+          const FString Key = AssetHiveZion3DMaterials::Key(Name);
+          const FString CacheKey = (AssetDestinationPath / ZionCategoryFolder).ToLower() + TEXT("|") + Key;
+          if (NamedGroupsByName.Contains(Key)) {
+            GAssetHiveImportFailed = true;
+            FailureMessage = FString::Printf(TEXT("同一资产内材质名称 %s 重复，请合并其贴图组"), *Name);
+            break;
+          }
+          NamedGroupsByName.Add(Key, GroupId);
+          if (const FSharedZion3DMaterial* Existing = SharedZion3DMaterials.Find(CacheKey)) {
+            if (Existing->Signature != Signature || Existing->ParentType != EnvironmentProfile.TypeKey) {
+              GAssetHiveImportFailed = true;
+              FailureMessage = FString::Printf(TEXT("同名材质 %s 的纹理或父材质分类冲突"), *Name);
+              break;
+            }
+          }
+          NamedMaterialNames.Add(GroupId, Name);
+          NamedMaterialSignatures.Add(GroupId, Signature);
+          NamedMaterialCacheKeys.Add(GroupId, CacheKey);
+        }
       }
+    }
+    if (bNamedZion3D && (GAssetHiveImportFailed || NamedGroupsByName.IsEmpty())) {
+      GAssetHiveImportFailed = true;
+      if (FailureMessage.IsEmpty()) FailureMessage = TEXT("Zion 3D 缺少命名材质组");
+      UE_LOG(LogTemp, Error, TEXT("AssetHive: %s: %s"), *AssetName, *FailureMessage);
+      continue;
     }
 
     const auto TextureSlotForFile = [&](const FString& SourceKey, const FString& SourceFile, int32 GroupId) {
@@ -8862,7 +8943,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       MissingParent = UAssetHiveSettings::GetSurfaceParentMaterialPath();
     } else if (bIsDecal && !UAssetHiveSettings::GetDecalParentMaterial(DecalParentMode)) {
       MissingParent = UAssetHiveSettings::GetDecalParentMaterialPath(DecalParentMode);
-    } else if (bIs3DAsset) {
+    } else if (bIs3DAsset && !bNamedZion3D) {
       TMap<int32, bool> MaskedByGroup;
       const TArray<TSharedPtr<FJsonValue>>* Files = nullptr;
       if (EnvironmentProfile.bBaseFamily && AssetObject->TryGetArrayField(TEXT("textureFiles"), Files)) {
@@ -9208,6 +9289,48 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const bool bSuppressBillboardExport =
         bNaniteMasked || bBillboardExcluded || bAllModelVariantsOpaque ||
         (!PlantExportMode.IsEmpty() && !PlantExportMode.Equals(TEXT("lod"), ESearchCase::IgnoreCase));
+    TMap<UStaticMesh*, TArray<int32>> NamedGroupsByMesh;
+    TSet<int32> ReferencedNamedGroups;
+    if (bNamedZion3D) {
+      // Read every imported model's authored slots before creating any MI.
+      // Slot order and the model's variant number never select a material.
+      TArray<FString> Unmatched;
+      for (UStaticMesh* Mesh : ImportedMeshes) {
+        if (!Mesh) continue;
+        TArray<int32>& Assignments = NamedGroupsByMesh.Add(Mesh);
+        for (const FStaticMaterial& Slot : Mesh->GetStaticMaterials()) {
+          const int32 Group = AssetHiveZion3DMaterials::FindGroup(Slot, NamedGroupsByName);
+          Assignments.Add(Group);
+          if (Group == INDEX_NONE) {
+            Unmatched.Add(FString::Printf(TEXT("%s: %s（原名 %s）"), *Mesh->GetName(),
+                *Slot.MaterialSlotName.ToString(), *Slot.ImportedMaterialSlotName.ToString()));
+          } else ReferencedNamedGroups.Add(Group);
+        }
+      }
+      if (!Unmatched.IsEmpty() || ReferencedNamedGroups.IsEmpty()) {
+        GAssetHiveImportFailed = true;
+        FailureMessage = Unmatched.IsEmpty() ? TEXT("模型没有可匹配的材质槽")
+            : TEXT("材质槽未找到同名纹理套组：") + FString::Join(Unmatched, TEXT("；"));
+        UE_LOG(LogTemp, Error, TEXT("AssetHive: %s"), *FailureMessage);
+        continue;
+      }
+      for (const int32 Group : ReferencedNamedGroups) {
+        bool bMasked = false;
+        if (const auto* Slots = SourceTextureSlotMapByGroup.Find(Group)) {
+          for (const auto& Slot : *Slots) bMasked |= Slot.Value == TEXT("opacity");
+        }
+        bMasked &= EnvironmentProfile.bBaseFamily;
+        if (!UAssetHiveSettings::GetAssetParentMaterial(EnvironmentProfile.TypeKey, bMasked)) {
+          GAssetHiveImportFailed = true;
+          FailureMessage = TEXT("缺少父材质：") + UAssetHiveSettings::GetAssetParentMaterialPath(EnvironmentProfile.TypeKey, bMasked);
+          break;
+        }
+      }
+      if (GAssetHiveImportFailed) {
+        UE_LOG(LogTemp, Error, TEXT("AssetHive: %s: %s"), *AssetName, *FailureMessage);
+        continue;
+      }
+    }
     const TArray<TSharedPtr<FJsonValue>> *TextureFiles = nullptr;
     if (AssetObject->TryGetArrayField(TEXT("textureFiles"), TextureFiles) &&
         TextureFiles != nullptr) {
@@ -9226,6 +9349,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             SourceTextureGroupByPath.Contains(SourceKey)
                 ? FMath::Max(1, SourceTextureGroupByPath[SourceKey])
                 : 1;
+        if (bNamedZion3D) {
+          if (!ReferencedNamedGroups.Contains(GroupId)) continue;
+          if (const FSharedZion3DMaterial* Existing = SharedZion3DMaterials.Find(NamedMaterialCacheKeys.FindRef(GroupId))) {
+            TextureBySlotByGroup.FindOrAdd(GroupId) = Existing->Textures;
+            continue;
+          }
+        }
         if (bSuppressBillboardExport) {
           const FString *GroupMaterialRole =
               SourceTextureMaterialRoleByGroup.Find(GroupId);
@@ -9310,12 +9440,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         Task->Filename = SourceFile;
         Task->DestinationPath = TextureFolder;
         FString ConfiguredObjectName;
-        if ((bIsSurface || bIsDecal) && SourceTextureObjectNameByPath.Contains(SourceKey)) {
+        if ((bIsSurface || bIsDecal || bNamedZion3D) && SourceTextureObjectNameByPath.Contains(SourceKey)) {
           ConfiguredObjectName = MakeSafeObjectName(SourceTextureObjectNameByPath[SourceKey]);
         }
         FString ImportedTextureName = ConfiguredObjectName;
         if (ImportedTextureName.IsEmpty()) {
-          if (bIs3DAsset) {
+          if (bNamedZion3D) {
+            ImportedTextureName = FString::Printf(TEXT("T_%s_%s"),
+                *NamedMaterialNames.FindRef(GroupId), *To3DTextureSlotSuffix(SlotName));
+          } else if (bIs3DAsset) {
             const FString GroupSegment =
                 bMultipleTextureGroups
                     ? FString::Printf(TEXT("_G%03d"), GroupId)
@@ -9612,6 +9745,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     for (const int32 GroupId : GroupIds) {
+      if (bNamedZion3D) {
+        if (!ReferencedNamedGroups.Contains(GroupId)) continue;
+        if (const FSharedZion3DMaterial* Existing = SharedZion3DMaterials.Find(NamedMaterialCacheKeys.FindRef(GroupId))) {
+          MaterialInstances.Add(Existing->Instance);
+          MaterialGroupIds.Add(GroupId);
+          continue;
+        }
+      }
       const FString MaterialRole = SourceTextureMaterialRoleByGroup.FindRef(GroupId).ToLower();
       if (bSuppressBillboardExport &&
           MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
@@ -9699,7 +9840,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 GroupIds.Num() > 1
                     ? FString::Printf(TEXT("_G%03d"), GroupId)
                     : FString();
-            const FString ORMAssetName = FString::Printf(
+            const FString ORMAssetName = bNamedZion3D
+                ? FString::Printf(TEXT("T_%s_ORM"), *NamedMaterialNames.FindRef(GroupId))
+                : FString::Printf(
                 TEXT("T_%s_%s%s_ORM"), *EnvironmentStem,
                 *PrimaryModelVariantKey, *ORMGroup);
             ORMTexture = CreatePackedORMTexture(
@@ -9717,7 +9860,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         UTexture2D *MegaMaskTexture = Resolve3DSourceTexture(TEXT("mask"));
         UTexture2D *OpacityTexture = Resolve3DSourceTexture(TEXT("opacity"));
         const bool bMasked = OpacityTexture != nullptr;
-        const FString MaterialName = BuildEnvironmentAssetMaterialName(
+        const FString MaterialName = bNamedZion3D
+            ? TEXT("MI_") + NamedMaterialNames.FindRef(GroupId)
+            : BuildEnvironmentAssetMaterialName(
             EnvironmentStem, GroupId, GroupIds.Num() > 1,
             PrimaryModelVariantKey);
         MaterialInstance = CreateEnvironmentAssetMaterialInstance(
@@ -9911,6 +10056,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       if (MaterialInstance) {
         MaterialInstances.Add(MaterialInstance);
         MaterialGroupIds.Add(GroupId);
+        if (bNamedZion3D) {
+          FSharedZion3DMaterial& Shared = SharedZion3DMaterials.FindOrAdd(NamedMaterialCacheKeys.FindRef(GroupId));
+          Shared.Signature = NamedMaterialSignatures.FindRef(GroupId);
+          Shared.ParentType = EnvironmentProfile.TypeKey;
+          Shared.Instance = MaterialInstance;
+          Shared.Textures = TextureBySlotByGroup.FindRef(GroupId);
+        }
       }
       if (OpaqueMaterialInstance) {
         OpaqueMaterialInstances.Add(OpaqueMaterialInstance);
@@ -10182,7 +10334,17 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       for (int32 Index = 0; Index < Slots.Num(); ++Index) {
         if (BillboardSlotIndexes.Contains(Index)) continue;
         UMaterialInstanceConstant *Material = nullptr;
-        if (bUseZionSlotsForMesh && AtlasMaterialGroups.Num() > 0) {
+        if (bNamedZion3D) {
+          const TArray<int32>* Assignments = NamedGroupsByMesh.Find(StaticMesh);
+          const int32 Group = Assignments && Assignments->IsValidIndex(Index) ? (*Assignments)[Index] : INDEX_NONE;
+          const FSharedZion3DMaterial* Shared = SharedZion3DMaterials.Find(NamedMaterialCacheKeys.FindRef(Group));
+          if (Shared) Material = Shared->Instance;
+          if (!Material) {
+            GAssetHiveImportFailed = true;
+            FailureMessage = FString::Printf(TEXT("%s 材质槽 %s 的实例创建失败"),
+                *StaticMesh->GetName(), *Slots[Index].MaterialSlotName.ToString());
+          }
+        } else if (bUseZionSlotsForMesh && AtlasMaterialGroups.Num() > 0) {
           const int32 GroupId = AtlasMaterialGroups[
               FMath::Min(Index, AtlasMaterialGroups.Num() - 1)];
           const FZionPlantMaterialInputs &Inputs = ZionPlantInputsByGroup.FindChecked(GroupId);
@@ -10655,9 +10817,11 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
     };
     // Temp 子目录（2026-10-28）：Temp 资产在各自分类目录下再建一层 Temp；
     // 非 Temp 与 Zion 资产不改分类目录。
-    TestEqual(TEXT("Temp + Kits 落 Kits/Temp"),
-              ResolveTempCategoryFolder(TEXT("Kits"), true, false),
-              FString(TEXT("Kits/Temp")));
+    TestEqual(TEXT("Temp + Kits 落 Kit/Temp"),
+              ResolveTempCategoryFolder(
+                  ResolveEnvironmentAssetProfile(MakeTags(TEXT("Kits"))).FolderName,
+                  true, false),
+              FString(TEXT("Kit/Temp")));
     TestEqual(TEXT("Temp + Props 落 Props/Temp"),
               ResolveTempCategoryFolder(TEXT("Props"), true, false),
               FString(TEXT("Props/Temp")));
@@ -10773,9 +10937,12 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
               BuildEnvironmentObjectStem(ThirdPartyKitProfile, TEXT("Bucket"),
                                          TEXT("abc123")),
               FString(TEXT("Env_Bucket_abc123")));
-    TestEqual(TEXT("非第三方 Kits 仍落 Kits 分类"),
+    TestEqual(TEXT("Kits 标签落 Kit 分类目录"),
               ResolveEnvironmentAssetProfile(MakeTags(TEXT("Kits"))).FolderName,
-              FString(TEXT("Kits")));
+              FString(TEXT("Kit")));
+    TestEqual(TEXT("Kit 标签落 Kit 分类目录"),
+              ResolveEnvironmentAssetProfile(MakeTags(TEXT("Kit"))).FolderName,
+              FString(TEXT("Kit")));
     TestEqual(TEXT("非第三方 MEGA 仍落 MEGA 分类"),
               ResolveEnvironmentAssetProfile(MakeTags(TEXT("MEGA"))).FolderName,
               FString(TEXT("MEGA")));
