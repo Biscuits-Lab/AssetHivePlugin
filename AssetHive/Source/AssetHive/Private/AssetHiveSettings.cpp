@@ -53,7 +53,7 @@ UAssetHiveSettings::UAssetHiveSettings()
     PlantAtlasParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_GrassBend_Masked_ST_VT.MI_Env_GrassBend_Masked_ST_VT")));
     PlantBillboardParentMaterial = PlantAtlasParentMaterial;
     PlantAtlasMaterialNamePrefix = TEXT("MI_");
-    PlantBillboardMaterialNamePrefix = TEXT("MI_Billboard_");
+    PlantBillboardMaterialNamePrefix = TEXT("MI_");
     // 2026-09-30：植被贴图按 Diffuse / Normal / ORM / OpacityMasked 分张导出，
     // 参数名对齐项目 GrassBend 母材质（M_Env_GrassBend_ST）。
     PlantDiffuseParameter = TEXT("Diffuse_VT");
@@ -553,10 +553,10 @@ FString UAssetHiveSettings::GetPlantMaterialName(const FString& AssetName, bool 
     const FString ConfiguredPrefix = bBillboard
         ? Settings->PlantBillboardMaterialNamePrefix
         : Settings->PlantAtlasMaterialNamePrefix;
-    const FString DefaultPrefix = bBillboard ? TEXT("MI_Billboard_") : TEXT("MI_");
     const FString Prefix = ConfiguredPrefix.TrimStartAndEnd().IsEmpty()
-        ? DefaultPrefix
+        ? TEXT("MI_")
         : ConfiguredPrefix.TrimStartAndEnd();
+    if (bBillboard && Prefix.Equals(TEXT("MI_"), ESearchCase::IgnoreCase)) SafeAssetName += TEXT("_Billboard");
     // Opaque 导出材质实例使用 _Op 后缀，与裁切表示目录的命名一致。
     return bOpaque ? Prefix + SafeAssetName + TEXT("_Op")
                    : Prefix + SafeAssetName;

@@ -2,18 +2,22 @@
 #include "AssetHiveSettings.h"
 #include "AssetHiveThumbnailRefresh.h"
 #include "AssetHiveZion3DMaterials.h"
+#include "AssetHiveZionPlantReuse.h"
 
 #include "AssetImportTask.h"
+#include "Algo/Count.h"
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "Dom/JsonObject.h"
 #include "Engine/StaticMesh.h"
+#include "EditorFramework/AssetImportData.h"
 #include "Engine/Texture.h"
 #include "Engine/Texture2D.h"
 #include "Engine/CollisionProfile.h"
 #include "Editor.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "StaticMeshEditorSubsystem.h"
+#include "StaticMeshCompiler.h"
 #include "StaticParameterSet.h"
 #include "UObject/MetaData.h"
 #include "Factories/FbxImportUI.h"
@@ -24,6 +28,7 @@
 #include "HAL/IConsoleManager.h"
 #include "ImageUtils.h"
 #include "Internationalization/Regex.h"
+#include "Interfaces/IPluginManager.h"
 #include "MaterialEditingLibrary.h"
 #if WITH_DEV_AUTOMATION_TESTS
 #include "MaterialShared.h"
@@ -48,6 +53,8 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "UObject/Package.h"
+#include "UObject/UObjectHash.h"
+#include "UObject/UObjectIterator.h"
 #include <type_traits>
 
 template <typename T, typename = void>
@@ -89,6 +96,238 @@ static void FinalizeImportedAsset(UObject* Object) {
   if (!Object) return;
   // Explicit imports remain unsaved even when ordinary dirty marking is suppressed.
   Object->GetOutermost()->SetDirtyFlag(true);
+}
+
+// An unsaved asset in the editor is just as much an existing target as a package on disk.
+template <typename T>
+static bool FindAssetHiveOverwriteTarget(const FString& Path, const FString& Name, T*& Result) {
+  UPackage* Package = FindPackage(nullptr, *Path);
+  const bool bOnDisk = FPackageName::DoesPackageExist(Path);
+  if (bOnDisk) {
+    if (!Package) Package = LoadPackage(nullptr, *Path, LOAD_None);
+    if (Package) Package->FullyLoad();
+  }
+  UObject* Object = Package ? FindObject<UObject>(Package, *Name) : nullptr;
+  Result = Cast<T>(Object);
+  if (!Result && (Object || bOnDisk)) {
+    GAssetHiveImportFailed = true;
+    UE_LOG(LogTemp, Error, TEXT("AssetHive: 无法按 %s 加载已有目标 %s"), *T::StaticClass()->GetName(), *Path);
+  }
+  return Object || bOnDisk;
+}
+
+struct FAssetHiveDependencyPolicy {
+  bool bMeshOnly = false;
+  bool bCreateMissing = true;
+  TSet<const UObject*> Kept;
+
+  template <typename T>
+  bool Reuse(const FString& Folder, const FString& Name, T*& Result) {
+    if (!bMeshOnly) return false;
+    if (FindAssetHiveOverwriteTarget(Folder / Name, Name, Result)) {
+      if (Result) Kept.Add(Result);
+      return true;
+    }
+    return !bCreateMissing;
+  }
+};
+
+// The desktop normally stages Common before dispatch. Under mesh-only it cannot know
+// whether a target exists, so stage missing library files only when UE needs a first import.
+static bool PrepareAssetHiveCommonForNewMesh() {
+  const auto Plugin = IPluginManager::Get().FindPlugin(TEXT("AssetHive"));
+  if (!Plugin) return false;
+  const FString Source = FPaths::ConvertRelativePathToFull(Plugin->GetContentDir() / TEXT("Common"));
+  const FString Dest = FPaths::ProjectContentDir() / TEXT("Common");
+  TArray<FString> Files;
+  IFileManager& Manager = IFileManager::Get();
+  Manager.FindFilesRecursive(Files, *Source, TEXT("*"), true, false);
+  for (const FString& File : Files) {
+    const FString Target = Dest / File.Mid(Source.Len() + 1);
+    if (Manager.FileExists(*Target)) continue;
+    Manager.MakeDirectory(*FPaths::GetPath(Target), true);
+    const FString Temp = Target + TEXT(".") + FGuid::NewGuid().ToString(EGuidFormats::Digits) + TEXT(".tmp");
+    ON_SCOPE_EXIT { Manager.Delete(*Temp, false, true, true); };
+    if (Manager.Copy(*Temp, *File, false) != COPY_OK) return false;
+    if (!Manager.Move(*Target, *Temp, false) && !Manager.FileExists(*Target)) return false;
+  }
+  return Manager.FileExists(*(Dest / TEXT("MaterialInstance/MMI_GeneralMat.uasset")));
+}
+
+// Import existing targets in isolation: even a factory that creates embedded materials or
+// textures can only create them under the scratch path. No staged asset is saved or bound.
+struct FAssetHiveMeshStaging {
+  FString Folder;
+  TMap<UStaticMesh*, UStaticMesh*> Targets;
+  TMap<UObject*, UObject*> Published;
+
+  const FString& GetFolder() {
+    if (Folder.IsEmpty()) Folder = TEXT("/Temp/AssetHiveMesh_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+    return Folder;
+  }
+
+  // Some model factories emit embedded material/texture assets. Publish just the references
+  // of a new mesh, remapping them to same-path project assets before duplicating their owner.
+  UObject* PublishNewAsset(UObject* Source, const FString& SourceFolder, const FString& DestFolder) {
+    if (UObject** Known = Published.Find(Source)) return *Known;
+    const FString SourcePackage = Source->GetPackage()->GetName();
+    const FString Relative = SourcePackage.Mid(SourceFolder.Len() + 1);
+    const FString PackagePath = DestFolder / Relative;
+    UObject* Existing = nullptr;
+    if (FindAssetHiveOverwriteTarget(PackagePath, Source->GetName(), Existing)) {
+      if (!Existing || !Existing->IsA(Source->GetClass())) return nullptr;
+      Published.Add(Source, Existing);
+      return Existing;
+    }
+    Published.Add(Source, nullptr); // A cyclic or invalid embedded dependency fails closed.
+    TArray<UObject*> Objects, References;
+    GetObjectsWithOuter(Source, Objects);
+    Objects.Add(Source);
+    FReferenceFinder Finder(References, nullptr, false, true, false, true);
+    for (UObject* Object : Objects) Finder.FindReferences(Object);
+    for (UObject* Ref : References) {
+      if (!Ref || Ref->IsA<UPackage>() || !Ref->GetPackage()->GetName().StartsWith(SourceFolder + TEXT("/"))) continue;
+      UObject* Asset = Ref;
+      while (Asset->GetOuter() && !Asset->GetOuter()->IsA<UPackage>()) Asset = Asset->GetOuter();
+      if (Asset != Source && !PublishNewAsset(Asset, SourceFolder, DestFolder)) return nullptr;
+    }
+    FObjectDuplicationParameters Params(Source, CreatePackage(*PackagePath));
+    Params.DestName = Source->GetFName();
+    for (const auto& Entry : Published)
+      if (Entry.Value) Params.DuplicationSeed.Add(Entry.Key, Entry.Value);
+    TMap<UObject*, UObject*> Copies;
+    Params.CreatedObjects = &Copies;
+    UObject* Copy = StaticDuplicateObjectEx(Params);
+    if (Copy) {
+      Published.Append(Copies);
+      Published.Add(Source, Copy);
+      Copy->SetFlags(RF_Public | RF_Standalone);
+      FAssetRegistryModule::AssetCreated(Copy);
+      FinalizeImportedAsset(Copy);
+    }
+    return Copy;
+  }
+  ~FAssetHiveMeshStaging() {
+    if (Folder.IsEmpty()) return;
+    IAssetRegistry& Registry = FAssetRegistryModule::GetRegistry();
+    // /Temp may be filtered out of the asset registry. Release every unsaved factory output.
+    const FString Prefix = Folder + TEXT("/");
+    TArray<UPackage*> Packages;
+    for (TObjectIterator<UPackage> It; It; ++It) {
+      if (It->GetName().StartsWith(Prefix)) Packages.Add(*It);
+    }
+    for (UPackage* Package : Packages) {
+      TArray<UObject*> Objects;
+      GetObjectsWithOuter(Package, Objects);
+      for (UObject* Object : Objects) {
+        if (Object->GetOuter() != Package) continue;
+        if (auto* Mesh = Cast<UStaticMesh>(Object)) FStaticMeshCompilingManager::Get().FinishCompilation({Mesh});
+        if (auto* Texture = Cast<UTexture>(Object)) ForceTextureDataReady(Texture);
+        if (Object->IsAsset()) FAssetRegistryModule::AssetDeleted(Object);
+        Object->ClearFlags(RF_Public | RF_Standalone);
+        Object->SetFlags(RF_Transient);
+      }
+      Package->SetDirtyFlag(false);
+    }
+    TArray<FString> Paths;
+    Registry.GetSubPaths(Folder, Paths, true);
+    for (const FString& Path : Paths) Registry.RemovePath(Path);
+    Registry.RemovePath(Folder);
+  }
+};
+
+// Keep the destination slot array (including empty bindings and component override indices).
+// Section overrides follow the original polygon-group name when the FBX changes slot order.
+static bool ReplaceAssetHiveMeshGeometry(UStaticMesh* Target, UStaticMesh* Source,
+                                         const FString& SourceFile, const TSet<int32>& BillboardLods) {
+  if (!Source->GetMeshDescription(0) || !Source->GetMeshDescription(0)->Triangles().Num()) return false;
+  struct FSectionBinding { FMeshSectionInfo Current, Original; };
+  TArray<TMap<FName, FSectionBinding>> Bindings;
+  Bindings.SetNum(Target->GetNumSourceModels());
+  for (int32 Lod = 0; Lod < Bindings.Num(); ++Lod) {
+    const FMeshDescription* Mesh = Target->GetMeshDescription(Lod);
+    if (!Mesh) continue;
+    const auto Names = FStaticMeshConstAttributes(*Mesh).GetPolygonGroupMaterialSlotNames();
+    int32 Section = 0;
+    for (FPolygonGroupID Group : Mesh->PolygonGroups().GetElementIDs()) {
+      if (!Mesh->GetNumPolygonGroupPolygons(Group)) continue;
+      const FName Name = Names[Group];
+      FSectionBinding Binding;
+      Binding.Original.MaterialIndex = Target->GetMaterialIndexFromImportedMaterialSlotName(Name);
+      if (Target->GetOriginalSectionInfoMap().IsValidSection(Lod, Section))
+        Binding.Original = Target->GetOriginalSectionInfoMap().Get(Lod, Section);
+      Binding.Current = Target->GetSectionInfoMap().IsValidSection(Lod, Section)
+          ? Target->GetSectionInfoMap().Get(Lod, Section) : Binding.Original;
+      Bindings[Lod].Add(Name, Binding);
+      ++Section;
+    }
+  }
+  Target->Modify();
+  Target->PreEditChange(nullptr);
+  Target->SetNumSourceModels(0);
+  Target->SetNumSourceModels(Source->GetNumSourceModels());
+  Target->GetSectionInfoMap().Clear();
+  Target->GetOriginalSectionInfoMap().Clear();
+  auto& Slots = Target->GetStaticMaterials();
+  for (int32 Lod = 0; Lod < Source->GetNumSourceModels(); ++Lod) {
+    auto& To = Target->GetSourceModel(Lod);
+    const auto& From = Source->GetSourceModel(Lod);
+    To.BuildSettings = From.BuildSettings;
+    To.ReductionSettings = From.ReductionSettings;
+    To.ScreenSize = From.ScreenSize;
+    To.SourceImportFilename = From.SourceImportFilename;
+    To.bImportWithBaseMesh = From.bImportWithBaseMesh;
+    const FMeshDescription* Incoming = Source->GetMeshDescription(Lod);
+    if (!Incoming) continue; // A reduced LOD is built from its base model.
+    FMeshDescription* Mesh = Target->CreateMeshDescription(Lod, *Incoming);
+    auto Names = FStaticMeshAttributes(*Mesh).GetPolygonGroupMaterialSlotNames();
+    int32 Section = 0;
+    for (FPolygonGroupID Group : Mesh->PolygonGroups().GetElementIDs()) {
+      if (!Mesh->GetNumPolygonGroupPolygons(Group)) continue;
+      FName Name = Names[Group];
+      const auto* Old = Bindings.IsValidIndex(Lod) ? Bindings[Lod].Find(Name) : nullptr;
+      // AssetHive gives the separate Billboard LOD its MI name on first import.
+      if (!Old && BillboardLods.Contains(Lod) && Mesh->PolygonGroups().Num() == 1 &&
+          Bindings.IsValidIndex(Lod) && Bindings[Lod].Num() == 1) {
+        const auto It = Bindings[Lod].CreateConstIterator();
+        Names[Group] = Name = It.Key();
+        Old = &It.Value();
+      }
+      int32 Slot = Target->GetMaterialIndexFromImportedMaterialSlotName(Name);
+      if (Slot == INDEX_NONE && !Name.IsNone()) {
+        Slot = Slots.IndexOfByPredicate([&](const FStaticMaterial& Existing) {
+          return Existing.ImportedMaterialSlotName.IsNone() && Existing.MaterialSlotName == Name;
+        });
+        if (Slot != INDEX_NONE) Slots[Slot].ImportedMaterialSlotName = Name;
+      }
+      if (Slot == INDEX_NONE)
+        Slot = Slots.Add(FStaticMaterial(UMaterial::GetDefaultMaterial(MD_Surface), Name, Name));
+      FMeshSectionInfo Default;
+      Default.MaterialIndex = Slot;
+      Target->GetSectionInfoMap().Set(Lod, Section,
+          Old && Slots.IsValidIndex(Old->Current.MaterialIndex) ? Old->Current : Default);
+      Target->GetOriginalSectionInfoMap().Set(Lod, Section,
+          Old && Slots.IsValidIndex(Old->Original.MaterialIndex) ? Old->Original : Default);
+      ++Section;
+    }
+    Target->CommitMeshDescription(Lod);
+  }
+  auto& ToNanite = *GetMutableNaniteSettings(Target);
+  const auto& FromNanite = *GetMutableNaniteSettings(Source);
+  ToNanite.bEnabled = FromNanite.bEnabled;
+  ToNanite.KeepPercentTriangles = FromNanite.KeepPercentTriangles;
+  ToNanite.ShapePreservation = FromNanite.ShapePreservation;
+  ToNanite.bLerpUVs = FromNanite.bLerpUVs;
+  Target->SpeedTreeWind = Source->SpeedTreeWind;
+  if (UBodySetup* IncomingBody = Source->GetBodySetup(); IncomingBody && IncomingBody->AggGeom.GetElementCount() > 0) {
+    Target->CreateBodySetup();
+    Target->GetBodySetup()->AggGeom = IncomingBody->AggGeom;
+    Target->GetBodySetup()->InvalidatePhysicsData();
+  }
+  if (auto* Data = Target->GetAssetImportData(); Data && !SourceFile.IsEmpty()) Data->Update(SourceFile);
+  Target->PostEditChange();
+  FinalizeImportedAsset(Target);
+  return true;
 }
 
 UAssetHiveImportCommandlet::UAssetHiveImportCommandlet() {
@@ -268,6 +507,15 @@ static FString BuildPlantObjectStem(const TArray<FString> &Tags,
   const FString Tag = ResolvePlantTagSegment(Tags);
   return Identifier.IsEmpty() ? FString::Printf(TEXT("Env_%s"), *Tag)
                              : FString::Printf(TEXT("Env_%s_%s"), *Tag, *Identifier);
+}
+
+// 纹理和 MI 共用资产名。多个材质组用源槽名区分，未命名的组沿用组号。
+static FString BuildPlantMaterialStem(const FString &AssetName, const FString &MaterialName,
+                                      int32 GroupId, bool bMultipleGroups) {
+  const FString Base = TEXT("Env_Foliage_") + AssetName;
+  if (!bMultipleGroups) return Base;
+  return Base + TEXT("_") + (MaterialName.IsEmpty()
+      ? FString::Printf(TEXT("%03d"), GroupId) : MaterialName);
 }
 
 // 3D Plants 导出档案（md §5.2，2026-09-30 插件侧定稿）：路径 / 面数 / Nanite /
@@ -6445,7 +6693,8 @@ static UStaticMesh *ImportStaticMeshAsset(FAssetToolsModule &AssetToolsModule,
                                           const FString &SourceFile,
                                           const FString &DestinationPath,
                                           const FString &DestinationName,
-                                          bool bBuildNanite = true) {
+                                          bool bBuildNanite = true,
+                                          TArray<UStaticMesh*>* AllMeshes = nullptr) {
   UAssetImportTask *Task = NewObject<UAssetImportTask>();
   Task->Filename = SourceFile;
   Task->DestinationPath = DestinationPath;
@@ -6459,12 +6708,14 @@ static UStaticMesh *ImportStaticMeshAsset(FAssetToolsModule &AssetToolsModule,
 
   TArray<UObject *> ImportedObjects;
   AppendImportedObjects(Task, ImportedObjects);
+  UStaticMesh* First = nullptr;
   for (UObject *ImportedObject : ImportedObjects) {
     if (UStaticMesh *StaticMesh = Cast<UStaticMesh>(ImportedObject)) {
-      return StaticMesh;
+      if (!First) First = StaticMesh;
+      if (AllMeshes) AllMeshes->AddUnique(StaticMesh);
     }
   }
-  return nullptr;
+  return First;
 }
 
 static FString NormalizeModelVariantKey(const FString &RawValue) {
@@ -6888,7 +7139,7 @@ static bool AssignPlantBillboardLodMaterial(UStaticMesh *Mesh, int32 Lod,
 
 static UFoliageType_InstancedStaticMesh *
 CreateFoliageTypeAsset(const FString &AssetFolder, const FString &AssetName,
-                       UStaticMesh *StaticMesh) {
+                       UStaticMesh *StaticMesh, FAssetHiveDependencyPolicy* Policy = nullptr) {
   if (!StaticMesh) {
     return nullptr;
   }
@@ -6901,6 +7152,8 @@ CreateFoliageTypeAsset(const FString &AssetFolder, const FString &AssetName,
   }
   const FString FoliageAssetName =
       FString::Printf(TEXT("FT_%s"), *FoliageStem);
+  UFoliageType_InstancedStaticMesh* Existing = nullptr;
+  if (Policy && Policy->Reuse(AssetFolder, FoliageAssetName, Existing)) return Existing;
   const FString PackagePath = AssetFolder / FoliageAssetName;
   UPackage *Package = CreatePackage(*PackagePath);
   if (!Package) {
@@ -7508,7 +7761,10 @@ CreateEnvironmentAssetMaterialInstance(
     const FString &MaterialFolder, const FString &MaterialAssetName,
     const FEnvironmentAssetProfile &Profile, UTexture *AlbedoTexture,
     UTexture *NormalTexture, UTexture *ORMTexture, UTexture *MegaMaskTexture,
-    UTexture *OpacityTexture, UTexture *EmissiveTexture, bool bMasked) {
+    UTexture *OpacityTexture, UTexture *EmissiveTexture, bool bMasked,
+    FAssetHiveDependencyPolicy* Policy = nullptr) {
+  UMaterialInstanceConstant* Existing = nullptr;
+  if (Policy && Policy->Reuse(MaterialFolder, MaterialAssetName, Existing)) return Existing;
   const bool bUseMaskedParent = bMasked && Profile.bBaseFamily;
   UMaterialInterface *ParentMaterial = UAssetHiveSettings::GetAssetParentMaterial(
       Profile.TypeKey, bUseMaskedParent);
@@ -7828,38 +8084,27 @@ static TSharedPtr<FJsonObject> FindZionNativeWindMaterial(
 // 仅存在 UV 通道数量不代表原生 Branch2；还需要 JSON 声明和有效的实际 UV3 数据。
 static bool HasZionNativeUV3(UStaticMesh *Mesh) {
   if (!Mesh || Mesh->GetNumSourceModels() == 0) return false;
+  TArray<TArray<FVector2f>> Lods;
   for (int32 Lod = 0; Lod < Mesh->GetNumSourceModels(); ++Lod) {
     const FMeshDescription *Description = Mesh->GetMeshDescription(Lod);
     if (!Description || Description->VertexInstances().Num() == 0) return false;
     const FStaticMeshConstAttributes Attributes(*Description);
     const TVertexInstanceAttributesConstRef<FVector2f> UVs = Attributes.GetVertexInstanceUVs();
     if (UVs.GetNumChannels() < 4) return false;
-    bool bHasData = false;
+    auto &Values = Lods.AddDefaulted_GetRef();
+    Values.Reserve(Description->VertexInstances().Num());
     for (const FVertexInstanceID Vertex : Description->VertexInstances().GetElementIDs()) {
       const FVector2f UV = UVs.Get(Vertex, 3);
-      if (!FMath::IsFinite(UV.X) || !FMath::IsFinite(UV.Y)) return false;
-      bHasData |= UV.X != 0.0f || UV.Y != 0.0f;
+      Values.Add(UV);
     }
-    if (!bHasData) return false;
   }
-  return true;
+  return AssetHiveZionPlantReuse::HasValidUV3(Lods);
 }
 
 static bool ResolveZionNativeUV3(const TSharedPtr<FJsonObject> &Profile,
                                  const TSharedPtr<FJsonObject> &Material,
                                  bool bHasUV3, bool &bHasDeclaration) {
-  bool bWanted = false;
-  bHasDeclaration = Profile.IsValid() && Profile->TryGetBoolField(TEXT("useRemappedUV3"), bWanted);
-  const bool bExplicitlyDisabled = bHasDeclaration && !bWanted;
-  for (const auto &Source : {Profile, Material}) {
-    const auto Switches = GetZionWindObject(Source, TEXT("staticSwitchParameters"));
-    bool bValue = false;
-    if (Switches.IsValid() && Switches->TryGetBoolField(TEXT("Use Remapped UV3"), bValue)) {
-      bHasDeclaration = true;
-      if (!bExplicitlyDisabled) bWanted = bValue;
-    }
-  }
-  return bHasDeclaration && bWanted && bHasUV3;
+  return AssetHiveZionPlantReuse::WantsRemappedUV3(Profile, Material, bHasDeclaration) && bHasUV3;
 }
 
 // 风条目和 UV3 只参与内部身份；可见资产名只在真正重名时追加普通序号。
@@ -7976,14 +8221,15 @@ template <typename T> static auto &PlantPackageMetadata(T &&Value) {
 
 // The five Zion ST masters select one texture bank for the whole material via Use VT.
 // Keep the texture budget of the smallest input when source maps straddle the VT threshold.
-static void MatchPlantWindTextureStreaming(std::initializer_list<UTexture *> Textures) {
+static void MatchPlantWindTextureStreaming(std::initializer_list<UTexture *> Textures,
+                                          const TSet<const UObject*>& Kept) {
   bool bHasRegular = false;
   for (const UTexture *Texture : Textures) {
     bHasRegular |= Texture && !Texture->VirtualTextureStreaming;
   }
   if (!bHasRegular) return;
   for (UTexture *Texture : Textures) {
-    if (!Texture || !Texture->VirtualTextureStreaming) continue;
+    if (!Texture || !Texture->VirtualTextureStreaming || Kept.Contains(Texture)) continue;
     ForceTextureDataReady(Texture);
     Texture->Modify();
     Texture->PreEditChange(nullptr);
@@ -8007,8 +8253,12 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
                             bool bAutoMasked = false, float PlantHeightCm = 0.f,
                             const FJsonObject* VerifiedLayers = nullptr,
                             const FPlantBranch2Bounds& DecodeBounds = {},
-                            bool bForceMasked = false, bool bStaticBillboard = false) {
+                            bool bForceMasked = false, bool bStaticBillboard = false,
+                            bool bOpacityInDiffuseAlpha = false, FAssetHiveDependencyPolicy* Policy = nullptr) {
   const bool bBillboard = MaterialRole.Equals(TEXT("billboard"), ESearchCase::IgnoreCase);
+  const FString MaterialAssetName = UAssetHiveSettings::GetPlantMaterialName(AssetName, bBillboard, bOpaque);
+  UMaterialInstanceConstant* Existing = nullptr;
+  if (Policy && Policy->Reuse(AssetFolder, MaterialAssetName, Existing)) return Existing;
   // Shared 与普通 LOD 使用相同预设和株高缩放，保证切换时整体运动一致。
   const EPlantSyntheticWind WindStyle = SyntheticWind;
   const bool bSyntheticWind = WindStyle != EPlantSyntheticWind::None;
@@ -8068,8 +8318,6 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     ForceTextureDataReady(Texture);
   }
 
-  const FString MaterialAssetName =
-      UAssetHiveSettings::GetPlantMaterialName(AssetName, bBillboard, bOpaque);
   const FString MaterialPackagePath = AssetFolder / MaterialAssetName;
   UPackage *MaterialPackage = CreatePackage(*MaterialPackagePath);
   UMaterialInstanceConstant *MaterialInstance =
@@ -8091,7 +8339,8 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
   const bool bWasForcedMasked = Metadata.HasValue(MaterialInstance, ForcedMaskedTag);
   if (bForceMasked) Metadata.SetValue(MaterialInstance, ForcedMaskedTag, TEXT("1"));
   else if (bWasForcedMasked) Metadata.RemoveValue(MaterialInstance, ForcedMaskedTag);
-  const bool bUseOpacityMasked = !bOpaque && OpacityMaskTexture != nullptr;
+  const bool bUseDiffuseAlpha = !bOpaque && bOpacityInDiffuseAlpha && DiffuseTexture;
+  const bool bUseOpacityMasked = !bOpaque && !bUseDiffuseAlpha && OpacityMaskTexture;
   if (bOpaque) {
     // The transparency mask is already cut into the geometry, so the variant
     // renders as a true Opaque surface instead of Masked.
@@ -8105,7 +8354,7 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     // Clear the importer's forced override when returning to inherited blending.
     FMaterialInstanceBasePropertyOverrides &Overrides =
         MaterialInstance->BasePropertyOverrides;
-    Overrides.bOverride_BlendMode = bForceMasked || (bAutoMasked && bUseOpacityMasked);
+    Overrides.bOverride_BlendMode = bForceMasked || (bAutoMasked && (bUseOpacityMasked || bUseDiffuseAlpha));
     if (Overrides.bOverride_BlendMode) {
       Overrides.BlendMode = BLEND_Masked;
     }
@@ -8166,6 +8415,15 @@ CreatePlantMaterialInstance(const FString &AssetFolder,
     MaterialInstance->SetTextureParameterValueEditorOnly(
         FMaterialParameterInfo(FName(*OpacityMaskedParameter)),
         OpacityMaskTexture);
+  } else if (bOpacityInDiffuseAlpha && !OpacityMaskedParameter.IsEmpty()) {
+    // 重导入时释放旧独立透贴的两个采样槽，透明度由 Diffuse.A 提供。
+    FString Regular = OpacityMaskedParameter;
+    Regular.RemoveFromEnd(TEXT("_VT"), ESearchCase::IgnoreCase);
+    const FMaterialParameterInfo RegularSlot{FName(*Regular)};
+    const FMaterialParameterInfo VirtualSlot{FName(*(Regular + TEXT("_VT")))};
+    MaterialInstance->TextureParameterValues.RemoveAll([&](const FTextureParameterValue &P) {
+      return P.ParameterInfo == RegularSlot || P.ParameterInfo == VirtualSlot;
+    });
   }
   // SSC 槽位：Megascans 植被的 Translucency（T）贴图；Opaque 裁切变体同样需要。
   if (SubsurfaceTexture) {
@@ -8461,10 +8719,30 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
   // short material name. The first owner stores Material/Tex; later meshes
   // reference those same objects instead of importing duplicate textures.
   TMap<FString, FSharedZion3DMaterial> SharedZion3DMaterials;
+  struct FZionPlantMaterialInputs {
+    FString MaterialStem;
+    FString ParentPath;
+    UTexture *Diffuse = nullptr;
+    UTexture *Normal = nullptr;
+    UTexture *ORM = nullptr;
+    UTexture *Opacity = nullptr;
+    UTexture *Subsurface = nullptr;
+    bool bOpacityInDiffuseAlpha = false;
+    FString MaterialRole;
+    bool bUseVT = false;
+    EPlantSyntheticWind WindStyle = EPlantSyntheticWind::None;
+  };
+  TMap<FString, FZionPlantMaterialInputs> SharedZionPlantTextureInputs;
+  TMap<FString, UMaterialInstanceConstant *> SharedZionPlantInstances;
   bool bAnyAssetFailed = false;
+  bool bPrepareCommonOnFirstImport = false;
+  Root->TryGetBoolField(TEXT("prepareCommonOnFirstImport"), bPrepareCommonOnFirstImport);
+  bool bPreparedCommonForNewMesh = false;
   const int32 AssetCount = AssetsJson->Num();
   int32 AssetIndex = 0;
-  for (const TSharedPtr<FJsonValue> &AssetValue : *AssetsJson) {
+  TArray<TSharedPtr<FJsonValue>> OrderedAssets = *AssetsJson;
+  AssetHiveZionPlantReuse::OrderNamedPlants(OrderedAssets);
+  for (const TSharedPtr<FJsonValue> &AssetValue : OrderedAssets) {
     if (!AssetValue.IsValid() || AssetValue->Type != EJson::Object) {
       continue;
     }
@@ -8530,6 +8808,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const bool bIsHdri = AssetType == TEXT("hdri");
     const bool bIsModelAsset =
         AssetType == TEXT("3d") || AssetType == TEXT("3dplant");
+    FString MeshOverwritePolicy;
+    AssetObject->TryGetStringField(TEXT("meshOverwritePolicy"), MeshOverwritePolicy);
+    FAssetHiveDependencyPolicy Dependencies;
+    Dependencies.bMeshOnly = bIsModelAsset && MeshOverwritePolicy == TEXT("meshOnly");
+    FString FirstImportError;
+    if (Dependencies.bMeshOnly) AssetObject->TryGetStringField(TEXT("firstImportError"), FirstImportError);
+    bool bSkippedNewMeshes = false;
+    FAssetHiveMeshStaging Staging;
     const bool bIsCustomAsset = AssetSource == TEXT("custom");
     const bool bIs3DAsset = AssetType == TEXT("3d");
     const bool bHasLibraryId = !AssetId.TrimStartAndEnd().IsEmpty();
@@ -8752,6 +9038,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
     FString SafeAssetFolderName = MakeSafeObjectName(
         AssetFolderName.IsEmpty() ? FolderStemSource : AssetFolderName);
+    const bool bZionPlant = AssetType == TEXT("3dplant") && bIsZionAsset;
+    if (bZionPlant && bHasLibraryId) {
+      // 旧发送端可能在显式 Zion 标签与供应商标签共存时已给目录追加库 ID。
+      SafeAssetFolderName.RemoveFromEnd(TEXT("_") + SafeAssetId, ESearchCase::IgnoreCase);
+    }
     // Keep the on-disk asset folder aligned with every other exported object:
     // the internal asset ID is part of the folder name as well.
     // Zion 资产例外：不带 ID 后缀（由用户选定的二级目录承担归类职责）。
@@ -8772,6 +9063,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         AssetType == TEXT("3dplant") && bIsZionAsset
             ? SafeAssetFolderName
             : FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
+    FString PlantDisplayName = bZionPlant ? SafeAssetFolderName : FolderStemSource;
+    if (!bZionPlant && bHasLibraryId) PlantDisplayName.RemoveFromEnd(TEXT("_") + SafeAssetId, ESearchCase::IgnoreCase);
     const bool bFbxPlantNaming = AssetType == TEXT("3dplant") && AssetHasFbxPlantModels(AssetObject);
     const bool bUsePlantNaming = bThirdPartyPlant || bFbxPlantNaming;
     TArray<FString> AuthoredPlantTags;
@@ -8859,8 +9152,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     FString MaterialMatching;
     AssetObject->TryGetStringField(TEXT("materialMatching"), MaterialMatching);
     const bool bNamedZion3D = bIs3DAsset && bIsZionAsset && MaterialMatching == TEXT("name");
+    const bool bNamedZionPlant = AssetType == TEXT("3dplant") && bIsZionAsset && MaterialMatching == TEXT("name");
+    const bool bNamedZionMaterial = bNamedZion3D || bNamedZionPlant;
+    const FString NamedParentType = bNamedZionPlant
+        ? TEXT("3dplant|") + PlantProfile.SubtypeFolder + (bUseVT ? TEXT("|vt") : TEXT("|regular"))
+        : EnvironmentProfile.TypeKey;
     const TArray<TSharedPtr<FJsonValue>>* SharedGroups = nullptr;
-    if (bNamedZion3D && Root->TryGetArrayField(TEXT("namedMaterialGroups"), SharedGroups)) {
+    if (bNamedZionMaterial && Root->TryGetArrayField(TEXT("namedMaterialGroups"), SharedGroups)) {
       FString Scope;
       AssetObject->TryGetStringField(TEXT("materialScope"), Scope);
       TArray<TSharedPtr<FJsonValue>> Groups, Slots, Files;
@@ -8906,8 +9204,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     }
 
     TMap<int32, TMap<FString, FString>> SourceTextureSlotMapByGroup;
+    TMap<int32, TMap<FString, FString>> SourceTextureBySlotByGroup;
     TMap<int32, TMap<FString, FString>> SourceTextureNormalFormatMapByGroup;
     TMap<int32, FString> SourceTextureMaterialRoleByGroup;
+    TSet<int32> DiffuseAlphaGroups;
     TMap<FString, int32> SourceTextureGroupByPath;
     TMap<FString, FString> SourceTextureObjectNameByPath;
     TMap<FString, FString> SourceTextureResolutionByPath;
@@ -9031,6 +9331,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           }
           SourceTextureSlotMapByGroup.FindOrAdd(GroupId).Add(
               SourceKey, NormalizedSlotName);
+          // 原始 RGBA 文件可被多个植被材质组明确引用，每个组都保留自己的输入。
+          if (bIsPlantAsset && FPaths::FileExists(SourceFile)) {
+            auto &GroupSources = SourceTextureBySlotByGroup.FindOrAdd(GroupId);
+            if (!GroupSources.Contains(NormalizedSlotName)) GroupSources.Add(NormalizedSlotName, SourceFile);
+          }
           SourceTextureGroupByPath.Add(SourceKey, GroupId);
           if (!ObjectName.IsEmpty()) {
             SourceTextureObjectNameByPath.Add(SourceKey, ObjectName);
@@ -9051,108 +9356,14 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
 
-    TMap<int32, FString> NamedMaterialNames, NamedMaterialSignatures, NamedMaterialCacheKeys;
-    TMap<FString, int32> NamedGroupsByName;
-    const TArray<TSharedPtr<FJsonValue>> *MaterialGroups = nullptr;
-    if (AssetObject->TryGetArrayField(TEXT("materialGroups"), MaterialGroups) && MaterialGroups != nullptr) {
-      for (const TSharedPtr<FJsonValue> &GroupValue : *MaterialGroups) {
-        if (!GroupValue.IsValid() || GroupValue->Type != EJson::Object) continue;
-        const TSharedPtr<FJsonObject> GroupObject = GroupValue->AsObject();
-        if (!GroupObject.IsValid()) continue;
-        FString MaterialRole;
-        double GroupIdValue = 1.0;
-        GroupObject->TryGetStringField(TEXT("materialRole"), MaterialRole);
-        GroupObject->TryGetNumberField(TEXT("groupId"), GroupIdValue);
-        if (!MaterialRole.IsEmpty()) {
-          SourceTextureMaterialRoleByGroup.Add(FMath::Max(1, static_cast<int32>(GroupIdValue)), MaterialRole.ToLower());
-        }
-        if (bNamedZion3D) {
-          FString Name, Signature;
-          GroupObject->TryGetStringField(TEXT("materialName"), Name);
-          GroupObject->TryGetStringField(TEXT("textureSignature"), Signature);
-          Name = AssetHiveZion3DMaterials::Stem(Name);
-          const int32 GroupId = FMath::Max(1, static_cast<int32>(GroupIdValue));
-          if (Name.IsEmpty() || MakeSafeObjectName(Name) != Name || Signature.Len() != 64 ||
-              NamedMaterialNames.Contains(GroupId)) {
-            GAssetHiveImportFailed = true;
-            FailureMessage = TEXT("Zion 3D 材质组名称或纹理签名无效");
-            break;
-          }
-          const FString Key = AssetHiveZion3DMaterials::Key(Name);
-          const FString CacheKey = (AssetDestinationPath / ZionCategoryFolder).ToLower() + TEXT("|") + Key;
-          if (NamedGroupsByName.Contains(Key)) {
-            GAssetHiveImportFailed = true;
-            FailureMessage = FString::Printf(TEXT("同一资产内材质名称 %s 重复，请合并其贴图组"), *Name);
-            break;
-          }
-          NamedGroupsByName.Add(Key, GroupId);
-          if (const FSharedZion3DMaterial* Existing = SharedZion3DMaterials.Find(CacheKey)) {
-            if (Existing->Signature != Signature || Existing->ParentType != EnvironmentProfile.TypeKey) {
-              GAssetHiveImportFailed = true;
-              FailureMessage = FString::Printf(TEXT("同名材质 %s 的纹理或父材质分类冲突"), *Name);
-              break;
-            }
-          }
-          NamedMaterialNames.Add(GroupId, Name);
-          NamedMaterialSignatures.Add(GroupId, Signature);
-          NamedMaterialCacheKeys.Add(GroupId, CacheKey);
-        }
-      }
-    }
-    if (bNamedZion3D && (GAssetHiveImportFailed || NamedGroupsByName.IsEmpty())) {
-      GAssetHiveImportFailed = true;
-      if (FailureMessage.IsEmpty()) FailureMessage = TEXT("Zion 3D 缺少命名材质组");
-      UE_LOG(LogTemp, Error, TEXT("AssetHive: %s: %s"), *AssetName, *FailureMessage);
-      continue;
-    }
-
-    const auto TextureSlotForFile = [&](const FString& SourceKey, const FString& SourceFile, int32 GroupId) {
-      const auto* Group = SourceTextureSlotMapByGroup.Find(GroupId);
-      const FString* ExplicitSlot = Group ? Group->Find(SourceKey) : nullptr;
-      return ExplicitSlot ? *ExplicitSlot : DetectTextureSlot(SourceFile);
-    };
-
-    // Resolve the parents this asset will use before creating any mesh or texture packages.
-    TOptional<FString> MissingParent;
-    if (bIsSurface && !UAssetHiveSettings::GetSurfaceParentMaterial()) {
-      MissingParent = UAssetHiveSettings::GetSurfaceParentMaterialPath();
-    } else if (bIsDecal && !UAssetHiveSettings::GetDecalParentMaterial(DecalParentMode)) {
-      MissingParent = UAssetHiveSettings::GetDecalParentMaterialPath(DecalParentMode);
-    } else if (bIs3DAsset && !bNamedZion3D) {
-      TMap<int32, bool> MaskedByGroup;
-      const TArray<TSharedPtr<FJsonValue>>* Files = nullptr;
-      if (EnvironmentProfile.bBaseFamily && AssetObject->TryGetArrayField(TEXT("textureFiles"), Files)) {
-        for (const auto& File : *Files) {
-          if (!File.IsValid() || File->Type != EJson::String) continue;
-          const FString SourceFile = File->AsString();
-          if (!FPaths::FileExists(SourceFile)) continue;
-          const FString Key = NormalizePathLower(SourceFile);
-          const int32 GroupId = FMath::Max(1, SourceTextureGroupByPath.FindRef(Key));
-          const FString Slot = TextureSlotForFile(Key, SourceFile, GroupId);
-          if (!Slot.IsEmpty()) MaskedByGroup.FindOrAdd(GroupId) |= Slot == TEXT("opacity");
-        }
-      }
-      if (MaskedByGroup.IsEmpty()) MaskedByGroup.Add(1, false);
-      TSet<bool> CheckedModes;
-      for (const auto& Group : MaskedByGroup) {
-        if (CheckedModes.Contains(Group.Value)) continue;
-        CheckedModes.Add(Group.Value);
-        if (!UAssetHiveSettings::GetAssetParentMaterial(EnvironmentProfile.TypeKey, Group.Value)) {
-          MissingParent = UAssetHiveSettings::GetAssetParentMaterialPath(EnvironmentProfile.TypeKey, Group.Value);
-          break;
-        }
-      }
-    }
-    if (MissingParent.IsSet()) {
-      GAssetHiveImportFailed = true;
-      FailureMessage = MissingParent->IsEmpty()
-          ? FString::Printf(TEXT("%s 未配置父材质"), *AssetName)
-          : FString::Printf(TEXT("缺少父材质：%s"), **MissingParent);
-      UE_LOG(LogTemp, Error, TEXT("AssetHive: %s: %s"), *AssetName, *FailureMessage);
-      continue;
-    }
-
     TArray<UStaticMesh *> ImportedMeshes;
+    struct FModelImport {
+      FString File, Name, Variant;
+      bool bGroupedPlant = false;
+      TArray<UStaticMesh*> Staged;
+      FString StageFolder;
+    };
+    TArray<FModelImport> Models;
     TMap<UStaticMesh *, FString> SourceFileByMesh;
     // Model variant key per imported mesh; keys ending with OPAQUE mark cut
     // foliage variants that must use a true Opaque material.
@@ -9164,7 +9375,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     TMap<FString, TArray<FPlantModelLodEntry>> PlantLodsByVariant;
     TMap<FString, bool> FbxSmoothingGroupCache;
     TMap<int32, TMap<FString, UTexture *>> TextureBySlotByGroup;
-    TMap<int32, TMap<FString, FString>> SourceTextureBySlotByGroup;
     const bool bMultipleTextureGroups = SourceTextureSlotMapByGroup.Num() > 1;
 
     FString PrimaryModelVariantKey = TEXT("01");
@@ -9309,35 +9519,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           const FString BaseMeshName =
               FString::Printf(TEXT("SM_%s"), *VariantStem);
 
-          SetStageProgress(
-              static_cast<float>(FMath::Clamp(AssetBaseProgress + 8, 0, 99)),
-              FString::Printf(TEXT("导入植物模型: %s"),
-                              *FPaths::GetCleanFilename(BaseFile)));
-          UStaticMesh *BaseMesh = ImportStaticMeshAsset(
-              AssetToolsModule, BaseFile, MeshFolder, BaseMeshName,
-              PlantProfile.bNanite);
-          if (!BaseMesh) {
-            continue;
-          }
-
-          // LOD 版本导出的 Masked 植被：把该变体自己的 LOD 链合并成 custom LOD，
-          // 合并后才配置材质，整个 LOD 栈只重建一次。OPAQUE 版本不带任何 LOD。
-          if (const TArray<FPlantModelLodEntry> *VariantLods =
-                  PlantLodsByVariant.Find(VariantKey)) {
-            ImportPlantCustomLods(AssetToolsModule, BaseMesh, *VariantLods,
-                                  MeshFolder, BaseMeshName);
-          }
-
-          // Nanite and materials are configured together after texture import.
-          ImportedMeshes.Add(BaseMesh);
-          VariantKeyByMesh.Add(BaseMesh, VariantKey);
-          SourceFileByMesh.Add(BaseMesh, BaseFile);
-
-          if (bCreateFoliageForAsset) {
-            CreateFoliageTypeAsset(AssetFolder, VariantStem, BaseMesh);
-          }
+          Models.Add({BaseFile, BaseMeshName, VariantKey, true});
         }
-        bHandledModelImport = ImportedMeshes.Num() > 0;
+        bHandledModelImport = !Models.IsEmpty();
       }
 
       if (!bHandledModelImport) {
@@ -9369,18 +9553,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (FPaths::GetExtension(SourceFile).ToLower() == TEXT("abc")) {
             continue;
           }
-          UAssetImportTask *Task = NewObject<UAssetImportTask>();
-          Task->Filename = SourceFile;
-          Task->DestinationPath = MeshFolder;
           FString ModelAssetName;
+          const FString VariantKey = ResolveModelVariantKey(
+              SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
           if (bIs3DAsset) {
-            const FString VariantKey = ResolveModelVariantKey(
-                SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
             ModelAssetName = FString::Printf(TEXT("SM_%s_%s"),
                                              *EnvironmentStem, *VariantKey);
-          } else if (bIsCustomAsset && bIsModelAsset) {
-            const FString VariantKey = ResolveModelVariantKey(
-                SourceFile, ExplicitVariantByFile, ImportedModelIndex + 1);
+          } else if (bZionPlant || (bIsCustomAsset && bIsModelAsset)) {
             const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
             const bool bNeedsVariantSuffix =
                 bFbxPlantAsset || bHasExplicitModelVariants ||
@@ -9400,37 +9579,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             ModelAssetName = FString::Printf(TEXT("SM_%s_%s"), *AssetStem,
                                              *DetectModelSuffix(SourceFile));
           }
-          Task->DestinationName = ModelAssetName;
-          Task->bReplaceExisting = true;
-          Task->bAutomated = true;
-          Task->bAsync = false;
-          Task->bSave = false;
-          Task->Options = MakeStaticMeshImportOptions(
-              AssetType == TEXT("3dplant") ? PlantProfile.bNanite : true);
-          SetStageProgress(
-              static_cast<float>(FMath::Clamp(AssetBaseProgress + 8, 0, 99)),
-              FString::Printf(TEXT("导入模型: %s"),
-                              *FPaths::GetCleanFilename(SourceFile)));
-          AssetToolsModule.Get().ImportAssetTasks({Task});
-
-          TArray<UObject *> ImportedObjects;
-          AppendImportedObjects(Task, ImportedObjects);
-          for (UObject *ImportedObject : ImportedObjects) {
-            if (UStaticMesh *StaticMesh = Cast<UStaticMesh>(ImportedObject)) {
-              ImportedMeshes.Add(StaticMesh);
-              // 植被（3dplant，含 st9）逐个网格创建对应 FoliageType（FT_ + 网格名去掉 SM_）。
-              if (bCreateFoliageForAsset && AssetType == TEXT("3dplant")) {
-                CreateFoliageTypeAsset(AssetFolder, ModelAssetName, StaticMesh);
-              }
-              if (bIs3DAsset) {
-                SourceFileByMesh.Add(StaticMesh, SourceFile);
-                VariantKeyByMesh.Add(
-                    StaticMesh,
-                    ResolveModelVariantKey(SourceFile, ExplicitVariantByFile,
-                                           ImportedModelIndex + 1));
-              }
-            }
-          }
+          Models.Add({SourceFile, ModelAssetName, VariantKey});
           ImportedModelIndex += 1;
         }
       }
@@ -9449,6 +9598,225 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         break;
       }
     }
+    if (Dependencies.bMeshOnly) {
+      if (Models.IsEmpty()) {
+        FailureMessage = TEXT("没有可导入的模型文件");
+        GAssetHiveImportFailed = true;
+        continue;
+      }
+      Dependencies.bCreateMissing = false;
+      TArray<FAssetData> InFolder;
+      auto& Registry = FAssetRegistryModule::GetRegistry();
+      if (IFileManager::Get().DirectoryExists(*FPackageName::LongPackageNameToFilename(MeshFolder)))
+        Registry.ScanPathsSynchronous({MeshFolder});
+      Registry.GetAssetsByPath(FName(*MeshFolder), InFolder);
+      const bool bHasMeshes = InFolder.ContainsByPredicate([](const FAssetData& Data) {
+        return Data.IsInstanceOf(UStaticMesh::StaticClass());
+      });
+      int32 ModelIndex = 0;
+      for (auto& Model : Models) {
+        UStaticMesh* Expected = nullptr;
+        const bool bOccupied = FindAssetHiveOverwriteTarget(MeshFolder / Model.Name, Model.Name, Expected);
+        if (bOccupied && !Expected) break;
+        if (!bHasMeshes && !Expected) {
+          Dependencies.bCreateMissing = true;
+          continue;
+        }
+        // A multi-node FBX can produce several object names. Classify its actual factory
+        // outputs before letting anything write to the destination.
+        Model.StageFolder = Staging.GetFolder() / FString::FromInt(++ModelIndex);
+        ImportStaticMeshAsset(AssetToolsModule, Model.File, Model.StageFolder, Model.Name,
+                              bIs3DAsset || PlantProfile.bNanite, &Model.Staged);
+        if (Model.Staged.IsEmpty()) {
+          GAssetHiveImportFailed = true;
+          FailureMessage = TEXT("模型导入失败：") + Model.File;
+          break;
+        }
+        for (UStaticMesh* Mesh : Model.Staged) {
+          UStaticMesh* Target = nullptr;
+          if (FindAssetHiveOverwriteTarget(MeshFolder / Mesh->GetName(), Mesh->GetName(), Target)) {
+            if (Target) Staging.Targets.Add(Mesh, Target);
+          } else Dependencies.bCreateMissing = true;
+        }
+      }
+      if (GAssetHiveImportFailed) continue;
+      if (Dependencies.bCreateMissing) {
+        if (FirstImportError.IsEmpty() && bPrepareCommonOnFirstImport && !bPreparedCommonForNewMesh) {
+          bPreparedCommonForNewMesh = PrepareAssetHiveCommonForNewMesh();
+          if (!bPreparedCommonForNewMesh) FirstImportError = TEXT("无法准备 AssetHive 公共材质");
+        }
+        if (!FirstImportError.IsEmpty()) {
+          if (Staging.Targets.IsEmpty()) {
+            GAssetHiveImportFailed = true;
+            FailureMessage = FirstImportError;
+            continue;
+          }
+          bSkippedNewMeshes = true;
+          Dependencies.bCreateMissing = false;
+        }
+      }
+      if (!bHasMeshes && Staging.Targets.IsEmpty()) Dependencies.bMeshOnly = false;
+    }
+    bool bReadNamedDependencies = bNamedZionMaterial && FirstImportError.IsEmpty() &&
+        (Dependencies.bCreateMissing || AssetCount > 1);
+    TMap<int32, FString> NamedMaterialNames, NamedMaterialSignatures, NamedMaterialCacheKeys;
+    TMap<FString, int32> NamedGroupsByName;
+    const TArray<TSharedPtr<FJsonValue>> *MaterialGroups = nullptr;
+    if (AssetObject->TryGetArrayField(TEXT("materialGroups"), MaterialGroups) && MaterialGroups != nullptr) {
+      for (const TSharedPtr<FJsonValue> &GroupValue : *MaterialGroups) {
+        if (!GroupValue.IsValid() || GroupValue->Type != EJson::Object) continue;
+        const TSharedPtr<FJsonObject> GroupObject = GroupValue->AsObject();
+        if (!GroupObject.IsValid()) continue;
+        FString MaterialRole;
+        double GroupIdValue = 1.0;
+        GroupObject->TryGetStringField(TEXT("materialRole"), MaterialRole);
+        GroupObject->TryGetNumberField(TEXT("groupId"), GroupIdValue);
+        bool bOpacityInDiffuseAlpha = false;
+        if (AssetType == TEXT("3dplant") && bIsZionAsset &&
+            GroupObject->TryGetBoolField(TEXT("opacityInDiffuseAlpha"), bOpacityInDiffuseAlpha) && bOpacityInDiffuseAlpha) {
+          DiffuseAlphaGroups.Add(FMath::Max(1, static_cast<int32>(GroupIdValue)));
+        }
+        if (!MaterialRole.IsEmpty()) {
+          SourceTextureMaterialRoleByGroup.Add(FMath::Max(1, static_cast<int32>(GroupIdValue)), MaterialRole.ToLower());
+        }
+        if (bReadNamedDependencies) {
+          FString Name, Signature;
+          GroupObject->TryGetStringField(TEXT("materialName"), Name);
+          GroupObject->TryGetStringField(TEXT("textureSignature"), Signature);
+          Name = AssetHiveZion3DMaterials::Stem(Name);
+          const int32 GroupId = FMath::Max(1, static_cast<int32>(GroupIdValue));
+          if (Name.IsEmpty() || MakeSafeObjectName(Name) != Name || Signature.Len() != 64 ||
+              NamedMaterialNames.Contains(GroupId)) {
+            GAssetHiveImportFailed = true;
+            FailureMessage = TEXT("Zion 3D 材质组名称或纹理签名无效");
+            break;
+          }
+          const FString Key = AssetHiveZion3DMaterials::Key(Name);
+          const FString CacheKey = (AssetDestinationPath / ZionCategoryFolder).ToLower() + TEXT("|") + Key;
+          if (NamedGroupsByName.Contains(Key)) {
+            GAssetHiveImportFailed = true;
+            FailureMessage = FString::Printf(TEXT("同一资产内材质名称 %s 重复，请合并其贴图组"), *Name);
+            break;
+          }
+          NamedGroupsByName.Add(Key, GroupId);
+          if (const FSharedZion3DMaterial* Existing = SharedZion3DMaterials.Find(CacheKey)) {
+            if (Existing->Signature != Signature || Existing->ParentType != NamedParentType) {
+              GAssetHiveImportFailed = true;
+              FailureMessage = FString::Printf(TEXT("同名材质 %s 的纹理或父材质分类冲突"), *Name);
+              break;
+            }
+          }
+          NamedMaterialNames.Add(GroupId, Name);
+          NamedMaterialSignatures.Add(GroupId, Signature);
+          NamedMaterialCacheKeys.Add(GroupId, CacheKey);
+        }
+      }
+    }
+    if (bReadNamedDependencies && (GAssetHiveImportFailed || NamedGroupsByName.IsEmpty())) {
+      if (Dependencies.bCreateMissing) {
+        GAssetHiveImportFailed = true;
+        if (FailureMessage.IsEmpty()) FailureMessage = TEXT("Zion 3D 缺少命名材质组");
+        UE_LOG(LogTemp, Error, TEXT("AssetHive: %s: %s"), *AssetName, *FailureMessage);
+        continue;
+      }
+      bReadNamedDependencies = false;
+      GAssetHiveImportFailed = false;
+      FailureMessage.Reset();
+    }
+
+    const auto TextureSlotForFile = [&](const FString& SourceKey, const FString& SourceFile, int32 GroupId) {
+      const auto* Group = SourceTextureSlotMapByGroup.Find(GroupId);
+      const FString* ExplicitSlot = Group ? Group->Find(SourceKey) : nullptr;
+      return ExplicitSlot ? *ExplicitSlot : DetectTextureSlot(SourceFile);
+    };
+
+    // Resolve the parents this asset will use before creating any mesh or texture packages.
+    TOptional<FString> MissingParent;
+    if (bIsSurface && !UAssetHiveSettings::GetSurfaceParentMaterial()) {
+      MissingParent = UAssetHiveSettings::GetSurfaceParentMaterialPath();
+    } else if (bIsDecal && !UAssetHiveSettings::GetDecalParentMaterial(DecalParentMode)) {
+      MissingParent = UAssetHiveSettings::GetDecalParentMaterialPath(DecalParentMode);
+    } else if (bIs3DAsset && !bNamedZion3D && Dependencies.bCreateMissing) {
+      TMap<int32, bool> MaskedByGroup;
+      const TArray<TSharedPtr<FJsonValue>>* Files = nullptr;
+      if (EnvironmentProfile.bBaseFamily && AssetObject->TryGetArrayField(TEXT("textureFiles"), Files)) {
+        for (const auto& File : *Files) {
+          if (!File.IsValid() || File->Type != EJson::String) continue;
+          const FString SourceFile = File->AsString();
+          if (!FPaths::FileExists(SourceFile)) continue;
+          const FString Key = NormalizePathLower(SourceFile);
+          const int32 GroupId = FMath::Max(1, SourceTextureGroupByPath.FindRef(Key));
+          const FString Slot = TextureSlotForFile(Key, SourceFile, GroupId);
+          if (!Slot.IsEmpty()) MaskedByGroup.FindOrAdd(GroupId) |= Slot == TEXT("opacity");
+        }
+      }
+      if (MaskedByGroup.IsEmpty()) MaskedByGroup.Add(1, false);
+      TSet<bool> CheckedModes;
+      for (const auto& Group : MaskedByGroup) {
+        if (CheckedModes.Contains(Group.Value)) continue;
+        CheckedModes.Add(Group.Value);
+        if (!UAssetHiveSettings::GetAssetParentMaterial(EnvironmentProfile.TypeKey, Group.Value)) {
+          MissingParent = UAssetHiveSettings::GetAssetParentMaterialPath(EnvironmentProfile.TypeKey, Group.Value);
+          break;
+        }
+      }
+    }
+    if (MissingParent.IsSet()) {
+      GAssetHiveImportFailed = true;
+      FailureMessage = MissingParent->IsEmpty()
+          ? FString::Printf(TEXT("%s 未配置父材质"), *AssetName)
+          : FString::Printf(TEXT("缺少父材质：%s"), **MissingParent);
+      UE_LOG(LogTemp, Error, TEXT("AssetHive: %s: %s"), *AssetName, *FailureMessage);
+      continue;
+    }
+
+    for (const auto& Model : Models) {
+      SetStageProgress(static_cast<float>(FMath::Clamp(AssetBaseProgress + 8, 0, 99)),
+          FString::Printf(TEXT("导入模型: %s"), *FPaths::GetCleanFilename(Model.File)));
+      TArray<UStaticMesh*> Meshes = Model.Staged;
+      if (Meshes.IsEmpty()) {
+        if (bSkippedNewMeshes) continue;
+        ImportStaticMeshAsset(AssetToolsModule, Model.File, MeshFolder, Model.Name,
+                              bIsModelAsset && !bIs3DAsset ? PlantProfile.bNanite : true, &Meshes);
+      }
+      if (Meshes.IsEmpty()) {
+        GAssetHiveImportFailed = true;
+        FailureMessage = TEXT("模型导入失败：") + Model.File;
+        continue;
+      }
+      for (UStaticMesh* Mesh : Meshes) {
+        const bool bBasePlantMesh = Model.bGroupedPlant && Mesh == Meshes[0];
+        const bool bExisting = Staging.Targets.Contains(Mesh);
+        if (!bExisting && bSkippedNewMeshes) continue;
+        if (!Model.Staged.IsEmpty() && !bExisting) {
+          Mesh = Cast<UStaticMesh>(Staging.PublishNewAsset(Mesh, Model.StageFolder, MeshFolder));
+          if (!Mesh) {
+            GAssetHiveImportFailed = true;
+            FailureMessage = TEXT("无法创建新网格：") + Model.File;
+            continue;
+          }
+        }
+        if (bBasePlantMesh) {
+          if (const auto* Lods = PlantLodsByVariant.Find(Model.Variant)) {
+            const int32 Merged = ImportPlantCustomLods(AssetToolsModule, Mesh, *Lods,
+                Dependencies.bMeshOnly ? Staging.GetFolder() : MeshFolder, Mesh->GetName());
+            const int32 ExpectedLods = static_cast<int32>(Algo::CountIf(*Lods, [](const FPlantModelLodEntry& Lod) { return Lod.LodIndex > 0; }));
+            if (bExisting && Merged != ExpectedLods) {
+              GAssetHiveImportFailed = true;
+              FailureMessage = TEXT("模型 LOD 导入不完整：") + Model.File;
+              continue;
+            }
+          }
+        }
+        ImportedMeshes.Add(Mesh);
+        SourceFileByMesh.Add(Mesh, Model.File);
+        VariantKeyByMesh.Add(Mesh, Model.Variant);
+        if (!bExisting && bCreateFoliageForAsset && bUsesFoliageFolders)
+          CreateFoliageTypeAsset(AssetFolder, Model.Name, Mesh, &Dependencies);
+        if (Model.bGroupedPlant && Model.Staged.IsEmpty()) break;
+      }
+    }
+    if (GAssetHiveImportFailed) continue;
     // OPAQUE foliage exports must not carry billboard textures or
     // MI_Billboard_* instances. New desktop payloads set billboardExcluded
     // explicitly, so a masked fallback variant cannot re-enable billboard.
@@ -9465,24 +9833,71 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         bNaniteMasked || bBillboardExcluded || bAllModelVariantsOpaque ||
         (!PlantExportMode.IsEmpty() && !PlantExportMode.Equals(TEXT("lod"), ESearchCase::IgnoreCase));
     TMap<UStaticMesh*, TArray<int32>> NamedGroupsByMesh;
-    TSet<int32> ReferencedNamedGroups;
-    if (bNamedZion3D) {
+    TMap<UStaticMesh*, TSet<int32>> NamedBillboardSlotsByMesh;
+    TSet<int32> ReferencedNamedGroups, NewMeshGroups;
+    if (bReadNamedDependencies) {
       // Read every imported model's authored slots before creating any MI.
       // Slot order and the model's variant number never select a material.
       TArray<FString> Unmatched;
+      TSet<FString> ExcludedPlantMaterials;
+      const TArray<TSharedPtr<FJsonValue>> *ExcludedNames = nullptr;
+      if (bNamedZionPlant && bSuppressBillboardExport &&
+          AssetObject->TryGetArrayField(TEXT("excludedPlantMaterialNames"), ExcludedNames) && ExcludedNames) {
+        for (const auto &Name : *ExcludedNames) {
+          if (Name.IsValid() && Name->Type == EJson::String)
+            ExcludedPlantMaterials.Add(AssetHiveZion3DMaterials::Key(Name->AsString()));
+        }
+      }
       for (UStaticMesh* Mesh : ImportedMeshes) {
         if (!Mesh) continue;
         TArray<int32>& Assignments = NamedGroupsByMesh.Add(Mesh);
         for (const FStaticMaterial& Slot : Mesh->GetStaticMaterials()) {
           const int32 Group = AssetHiveZion3DMaterials::FindGroup(Slot, NamedGroupsByName);
+          const int32 SlotIndex = Assignments.Num();
           Assignments.Add(Group);
-          if (Group == INDEX_NONE) {
+          const FString SlotKey = AssetHiveZion3DMaterials::Key(
+              (Slot.ImportedMaterialSlotName.IsNone() ? Slot.MaterialSlotName : Slot.ImportedMaterialSlotName).ToString());
+          if (bNamedZionPlant && (ExcludedPlantMaterials.Contains(SlotKey) ||
+              SourceTextureMaterialRoleByGroup.FindRef(Group) == TEXT("billboard"))) {
+            NamedBillboardSlotsByMesh.FindOrAdd(Mesh).Add(SlotIndex);
+            if (bSuppressBillboardExport) continue;
+          }
+          if (Group == INDEX_NONE && !Staging.Targets.Contains(Mesh)) {
             Unmatched.Add(FString::Printf(TEXT("%s: %s（原名 %s）"), *Mesh->GetName(),
                 *Slot.MaterialSlotName.ToString(), *Slot.ImportedMaterialSlotName.ToString()));
-          } else ReferencedNamedGroups.Add(Group);
+          } else if (Group != INDEX_NONE) {
+            ReferencedNamedGroups.Add(Group);
+            if (!Staging.Targets.Contains(Mesh)) NewMeshGroups.Add(Group);
+          }
         }
       }
-      if (!Unmatched.IsEmpty() || ReferencedNamedGroups.IsEmpty()) {
+      if (bNamedZionPlant && !bSuppressBillboardExport) {
+        const TArray<TSharedPtr<FJsonValue>> *Lods = nullptr;
+        if (AssetObject->TryGetArrayField(TEXT("modelLods"), Lods) && Lods) {
+          for (const auto &Lod : *Lods) {
+            if (!Lod.IsValid() || Lod->Type != EJson::Object) continue;
+            FString Role;
+            double GroupValue = 0;
+            const auto Object = Lod->AsObject();
+            Object->TryGetStringField(TEXT("materialRole"), Role);
+            if (!Role.Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) continue;
+            Object->TryGetNumberField(TEXT("materialGroupId"), GroupValue);
+            const int32 Group = static_cast<int32>(GroupValue);
+            if (!NamedMaterialNames.Contains(Group) ||
+                !SourceTextureMaterialRoleByGroup.FindRef(Group).Equals(TEXT("billboard"), ESearchCase::IgnoreCase)) {
+              Unmatched.Add(TEXT("Billboard LOD 缺少唯一对应的命名纹理组"));
+            } else {
+              ReferencedNamedGroups.Add(Group);
+              FString Variant;
+              if (!ReadModelVariantKey(Object, Variant) ||
+                  ImportedMeshes.ContainsByPredicate([&](UStaticMesh* Mesh) {
+                    return !Staging.Targets.Contains(Mesh) && VariantKeyByMesh.FindRef(Mesh) == Variant;
+                  })) NewMeshGroups.Add(Group);
+            }
+          }
+        }
+      }
+      if (Dependencies.bCreateMissing && (!Unmatched.IsEmpty() || ReferencedNamedGroups.IsEmpty())) {
         GAssetHiveImportFailed = true;
         FailureMessage = Unmatched.IsEmpty() ? TEXT("模型没有可匹配的材质槽")
             : TEXT("材质槽未找到同名纹理套组：") + FString::Join(Unmatched, TEXT("；"));
@@ -9490,6 +9905,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         continue;
       }
       for (const int32 Group : ReferencedNamedGroups) {
+        if (!bNamedZion3D || !NewMeshGroups.Contains(Group)) continue;
         bool bMasked = false;
         if (const auto* Slots = SourceTextureSlotMapByGroup.Find(Group)) {
           for (const auto& Slot : *Slots) bMasked |= Slot.Value == TEXT("opacity");
@@ -9507,7 +9923,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     const TArray<TSharedPtr<FJsonValue>> *TextureFiles = nullptr;
-    if (AssetObject->TryGetArrayField(TEXT("textureFiles"), TextureFiles) &&
+    const bool bProcessDependencies = Dependencies.bCreateMissing || bReadNamedDependencies;
+    if (bProcessDependencies && AssetObject->TryGetArrayField(TEXT("textureFiles"), TextureFiles) &&
         TextureFiles != nullptr) {
       for (const TSharedPtr<FJsonValue> &FileValue : *TextureFiles) {
         if (!FileValue.IsValid() || FileValue->Type != EJson::String) {
@@ -9524,7 +9941,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             SourceTextureGroupByPath.Contains(SourceKey)
                 ? FMath::Max(1, SourceTextureGroupByPath[SourceKey])
                 : 1;
-        if (bNamedZion3D) {
+        TGuardValue<bool> GroupCreation(Dependencies.bCreateMissing,
+            Dependencies.bCreateMissing && (!bReadNamedDependencies || NewMeshGroups.Contains(GroupId)));
+        if (bNamedZionMaterial) {
           if (!ReferencedNamedGroups.Contains(GroupId)) continue;
           if (const FSharedZion3DMaterial* Existing = SharedZion3DMaterials.Find(NamedMaterialCacheKeys.FindRef(GroupId))) {
             TextureBySlotByGroup.FindOrAdd(GroupId) = Existing->Textures;
@@ -9620,9 +10039,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         }
         FString ImportedTextureName = ConfiguredObjectName;
         if (ImportedTextureName.IsEmpty()) {
-          if (bNamedZion3D) {
+          if (bNamedZionMaterial) {
             ImportedTextureName = FString::Printf(TEXT("T_%s_%s"),
-                *NamedMaterialNames.FindRef(GroupId), *To3DTextureSlotSuffix(SlotName));
+                *NamedMaterialNames.FindRef(GroupId),
+                *(bNamedZionPlant && SlotName == TEXT("albedo") ? FString(TEXT("D")) : To3DTextureSlotSuffix(SlotName)));
           } else if (bIs3DAsset) {
             const FString GroupSegment =
                 bMultipleTextureGroups
@@ -9640,6 +10060,11 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                     : FString::Printf(TEXT("T_%s_%s"), *AssetStem,
                                       *ToSlotSuffix(SlotName));
           }
+        }
+        UTexture* ExistingTexture = nullptr;
+        if (Dependencies.Reuse(TextureFolder, ImportedTextureName, ExistingTexture)) {
+          if (ExistingTexture) TextureBySlotByGroup.FindOrAdd(GroupId).Add(SlotName, ExistingTexture);
+          continue;
         }
         Task->DestinationName = ImportedTextureName;
         Task->bReplaceExisting = true;
@@ -9811,6 +10236,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     if (GroupIds.Num() == 0) {
       GroupIds.Add(1);
     }
+    if (!bProcessDependencies) GroupIds.Reset();
     // md §5.2（2026-09-30）：3D Plants 的材质槽顺序对齐 FBX 材质顺序——Atlas
     // （非 billboard）组排在 billboard 组之前。Megascans 的 Billboard 贴图条目
     // 可能先于 Atlas 入库并拿到更小的 groupId，若直接按 groupId 排序，网格首个
@@ -9836,25 +10262,13 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     TArray<int32> MaterialGroupIds;
     TArray<int32> OpaqueMaterialGroupIds;
     // Zion 按最终槽位角色和风参数创建实例，组阶段只保存纹理输入。
-    struct FZionPlantMaterialInputs {
-      FString MaterialStem;
-      FString ParentPath;
-      UTexture *Diffuse = nullptr;
-      UTexture *Normal = nullptr;
-      UTexture *ORM = nullptr;
-      UTexture *Opacity = nullptr;
-      UTexture *Subsurface = nullptr;
-      FString MaterialRole;
-      bool bUseVT = false;
-      EPlantSyntheticWind WindStyle = EPlantSyntheticWind::None;
-    };
     TMap<int32, FZionPlantMaterialInputs> ZionPlantInputsByGroup;
     TArray<int32> ZionPlantMaterialGroups;
     TMap<FString, UMaterialInstanceConstant *> ZionPlantSlotInstances;
     TMap<FString, FString> ZionPlantNamesByIdentity;
     TSet<FName> ZionPlantUsedMaterialNames;
-    const bool bUseZionSlotMaterials = AssetType == TEXT("3dplant") && !bMicroPlant &&
-        (!ZionPlantParentMaterialPath.IsEmpty() || bHasZionNativeWind);
+    const bool bUseZionSlotMaterials = bNamedZionPlant ||
+        (AssetType == TEXT("3dplant") && !bMicroPlant && (!ZionPlantParentMaterialPath.IsEmpty() || bHasZionNativeWind));
     // A material group uses the median original LOD0 height. A pure Opaque
     // job must use the same source measurements as its masked counterpart.
     TMap<UStaticMesh*,UStaticMesh*> PreloadedWindSources;
@@ -9887,7 +10301,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           Height = float(Z);
           SourceFile = Original;
         } else if (bCut && !Original.IsEmpty() && (!LayerSources || Variant)) {
-          UStaticMesh* Base = ImportStaticMeshAsset(AssetToolsModule, Original, AssetFolder,
+          UStaticMesh* Base = ImportStaticMeshAsset(AssetToolsModule, Original, Dependencies.bMeshOnly ? Staging.GetFolder() : AssetFolder,
               FString::Printf(TEXT("TEMP_WINDCARDS_%s"),*Mesh->GetName()),Variant.IsValid() && PlantProfile.bNanite);
           PreloadedWindSources.Add(Mesh,Base);
           if (Base) {
@@ -9920,6 +10334,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     for (const int32 GroupId : GroupIds) {
+      TGuardValue<bool> GroupCreation(Dependencies.bCreateMissing,
+          Dependencies.bCreateMissing && (!bReadNamedDependencies || NewMeshGroups.Contains(GroupId)));
+      if (bNamedZionPlant && !ReferencedNamedGroups.Contains(GroupId)) continue;
       if (bNamedZion3D) {
         if (!ReferencedNamedGroups.Contains(GroupId)) continue;
         if (const FSharedZion3DMaterial* Existing = SharedZion3DMaterials.Find(NamedMaterialCacheKeys.FindRef(GroupId))) {
@@ -9941,24 +10358,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           GroupIds.Num() > 1
               ? FString::Printf(TEXT("%s_%03d"), *AssetStem, GroupId)
               : AssetStem;
-      // 3D Plants 命名（2026-09-30 定稿，仅 FBX 原始资产）：纹理不带变体号、
-      // 不带分辨率；材质实例带主变体号；多变体组沿用 _00N 组号段。
-      const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
-      const FString PlantTextureStem =
-          bFbxPlantAsset
-              ? (GroupIds.Num() > 1
-                     ? FString::Printf(TEXT("%s_%03d"), *PlantObjectStem,
-                                       GroupId)
-                     : PlantObjectStem)
-              : GroupStem;
-      const FString PlantMaterialStem =
-          bFbxPlantAsset
-              ? (GroupIds.Num() > 1
-                     ? FString::Printf(TEXT("%s_%03d_%s"), *PlantObjectStem,
-                                       GroupId, *PrimaryModelVariantKey)
-                     : FString::Printf(TEXT("%s_%s"), *PlantObjectStem,
-                                       *PrimaryModelVariantKey))
-              : GroupStem;
       UMaterialInstanceConstant *MaterialInstance = nullptr;
       UMaterialInstanceConstant *OpaqueMaterialInstance = nullptr;
       if (bIsHdri) {
@@ -10020,14 +10419,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 : FString::Printf(
                 TEXT("T_%s_%s%s_ORM"), *EnvironmentStem,
                 *PrimaryModelVariantKey, *ORMGroup);
-            ORMTexture = CreatePackedORMTexture(
-                AssetFolder, ORMAssetName, AOTexture, RoughnessTexture,
-                MetallicTexture,
-                Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("albedo"))),
-                Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("normal"))));
+            if (!Dependencies.Reuse(AssetFolder, ORMAssetName, ORMTexture)) {
+              ORMTexture = CreatePackedORMTexture(
+                  AssetFolder, ORMAssetName, AOTexture, RoughnessTexture, MetallicTexture,
+                  Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("albedo"))),
+                  Cast<UTexture2D>(TextureBySlot.FindRef(TEXT("normal"))));
+            }
           }
         }
-        if (ORMTexture) {
+        if (ORMTexture && !Dependencies.Kept.Contains(ORMTexture)) {
           Apply3DAssetTexturePreset(ORMTexture, TEXT("orm"),
                                     EnvironmentProfile, bUseVT);
         }
@@ -10044,9 +10444,22 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             MaterialFolder, MaterialName, EnvironmentProfile,
             TextureBySlot.FindRef(TEXT("albedo")),
             TextureBySlot.FindRef(TEXT("normal")), ORMTexture, MegaMaskTexture,
-            OpacityTexture, TextureBySlot.FindRef(TEXT("emissive")), bMasked);
+            OpacityTexture, TextureBySlot.FindRef(TEXT("emissive")), bMasked, &Dependencies);
       } else {
         if (AssetType == TEXT("3dplant")) {
+          const FString PlantMaterialStem = BuildPlantMaterialStem(PlantDisplayName,
+              NamedMaterialNames.FindRef(GroupId), GroupId,
+              bNamedZionPlant ? ReferencedNamedGroups.Num() > 1 : GroupIds.Num() > 1);
+          if (bNamedZionPlant) {
+            if (const auto *Shared = SharedZionPlantTextureInputs.Find(NamedMaterialCacheKeys.FindRef(GroupId))) {
+              auto Inputs = *Shared;
+              Inputs.MaterialStem = PlantMaterialStem;
+              ZionPlantInputsByGroup.Add(GroupId, MoveTemp(Inputs));
+              ZionPlantMaterialGroups.Add(GroupId);
+              UE_LOG(LogTemp, Display, TEXT("AssetHive: %s 复用植被纹理套组 %s"), *AssetName, *PlantMaterialStem);
+              continue;
+            }
+          }
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 22, 0, 99)),
               FString::Printf(TEXT("合成 Albedo+Opacity 贴图: %s"),
@@ -10058,38 +10471,33 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                              SourceTextureBySlot[SlotKey])
                        : nullptr;
           };
-          const FString TextureStem = PlantTextureStem;
+          const FString &TextureStem = PlantMaterialStem;
+          auto PlantTexture = [&](const TCHAR* Suffix, const FString& File, EPlantTextureKind Kind) -> UTexture2D* {
+            if (File.IsEmpty()) return nullptr;
+            const FString Name = FString::Printf(TEXT("T_%s_%s"), *TextureStem, Suffix);
+            UTexture2D* Existing = nullptr;
+            if (Dependencies.Reuse(TextureFolder, Name, Existing)) return Existing;
+            return CreatePlantTextureAsset(TextureFolder, Name, FImageUtils::ImportFileAsTexture2D(File), Kind, PlantProfile, bUseVT);
+          };
 
           // md §5.2：植被贴图按 Diffuse（albedo 代用，D）/ Normal（N）/
           // ORM / OpacityMasked（O，masked 资产）分张导出，类型用缩写。
-          UTexture2D *DiffuseTexture = CreatePlantTextureAsset(
-              TextureFolder, FString::Printf(TEXT("T_%s_D"), *TextureStem),
-              ImportPlantSource(TEXT("albedo")), EPlantTextureKind::Diffuse,
-              PlantProfile, bUseVT);
+          UTexture2D *DiffuseTexture = PlantTexture(TEXT("D"), SourceTextureBySlot.FindRef(TEXT("albedo")), EPlantTextureKind::Diffuse);
 
           SetStageProgress(
               static_cast<float>(FMath::Clamp(AssetBaseProgress + 24, 0, 99)),
               FString::Printf(TEXT("导出 Normal 贴图: %s"), *AssetName), false);
-          UTexture2D *NormalTexture = CreatePlantTextureAsset(
-              TextureFolder, FString::Printf(TEXT("T_%s_N"), *TextureStem),
-              ImportPlantSource(TEXT("normal")), EPlantTextureKind::Normal,
-              PlantProfile, bUseVT);
+          UTexture2D *NormalTexture = PlantTexture(TEXT("N"), SourceTextureBySlot.FindRef(TEXT("normal")), EPlantTextureKind::Normal);
 
           UTexture2D *ORMTexture = nullptr;
           if (SourceTextureBySlot.Contains(TEXT("orm"))) {
-            ORMTexture = CreatePlantTextureAsset(
-                TextureFolder, FString::Printf(TEXT("T_%s_ORM"), *TextureStem),
-                ImportPlantSource(TEXT("orm")), EPlantTextureKind::ORM,
-                PlantProfile, bUseVT);
+            ORMTexture = PlantTexture(TEXT("ORM"), SourceTextureBySlot.FindRef(TEXT("orm")), EPlantTextureKind::ORM);
           } else {
-            UTexture2D *AOSource = ImportPlantSource(TEXT("ao"));
-            UTexture2D *RoughnessSource = ImportPlantSource(TEXT("roughness"));
-            UTexture2D *MetallicSource = ImportPlantSource(TEXT("metalness"));
-            if (AOSource || RoughnessSource || MetallicSource) {
-              ORMTexture = CreatePackedORMTexture(
-                  TextureFolder, FString::Printf(TEXT("T_%s_ORM"), *TextureStem),
-                  AOSource, RoughnessSource, MetallicSource, DiffuseTexture,
-                  NormalTexture);
+            const FString Name = FString::Printf(TEXT("T_%s_ORM"), *TextureStem);
+            if ((SourceTextureBySlot.Contains(TEXT("ao")) || SourceTextureBySlot.Contains(TEXT("roughness")) ||
+                 SourceTextureBySlot.Contains(TEXT("metalness"))) && !Dependencies.Reuse(TextureFolder, Name, ORMTexture)) {
+              ORMTexture = CreatePackedORMTexture(TextureFolder, Name, ImportPlantSource(TEXT("ao")), ImportPlantSource(TEXT("roughness")),
+                  ImportPlantSource(TEXT("metalness")), DiffuseTexture, NormalTexture);
               if (ORMTexture) {
                 ORMTexture->PreEditChange(nullptr);
                 ApplyPlantTexturePreset(ORMTexture, EPlantTextureKind::ORM,
@@ -10103,11 +10511,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           }
 
           UTexture2D *OpacityMaskTexture = nullptr;
-          if (SourceTextureBySlot.Contains(TEXT("opacity"))) {
-            OpacityMaskTexture = CreatePlantTextureAsset(
-                TextureFolder, FString::Printf(TEXT("T_%s_O"), *TextureStem),
-                ImportPlantSource(TEXT("opacity")),
-                EPlantTextureKind::OpacityMasked, PlantProfile, bUseVT);
+          const bool bOpacityInDiffuseAlpha = DiffuseTexture && DiffuseAlphaGroups.Contains(GroupId);
+          if (!bOpacityInDiffuseAlpha && SourceTextureBySlot.Contains(TEXT("opacity"))) {
+            OpacityMaskTexture = PlantTexture(TEXT("O"), SourceTextureBySlot.FindRef(TEXT("opacity")), EPlantTextureKind::OpacityMasked);
           }
 
           // SSC（SubsurfaceColor）：Megascans 植被的 Translucency（T）贴图，
@@ -10120,10 +10526,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           }
           UTexture2D *SubsurfaceTexture = nullptr;
           if (!SubsurfaceSourcePath.IsEmpty()) {
-            SubsurfaceTexture = CreatePlantTextureAsset(
-                TextureFolder, FString::Printf(TEXT("T_%s_SSC"), *TextureStem),
-                FImageUtils::ImportFileAsTexture2D(SubsurfaceSourcePath),
-                EPlantTextureKind::SubsurfaceColor, PlantProfile, bUseVT);
+            SubsurfaceTexture = PlantTexture(TEXT("SSC"), SubsurfaceSourcePath, EPlantTextureKind::SubsurfaceColor);
           }
 
           SetStageProgress(
@@ -10132,7 +10535,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           // Billboard 共用该类的 Shared 预设，由独立实例关闭局部层级。
           const EPlantSyntheticWind PlantWindStyle = PlantProfile.SyntheticWind;
           if (PlantWindStyle != EPlantSyntheticWind::None || !ZionPlantParentMaterialPath.IsEmpty()) {
-            MatchPlantWindTextureStreaming({DiffuseTexture, NormalTexture, ORMTexture, SubsurfaceTexture, OpacityMaskTexture});
+            MatchPlantWindTextureStreaming({DiffuseTexture, NormalTexture, ORMTexture, SubsurfaceTexture, OpacityMaskTexture},
+                                          Dependencies.Kept);
           }
           {
             FZionPlantMaterialInputs Inputs;
@@ -10142,10 +10546,25 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             Inputs.Normal = NormalTexture;
             Inputs.ORM = ORMTexture;
             Inputs.Opacity = OpacityMaskTexture;
+            Inputs.bOpacityInDiffuseAlpha = bOpacityInDiffuseAlpha;
             Inputs.Subsurface = SubsurfaceTexture;
             Inputs.MaterialRole = MaterialRole;
             Inputs.bUseVT = bUseVT;
             Inputs.WindStyle = PlantWindStyle;
+            const bool bCompleteExistingSet = !SourceTextureBySlot.IsEmpty() &&
+                (!SourceTextureBySlot.Contains(TEXT("albedo")) || DiffuseTexture) &&
+                (!SourceTextureBySlot.Contains(TEXT("normal")) || NormalTexture) &&
+                (!SourceTextureBySlot.Contains(TEXT("orm")) || ORMTexture) &&
+                (SubsurfaceSourcePath.IsEmpty() || SubsurfaceTexture) &&
+                (!SourceTextureBySlot.Contains(TEXT("opacity")) || bOpacityInDiffuseAlpha || OpacityMaskTexture);
+            if (bNamedZionPlant && (Dependencies.bCreateMissing || bCompleteExistingSet)) {
+              const FString CacheKey = NamedMaterialCacheKeys.FindRef(GroupId);
+              SharedZionPlantTextureInputs.Add(CacheKey, Inputs);
+              auto &Shared = SharedZion3DMaterials.FindOrAdd(CacheKey);
+              Shared.Signature = NamedMaterialSignatures.FindRef(GroupId);
+              Shared.ParentType = NamedParentType;
+              Shared.Textures = TextureBySlotByGroup.FindRef(GroupId);
+            }
             ZionPlantInputsByGroup.Add(GroupId, MoveTemp(Inputs));
             ZionPlantMaterialGroups.Add(GroupId);
           }
@@ -10156,7 +10575,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 ORMTexture, OpacityMaskTexture, SubsurfaceTexture, MaterialRole,
                 bUseVT, /*bOpaque=*/false, PlantWindStyle,
                 ZionPlantParentMaterialPath, bIsZionAsset, PlantHeightCm,LayerSource.Get(),DecodeBounds,
-                bNaniteMasked || !NaniteMaskedModelVariantKeys.IsEmpty());
+                bNaniteMasked || !NaniteMaskedModelVariantKeys.IsEmpty(), false, bOpacityInDiffuseAlpha, &Dependencies);
           }
           // md §5.2：OPAQUE 裁切变体不创建 billboard 材质实例。
           if (bHasOpaqueModelVariant && !bSyntheticTreeSlots && !bUseZionSlotMaterials &&
@@ -10167,7 +10586,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 MaterialFolder, PlantMaterialStem, DiffuseTexture, NormalTexture,
                 ORMTexture, nullptr, SubsurfaceTexture, MaterialRole, bUseVT,
                 /*bOpaque=*/true, PlantWindStyle, ZionPlantParentMaterialPath,
-                bIsZionAsset, PlantHeightCm,LayerSource.Get(),DecodeBounds);
+                bIsZionAsset, PlantHeightCm,LayerSource.Get(),DecodeBounds, false, false, false, &Dependencies);
           }
         } else {
           SetStageProgress(
@@ -10244,10 +10663,19 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         OpaqueMaterialGroupIds.Add(GroupId);
       }
     }
+    if (bNamedZionPlant) {
+      ImportedMeshes.Remove(nullptr);
+      ImportedMeshes.StableSort([](const UStaticMesh &A, const UStaticMesh &B) {
+        return AssetHiveZionPlantReuse::NaturalLess(A.GetName(), B.GetName());
+      });
+    }
     for (UStaticMesh *StaticMesh : ImportedMeshes) {
       if (!StaticMesh) {
         continue;
       }
+      UStaticMesh* ReimportTarget = Staging.Targets.FindRef(StaticMesh);
+      const FString MeshIdentity = (ReimportTarget ? ReimportTarget : StaticMesh)->GetPathName();
+      TGuardValue<bool> MeshCreation(Dependencies.bCreateMissing, Dependencies.bCreateMissing && !ReimportTarget);
       // Reimport can preserve custom source LODs from an earlier Masked + LOD export.
       const FString MeshVariantKey = VariantKeyByMesh.FindRef(StaticMesh);
       const bool bMeshNaniteMasked = bNaniteMasked || NaniteMaskedModelVariantKeys.Contains(NormalizeModelVariantKey(MeshVariantKey));
@@ -10315,7 +10743,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           const FString ReferenceFile = WindReferenceFiles.FindRef(StaticMesh);
           if (!ReferenceFile.IsEmpty()) {
             if (!PreloadedWindSources.RemoveAndCopyValue(StaticMesh,TempWindReferenceMesh)) {
-              TempWindReferenceMesh = ImportStaticMeshAsset(AssetToolsModule, ReferenceFile, AssetFolder,
+              TempWindReferenceMesh = ImportStaticMeshAsset(AssetToolsModule, ReferenceFile, Dependencies.bMeshOnly ? Staging.GetFolder() : AssetFolder,
                   FString::Printf(TEXT("TEMP_WINDCARDS_%s"), *StaticMesh->GetName()), LayerVariant.IsValid() && PlantProfile.bNanite);
             }
             if (!TempWindReferenceMesh) {
@@ -10451,6 +10879,27 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       } else {
         GetMutableNaniteSettings(StaticMesh)->bEnabled = true;
       }
+      if (ReimportTarget) {
+        TSet<int32> BillboardLods = GetSharedOnlyPlantLods(GetZionWindObject(LayerSources, *MeshVariantKey));
+        if (const auto* Lods = PlantLodsByVariant.Find(MeshVariantKey)) {
+          for (const auto& Lod : *Lods) if (Lod.bBillboard) BillboardLods.Add(Lod.LodIndex);
+        }
+        if (!GAssetHiveImportFailed) {
+          if (!ReplaceAssetHiveMeshGeometry(ReimportTarget, StaticMesh, SourceFileByMesh.FindRef(StaticMesh), BillboardLods)) {
+            GAssetHiveImportFailed = true;
+            FailureMessage = TEXT("网格没有可替换的 LOD0：") + MeshIdentity;
+          } else if (bIs3DAsset) {
+            Configure3DAssetCollision(ReimportTarget);
+          } else {
+            ConfigurePlantAssetCollision(ReimportTarget, PlantProfile);
+          }
+        }
+        // Only named plants need the following lookup to seed shared MIs for new variants.
+        if (!bReadNamedDependencies || !bNamedZionPlant || GAssetHiveImportFailed) {
+          StaticMesh->PostEditChange();
+          continue;
+        }
+      }
       TArray<FStaticMaterial> &Slots = StaticMesh->GetStaticMaterials();
       const bool bUseZionSlotsForMesh = bUseZionSlotMaterials || bSyntheticTreeSlots;
       const bool bUseOpaqueMaterialSet =
@@ -10470,14 +10919,16 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // section 会重映射回 Atlas 槽位，槽位本身再从网格材质列表里移除。
       TArray<int32> BillboardSlotIndexes;
       int32 AtlasSlotIndex = INDEX_NONE;
+      const TSet<int32> *NamedBillboardSlots = NamedBillboardSlotsByMesh.Find(StaticMesh);
       for (int32 SlotIndex = 0; SlotIndex < Slots.Num(); ++SlotIndex) {
         UMaterialInterface *Existing = Slots[SlotIndex].MaterialInterface;
-        if (Existing && PlantPackageMetadata(Existing->GetPackage()->GetMetaData()).GetValue(
-            Existing, TEXT("AssetHivePlantMaterialRole")) == TEXT("billboard")) {
+        if ((NamedBillboardSlots && NamedBillboardSlots->Contains(SlotIndex)) ||
+            (Existing && PlantPackageMetadata(Existing->GetPackage()->GetMetaData()).GetValue(
+             Existing, TEXT("AssetHivePlantMaterialRole")) == TEXT("billboard"))) {
           BillboardSlotIndexes.Add(SlotIndex);
         } else if (AtlasSlotIndex == INDEX_NONE) AtlasSlotIndex = SlotIndex;
       }
-      if (bOpaqueMesh || bSuppressBillboardExport) {
+      if (!bNamedZionPlant && (bOpaqueMesh || bSuppressBillboardExport)) {
         for (int32 SlotIndex = 0;
              SlotIndex < Slots.Num() && SlotIndex < GroupIds.Num(); ++SlotIndex) {
           if (IsBillboardGroup(GroupIds[SlotIndex])) {
@@ -10519,10 +10970,20 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             FailureMessage = FString::Printf(TEXT("%s 材质槽 %s 的实例创建失败"),
                 *StaticMesh->GetName(), *Slots[Index].MaterialSlotName.ToString());
           }
-        } else if (bUseZionSlotsForMesh && AtlasMaterialGroups.Num() > 0) {
-          const int32 GroupId = AtlasMaterialGroups[
-              FMath::Min(Index, AtlasMaterialGroups.Num() - 1)];
-          const FZionPlantMaterialInputs &Inputs = ZionPlantInputsByGroup.FindChecked(GroupId);
+        } else if (bUseZionSlotsForMesh && (bNamedZionPlant || AtlasMaterialGroups.Num() > 0)) {
+          const TArray<int32> *NamedAssignments = bNamedZionPlant ? NamedGroupsByMesh.Find(StaticMesh) : nullptr;
+          const int32 GroupId = bNamedZionPlant
+              ? (NamedAssignments && NamedAssignments->IsValidIndex(Index) ? (*NamedAssignments)[Index] : INDEX_NONE)
+              : AtlasMaterialGroups[FMath::Min(Index, AtlasMaterialGroups.Num() - 1)];
+          const auto *MatchedInputs = ZionPlantInputsByGroup.Find(GroupId);
+          if (!MatchedInputs) {
+            if (ReimportTarget) continue;
+            GAssetHiveImportFailed = true;
+            FailureMessage = FString::Printf(TEXT("%s 的材质槽 %s 缺少对应植被纹理套组"),
+                *StaticMesh->GetName(), *Slots[Index].ImportedMaterialSlotName.ToString());
+            continue;
+          }
+          const FZionPlantMaterialInputs &Inputs = *MatchedInputs;
           FString RoleSuffix;
           if (BillboardSlotIndexes.Contains(Index)) continue;
           const FString SlotName = Slots[Index].MaterialSlotName.ToString();
@@ -10540,33 +11001,53 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
               : TSharedPtr<FJsonObject>();
           const bool bApplyNativeWind = bHasZionNativeWind &&
               (!bRequiresWindSlotMatch || MaterialWind.IsValid());
-          FString WindIdentity;
-          bool bHasDeclaration = false;
-          const bool bUseUV3 = bApplyNativeWind && ResolveZionNativeUV3(
-              NativePlantWind, MaterialWind, bNativeMeshHasUV3, bHasDeclaration);
           if (bHasZionNativeWind) {
             if (!bApplyNativeWind) {
-              WindIdentity = FString::Printf(TEXT("unmatched:%d"), Index);
               UE_LOG(LogTemp, Warning,
                      TEXT("AssetHive: %s 槽位 %s（原名 %s）的 Wind 条目%s；未套用其他槽位或公共风参数"),
                      *StaticMesh->GetName(), *Slots[Index].MaterialSlotName.ToString(),
                      *Slots[Index].ImportedMaterialSlotName.ToString(),
                      bAmbiguousWind ? TEXT("重名，无法唯一匹配") : TEXT("未匹配"));
-            } else {
-              WindIdentity = WindMaterialIndex == INDEX_NONE
-                  ? TEXT("common")
-                  : FString::Printf(TEXT("entry:%d"), WindMaterialIndex);
-              WindIdentity += bUseUV3 ? TEXT(":uv3") : TEXT(":no_uv3");
             }
           }
           const FString RolePart = RoleSuffix.IsEmpty() ? FString() : TEXT("_") + RoleSuffix;
-          const FString InstanceKey = FString::Printf(TEXT("%d|%s|%s"), GroupId,
-                                                       *ParentPath, *WindIdentity);
-          const FString CacheKey = bOpaqueMesh ? InstanceKey + TEXT("|opaque") : InstanceKey;
-          Material = ZionPlantSlotInstances.FindRef(CacheKey);
+          bool bRemapDeclared = false;
+          const bool bRemappedUV3Requested = bApplyNativeWind &&
+              ResolveZionNativeUV3(NativePlantWind, MaterialWind, true, bRemapDeclared);
+          const FString UV3Proof = bRemappedUV3Requested
+              ? AssetHiveZionPlantReuse::RemapProof(NativePlantWind, MaterialWind, bNativeMeshHasUV3) : FString();
+          const FString NativeParameters = bNamedZionPlant ? FString()
+              : AssetHiveZionPlantReuse::WindKey(NativePlantWind, MaterialWind);
+          const FString Scope = bNamedZionPlant ? NamedMaterialCacheKeys.FindRef(GroupId)
+              : FString::Printf(TEXT("group:%d|wind:%d|unmatched:%d"), GroupId, WindMaterialIndex,
+                  bHasZionNativeWind && !bApplyNativeWind ? Index : INDEX_NONE);
+          const FString WindCompatibility = bNamedZionPlant && bApplyNativeWind ? FString()
+              : FString::Printf(TEXT("%.17g|%.17g|%.17g|%.17g|%.17g|%.17g|%.17g|"),
+                  PlantHeightCm, DecodeBounds.Min.X, DecodeBounds.Min.Y, DecodeBounds.Min.Z,
+                  DecodeBounds.Max.X, DecodeBounds.Max.Y, DecodeBounds.Max.Z) +
+              NativeParameters + TEXT("|") + AssetHiveZionPlantReuse::ObjectKey(LayerSource);
+          const FString Compatibility = Scope + TEXT("|") + ParentPath + TEXT("|") + RoleSuffix + TEXT("|") + Inputs.MaterialRole +
+              FString::Printf(TEXT("|%d|%d|%d|%d|%d|"),
+                  bOpaqueMesh, bMeshNaniteMasked, Inputs.bUseVT, static_cast<int32>(Inputs.WindStyle), bApplyNativeWind) + WindCompatibility;
+          // 原生风的普通参数由首个变体提供；UV3 缺失、解码不全或槽位未唯一匹配时仍按变体隔离。
+          const bool bUnproven = (!bNamedZionPlant && NativeParameters.IsEmpty()) || (bHasZionNativeWind && !bApplyNativeWind);
+          const FString InstanceKey = AssetHiveZionPlantReuse::InstanceKey(
+              Compatibility, MeshIdentity, bRemappedUV3Requested || bUnproven,
+              bUnproven ? FString() : UV3Proof);
+          const FString CacheKey = InstanceKey;
+          Material = bNamedZionPlant ? SharedZionPlantInstances.FindRef(CacheKey)
+                                    : ZionPlantSlotInstances.FindRef(CacheKey);
+          if (Material && bNamedZionPlant) {
+            UE_LOG(LogTemp, Display, TEXT("AssetHive: %s 复用兼容植被材质 %s%s"), *StaticMesh->GetName(),
+                *Material->GetPathName(), bRemappedUV3Requested ? TEXT("（UV3 解码一致，风参数沿用默认变体）") : TEXT(""));
+          }
           if (!Material) {
+            FString MaterialStem = Inputs.MaterialStem + RolePart;
+            if (bRemappedUV3Requested && (!bNamedZionPlant || UV3Proof.IsEmpty())) {
+              MaterialStem = Inputs.MaterialStem + TEXT("_") + MakeSafeObjectName(MeshVariantKey) + RolePart;
+            }
             const FString MaterialName = ReserveZionPlantMaterialName(
-                Inputs.MaterialStem + RolePart, InstanceKey,
+                MaterialStem, InstanceKey,
                 ZionPlantNamesByIdentity, ZionPlantUsedMaterialNames);
             Material = CreatePlantMaterialInstance(
                 MaterialFolder, MaterialName,
@@ -10574,13 +11055,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                 (bOpaqueMesh || (bSyntheticTreeSlots && !RoleSuffix.IsEmpty())) ? nullptr : Inputs.Opacity,
                 Inputs.Subsurface, Inputs.MaterialRole, Inputs.bUseVT,
                 bOpaqueMesh, Inputs.WindStyle, ParentPath,
-                /*bAutoMasked=*/true, PlantHeightCm,LayerSource.Get(),DecodeBounds, bMeshNaniteMasked);
+                /*bAutoMasked=*/true, PlantHeightCm,LayerSource.Get(),DecodeBounds, bMeshNaniteMasked, false,
+                Inputs.bOpacityInDiffuseAlpha && !(bSyntheticTreeSlots && !RoleSuffix.IsEmpty()), &Dependencies);
             if (Material) {
-              if (bApplyNativeWind) {
+              if (bApplyNativeWind && !Dependencies.Kept.Contains(Material)) {
                 ApplyZionNativeWindParameters(Material, NativePlantWind, MaterialWind,
                                                bNativeMeshHasUV3);
               }
               ZionPlantSlotInstances.Add(CacheKey, Material);
+              if (bNamedZionPlant) SharedZionPlantInstances.Add(CacheKey, Material);
             }
           }
         } else if (MeshMaterials.Num() > 0) {
@@ -10622,29 +11105,53 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (GroupId == INDEX_NONE && BillboardGroups.Num() == 1) GroupId = BillboardGroups[0];
           const FZionPlantMaterialInputs *Inputs = ZionPlantInputsByGroup.Find(GroupId);
           if (!Inputs || !IsBillboardGroup(GroupId)) {
+            if (ReimportTarget) continue;
             GAssetHiveImportFailed = true;
             UE_LOG(LogTemp, Error, TEXT("AssetHive: %s LOD%d requires an unambiguous Billboard texture group"), *StaticMesh->GetName(), Lod.Key);
             continue;
           }
-          const FString CacheKey = FString::Printf(TEXT("billboard|%d|%s"), GroupId, *Inputs->ParentPath);
-          UMaterialInstanceConstant *Material = ZionPlantSlotInstances.FindRef(CacheKey);
+          const bool bStaticBillboard = bMicroPlant ||
+              (!bHasZionNativeWind && PlantProfile.SyntheticWind == EPlantSyntheticWind::None);
+          bool bRemapDeclared = false;
+          const bool bRemappedUV3 = bHasZionNativeWind && ResolveZionNativeUV3(NativePlantWind, {}, true, bRemapDeclared);
+          const FString Scope = bNamedZionPlant ? NamedMaterialCacheKeys.FindRef(GroupId) : FString::FromInt(GroupId);
+          const FString WindCompatibility = bNamedZionPlant && bHasZionNativeWind ? FString()
+              : FString::Printf(TEXT("%.17g|%.17g|%.17g|%.17g|%.17g|%.17g|%.17g|"), PlantHeightCm,
+                  DecodeBounds.Min.X, DecodeBounds.Min.Y, DecodeBounds.Min.Z,
+                  DecodeBounds.Max.X, DecodeBounds.Max.Y, DecodeBounds.Max.Z) +
+              AssetHiveZionPlantReuse::WindKey(NativePlantWind, {}) + TEXT("|") + AssetHiveZionPlantReuse::ObjectKey(LayerSource);
+          const FString Compatibility = TEXT("billboard|") + Scope + TEXT("|") + Inputs->ParentPath +
+              FString::Printf(TEXT("|%d|%d|%d|"), bStaticBillboard, Inputs->bUseVT, static_cast<int32>(Inputs->WindStyle)) + WindCompatibility;
+          const bool bUnprovenWind = !bNamedZionPlant && AssetHiveZionPlantReuse::WindKey(NativePlantWind, {}).IsEmpty();
+          const FString BillboardProof = bUnprovenWind ? FString() : AssetHiveZionPlantReuse::RemapProof(NativePlantWind, {}, bNativeMeshHasUV3);
+          const FString CacheKey = AssetHiveZionPlantReuse::InstanceKey(Compatibility,
+              MeshIdentity + FString::FromInt(Lod.Key), bRemappedUV3 || bUnprovenWind,
+              BillboardProof);
+          UMaterialInstanceConstant *Material = bNamedZionPlant ? SharedZionPlantInstances.FindRef(CacheKey)
+                                                              : ZionPlantSlotInstances.FindRef(CacheKey);
           if (!Material) {
-            const bool bStaticBillboard = bMicroPlant ||
-                (!bHasZionNativeWind && PlantProfile.SyntheticWind == EPlantSyntheticWind::None);
-            Material = CreatePlantMaterialInstance(MaterialFolder, Inputs->MaterialStem,
+            const FString BillboardStem = bRemappedUV3 && BillboardProof.IsEmpty()
+                ? Inputs->MaterialStem + TEXT("_") + MakeSafeObjectName(MeshVariantKey)
+                : Inputs->MaterialStem;
+            const FString BillboardName = ReserveZionPlantMaterialName(BillboardStem, CacheKey, ZionPlantNamesByIdentity, ZionPlantUsedMaterialNames);
+            Material = CreatePlantMaterialInstance(MaterialFolder, BillboardName,
                 Inputs->Diffuse, Inputs->Normal, Inputs->ORM, Inputs->Opacity, Inputs->Subsurface,
                 TEXT("billboard"), Inputs->bUseVT, false, Inputs->WindStyle, Inputs->ParentPath,
-                /*bAutoMasked=*/true, PlantHeightCm, LayerSource.Get(), DecodeBounds, false, bStaticBillboard);
-            if (Material && bHasZionNativeWind) {
+                /*bAutoMasked=*/true, PlantHeightCm, LayerSource.Get(), DecodeBounds, false, bStaticBillboard,
+                Inputs->bOpacityInDiffuseAlpha, &Dependencies);
+            if (Material && bHasZionNativeWind && !Dependencies.Kept.Contains(Material)) {
               ApplyZionNativeWindParameters(Material, NativePlantWind, {}, false);
               ApplyPlantBillboardWindPolicy(Material, bStaticBillboard);
               UMaterialEditingLibrary::UpdateMaterialInstance(Material);
               Material->MarkPackageDirty();
               FinalizeImportedAsset(Material);
             }
-            if (Material) ZionPlantSlotInstances.Add(CacheKey, Material);
+            if (Material) {
+              ZionPlantSlotInstances.Add(CacheKey, Material);
+              if (bNamedZionPlant) SharedZionPlantInstances.Add(CacheKey, Material);
+            }
           }
-          if (!AssignPlantBillboardLodMaterial(StaticMesh, Lod.Key, Material)) {
+          if (!ReimportTarget && !AssignPlantBillboardLodMaterial(StaticMesh, Lod.Key, Material)) {
             GAssetHiveImportFailed = true;
             UE_LOG(LogTemp, Error, TEXT("AssetHive: failed to assign %s Billboard material to LOD%d"), *StaticMesh->GetName(), Lod.Key);
           }
@@ -10680,6 +11187,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                RemappedSectionCount);
       }
       StaticMesh->PostEditChange();
+      if (ReimportTarget) continue;
       StaticMesh->MarkPackageDirty();
       FinalizeImportedAsset(StaticMesh);
       if (bIs3DAsset) {
@@ -10689,6 +11197,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
 
+    if (bSkippedNewMeshes) {
+      GAssetHiveImportFailed = true;
+      FailureMessage = TEXT("新网格未导入：") + FirstImportError;
+    }
     // The import target is authoritative here. AssetRegistry visibility can lag
     // behind synchronous imports until later in the frame, so gating this on
     // HasAssets may suppress the post-import Content Browser navigation.
@@ -10721,11 +11233,91 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 #include "Misc/AutomationTest.h"
 #include "Misc/CommandLine.h"
 #include "PackageTools.h"
-#include "StaticMeshCompiler.h"
 #include "MeshDescription.h"
 #include "StaticMeshAttributes.h"
 #include "UObject/GCObjectScopeGuard.h"
 #include "UObject/SavePackage.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveMeshOverwritePolicyTest, "AssetHive.Import.MeshOverwritePolicy",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveMeshOverwritePolicyTest::RunTest(const FString&) {
+  FAssetHiveMeshStaging Fixture;
+  const FString Folder = Fixture.GetFolder();
+  auto* Material = NewObject<UMaterialInstanceConstant>(CreatePackage(*(Folder / TEXT("MI_Artist"))),
+      TEXT("MI_Artist"), RF_Public | RF_Standalone);
+  Material->SetParentEditorOnly(UMaterial::GetDefaultMaterial(MD_Surface));
+  auto* Texture = NewObject<UTexture2D>(CreatePackage(*(Folder / TEXT("T_Artist"))), TEXT("T_Artist"), RF_Public | RF_Standalone);
+  auto* Foliage = NewObject<UFoliageType_InstancedStaticMesh>(CreatePackage(*(Folder / TEXT("FT_Artist"))),
+      TEXT("FT_Artist"), RF_Public | RF_Standalone);
+  for (UObject* Object : TArray<UObject*>{Material, Texture, Foliage}) Object->GetPackage()->SetDirtyFlag(false);
+  FAssetHiveDependencyPolicy Policy;
+  Policy.bMeshOnly = true;
+  Policy.bCreateMissing = false;
+  UTexture2D* ResolvedTexture = nullptr;
+  TestTrue(TEXT("A deleted dependency stays deleted"), Policy.Reuse(Folder, TEXT("T_Missing"), ResolvedTexture) && !ResolvedTexture);
+  Policy.bCreateMissing = true;
+  TestFalse(TEXT("A new mesh may create a missing dependency"), Policy.Reuse(Folder, TEXT("T_Missing"), ResolvedTexture));
+  TestTrue(TEXT("A new mesh reuses an existing shared texture"),
+           Policy.Reuse(Folder, TEXT("T_Artist"), ResolvedTexture) && ResolvedTexture == Texture);
+  UMaterialInstanceConstant* ResolvedMaterial = nullptr;
+  TestTrue(TEXT("Existing MI reused"), Policy.Reuse(Folder, TEXT("MI_Artist"), ResolvedMaterial) && ResolvedMaterial == Material);
+
+  auto MakeMesh = [&](const TCHAR* Name, TArray<FName> Groups, float Size) {
+    auto* Mesh = NewObject<UStaticMesh>(CreatePackage(*(Folder / Name)), Name, RF_Public | RF_Standalone);
+    FMeshDescription Description;
+    FStaticMeshAttributes Attributes(Description);
+    Attributes.Register();
+    for (FName GroupName : Groups) {
+      Mesh->GetStaticMaterials().Add(FStaticMaterial(nullptr, GroupName, GroupName));
+      const auto Group = Description.CreatePolygonGroup();
+      Attributes.GetPolygonGroupMaterialSlotNames()[Group] = GroupName;
+      TArray<FVertexInstanceID> Corners;
+      for (int32 K = 0; K < 3; ++K) {
+        const auto Vertex = Description.CreateVertex();
+        Attributes.GetVertexPositions()[Vertex] = FVector3f(K == 1 ? Size : 0, K == 2 ? Size : 0, Group.GetValue());
+        Corners.Add(Description.CreateVertexInstance(Vertex));
+      }
+      Description.CreateTriangle(Group, Corners);
+    }
+    Mesh->AddSourceModel();
+    Mesh->CreateMeshDescription(0, MoveTemp(Description));
+    Mesh->CommitMeshDescription(0);
+    return Mesh;
+  };
+  UStaticMesh* Target = MakeMesh(TEXT("SM_Artist"), {TEXT("Wood"), TEXT("Rope")}, 1);
+  UStaticMesh* Source = MakeMesh(TEXT("SM_Incoming"), {TEXT("Rope"), TEXT("Stone"), TEXT("Wood")}, 4);
+  Target->GetStaticMaterials()[0] = FStaticMaterial(Material, TEXT("ArtistLabel"), TEXT("Wood"));
+  Target->GetStaticMaterials().Add(FStaticMaterial(Material, TEXT("Extra"), TEXT("Extra")));
+  FMeshSectionInfo Override;
+  Override.MaterialIndex = 2;
+  Target->GetSectionInfoMap().Set(0, 0, Override);
+  Policy.bCreateMissing = false;
+  TestTrue(TEXT("Existing FoliageType is untouched"), CreateFoliageTypeAsset(Folder, TEXT("Artist"), Target, &Policy) == Foliage);
+  TestNull(TEXT("Geometry-only does not assign the foliage mesh"), Foliage->GetStaticMesh());
+  if (!TestTrue(TEXT("Replaced geometry"), ReplaceAssetHiveMeshGeometry(Target, Source, FString(), {}))) return false;
+  FStaticMeshCompilingManager::Get().FinishCompilation({Target});
+  TestEqual(TEXT("Three incoming triangles"), Target->GetMeshDescription(0)->Triangles().Num(), 3);
+  TestTrue(TEXT("Artist slot name and MI survive"), Target->GetStaticMaterials()[0].MaterialSlotName == TEXT("ArtistLabel") &&
+      Target->GetStaticMaterials()[0].MaterialInterface == Material);
+  TestNull(TEXT("An intentionally empty binding stays empty"), Target->GetStaticMaterials()[1].MaterialInterface.Get());
+  TestEqual(TEXT("Rope moved to the first section"), Target->GetSectionInfoMap().Get(0, 0).MaterialIndex, 1);
+  TestEqual(TEXT("Wood keeps its artist section override"), Target->GetSectionInfoMap().Get(0, 2).MaterialIndex, 2);
+  TestEqual(TEXT("New slot appended after existing indices"), Target->GetMaterialIndexFromImportedMaterialSlotName(TEXT("Stone")), 3);
+  // Two meshes from one file can have different destination states. Publish the new
+  // mesh with its references remapped to the existing shared material.
+  Source->GetStaticMaterials()[0].MaterialInterface = Material;
+  const FString NewFolder = Folder / TEXT("New");
+  auto* Shared = NewObject<UMaterialInstanceConstant>(CreatePackage(*(NewFolder / TEXT("MI_Artist"))),
+      TEXT("MI_Artist"), RF_Public | RF_Standalone);
+  Shared->GetPackage()->SetDirtyFlag(false);
+  auto* NewMesh = Cast<UStaticMesh>(Fixture.PublishNewAsset(Source, Folder, NewFolder));
+  if (!TestNotNull(TEXT("Missing mesh created"), NewMesh)) return false;
+  TestTrue(TEXT("New mesh uses the project material"), NewMesh->GetStaticMaterials()[0].MaterialInterface == Shared);
+  TestFalse(TEXT("Publishing a new mesh preserves its shared MI"), Shared->GetPackage()->IsDirty());
+  for (UObject* Object : TArray<UObject*>{Material, Texture, Foliage})
+    TestFalse(Object->GetName() + TEXT(" package stays clean"), Object->GetPackage()->IsDirty());
+  return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHive3DTextureVTPresetTest,
     "AssetHive.Import.ThreeDTextureVTPreset",
@@ -11404,12 +11996,17 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("Zion plant mesh name omits the internal ID"),
             FString::Printf(TEXT("SM_%s_01"), *ZionPlantStem),
             FString(TEXT("SM_Env_Tree_Conifer_01")));
+  const FString SurfaceStem = BuildPlantMaterialStem(TEXT("Conifer"), TEXT("Conifer_Mat"), 1, false);
   TestEqual(TEXT("Zion plant texture name uses the asset name"),
-            FString::Printf(TEXT("T_%s_ORM"), *ZionPlantStem),
-            FString(TEXT("T_Env_Tree_Conifer_ORM")));
+            FString::Printf(TEXT("T_%s_ORM"), *SurfaceStem),
+            FString(TEXT("T_Env_Foliage_Conifer_ORM")));
   TestEqual(TEXT("Zion plant material name uses the asset name"),
-            UAssetHiveSettings::GetPlantMaterialName(ZionPlantStem + TEXT("_01"), false, false),
-            FString(TEXT("MI_Env_Tree_Conifer_01")));
+            UAssetHiveSettings::GetPlantMaterialName(SurfaceStem, false, false),
+            FString(TEXT("MI_Env_Foliage_Conifer")));
+  TestEqual(TEXT("分组按源材质名区分"), BuildPlantMaterialStem(TEXT("Conifer"), TEXT("Bark"), 2, true),
+            FString(TEXT("Env_Foliage_Conifer_Bark")));
+  TestEqual(TEXT("未命名的多组保留组号"), BuildPlantMaterialStem(TEXT("Conifer"), FString(), 2, true),
+            FString(TEXT("Env_Foliage_Conifer_002")));
   TestEqual(TEXT("Third-party plant still uses its ID when a name is available"),
             BuildPlantObjectStem(PlantTags, TEXT("abc123"), TEXT("Conifer"), false),
             FString(TEXT("Env_Grass_abc123")));
@@ -11421,23 +12018,23 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
             FString::Printf(TEXT("SM_%s_%s"), *PlantStem, TEXT("01")),
             FString(TEXT("SM_Env_Grass_abc123_01")));
   TestEqual(TEXT("Plant texture name uses slot abbreviation"),
-            FString::Printf(TEXT("T_%s_%s"), *PlantStem, TEXT("D")),
-            FString(TEXT("T_Env_Grass_abc123_D")));
+            FString::Printf(TEXT("T_%s_%s"), *SurfaceStem, TEXT("D")),
+            FString(TEXT("T_Env_Foliage_Conifer_D")));
   TestEqual(TEXT("Plant atlas material name"),
             UAssetHiveSettings::GetPlantMaterialName(
-                FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), false,
+                SurfaceStem, false,
                 false),
-            FString(TEXT("MI_Env_Grass_abc123_01")));
+            FString(TEXT("MI_Env_Foliage_Conifer")));
   TestEqual(TEXT("Plant opaque material name uses _Op suffix"),
             UAssetHiveSettings::GetPlantMaterialName(
-                FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), false,
+                SurfaceStem, false,
                 true),
-            FString(TEXT("MI_Env_Grass_abc123_01_Op")));
+            FString(TEXT("MI_Env_Foliage_Conifer_Op")));
   TestEqual(TEXT("Plant billboard material keeps prefix"),
             UAssetHiveSettings::GetPlantMaterialName(
-                FString::Printf(TEXT("%s_%s"), *PlantStem, TEXT("01")), true,
+                SurfaceStem, true,
                 false),
-            FString(TEXT("MI_Billboard_Env_Grass_abc123_01")));
+            FString(TEXT("MI_Env_Foliage_Conifer_Billboard")));
   TArray<FString> MegascansPlantTags;
   MegascansPlantTags.Add(TEXT("Megascans"));
   const FString MegascansPlantStem =
@@ -13491,6 +14088,18 @@ bool FAssetHiveBillboardMaterialTest::RunTest(const FString &Parameters) {
   TestTrue(TEXT("Reimport reuses Billboard MI"), Import(true) == Billboard);
   TestTrue(TEXT("Micro disables Shared"), HasSwitch(TEXT("SharedEnable"), false));
   TestTrue(TEXT("Micro disables interaction"), HasSwitch(TEXT("Interactive"), false));
+  const auto ImportAtlasOpacity = [&](UTexture *SeparateMask, bool bDiffuseAlpha) {
+    return CreatePlantMaterialInstance(Folder, TEXT("Probe"), AtlasTexture, nullptr, nullptr, SeparateMask, nullptr,
+        TEXT("atlas"), false, false, EPlantSyntheticWind::None, ParentPath, true, 0.f, nullptr, {}, false, false, bDiffuseAlpha);
+  };
+  TestTrue(TEXT("独立遮罩重用同一实例"), ImportAtlasOpacity(BillboardTexture, false) == Atlas);
+  TestTrue(TEXT("改用 Diffuse.A 后保持 Masked"), ImportAtlasOpacity(nullptr, true) == Atlas &&
+      Atlas->BasePropertyOverrides.bOverride_BlendMode && Atlas->BasePropertyOverrides.BlendMode == BLEND_Masked);
+  TestFalse(TEXT("合并后的材质释放旧遮罩"), Atlas->TextureParameterValues.ContainsByPredicate([&](const FTextureParameterValue &P) {
+    return P.ParameterValue == BillboardTexture;
+  }));
+  TestTrue(TEXT("移除颜色透贴后恢复父材质混合模式"), ImportAtlasOpacity(nullptr, false) == Atlas &&
+      !Atlas->BasePropertyOverrides.bOverride_BlendMode);
   ObjectTools::DeleteSingleObject(Atlas, false); ObjectTools::DeleteSingleObject(Billboard, false);
   ObjectTools::DeleteSingleObject(Parent, false); ObjectTools::DeleteSingleObject(BillboardParent, false);
   return true;

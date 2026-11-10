@@ -51,7 +51,7 @@ bool FAssetHiveSettingsTest::RunTest(const FString& Parameters)
     TestTrue(TEXT("Plant atlas parent valid"), UAssetHiveSettings::IsValidPlantParentMaterialPath(UAssetHiveSettings::GetPlantParentMaterialPath(false)));
     TestTrue(TEXT("Plant billboard parent valid"), UAssetHiveSettings::IsValidPlantParentMaterialPath(UAssetHiveSettings::GetPlantParentMaterialPath(true)));
     TestEqual(TEXT("Plant atlas MI name"), UAssetHiveSettings::GetPlantMaterialName(TEXT("Fern_001"), false), FString(TEXT("MI_Fern_001")));
-    TestEqual(TEXT("Plant billboard MI name"), UAssetHiveSettings::GetPlantMaterialName(TEXT("Fern_001"), true), FString(TEXT("MI_Billboard_Fern_001")));
+    TestEqual(TEXT("Plant billboard MI name"), UAssetHiveSettings::GetPlantMaterialName(TEXT("Env_Foliage_Fern"), true), FString(TEXT("MI_Env_Foliage_Fern_Billboard")));
     TestEqual(TEXT("Plant diffuse parameter"), UAssetHiveSettings::GetPlantDiffuseParameter(), FString(TEXT("Diffuse_VT")));
     TestEqual(TEXT("Plant normal parameter"), UAssetHiveSettings::GetPlantNormalParameter(), FString(TEXT("Normal_VT")));
     TestEqual(TEXT("Plant ORM parameter"), UAssetHiveSettings::GetPlantORMParameter(), FString(TEXT("ORM_VT")));

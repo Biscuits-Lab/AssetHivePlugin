@@ -103,7 +103,7 @@ public:
     UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Atlas Material Name Prefix", ToolTip="Prefix for 3D Plant Atlas material instances. Default: MI_"))
     FString PlantAtlasMaterialNamePrefix;
 
-    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Billboard Material Name Prefix", ToolTip="Prefix for 3D Plant Billboard material instances. Default: MI_Billboard_"))
+    UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Billboard Material Name Prefix", ToolTip="The default MI_ prefix adds a _Billboard suffix to the asset name."))
     FString PlantBillboardMaterialNamePrefix;
 
     UPROPERTY(EditAnywhere, config, Category="3. 3D Plants|Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the Plant Diffuse texture T_..._D (albedo used as diffuse). Default: Diffuse_VT"))

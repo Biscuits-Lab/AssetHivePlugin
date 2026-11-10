@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 4,
-	"VersionName": "1.1.9",
+	"Version": 5,
+	"VersionName": "1.2.0",
 	"FriendlyName": "AssetHive",
 	"Description": "AssetHive live import over local TCP, with configurable project import root",
 	"Category": "Importers",
