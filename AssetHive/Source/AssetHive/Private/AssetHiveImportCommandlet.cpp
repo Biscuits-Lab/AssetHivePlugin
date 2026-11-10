@@ -3977,6 +3977,97 @@ struct FPlantWindCardReference {
   }
 };
 
+// A coarse LOD can widen a transparent card's basal edge beyond the source
+// root sphere. Its two corner weights must still interpolate to zero at the
+// original, measured root. Only an exact source boundary, UV and 3D witness
+// on the same wind card can constrain the corresponding transverse LOD edge.
+static TSet<int32> PlantWindFixedLodRootEdgeCorners(
+    const FMeshDescription& Mesh, const FPlantWindCardReference& Reference,
+    const TArray<int32>& SourceCardByInstance) {
+  TSet<int32> Fixed;
+  const auto& Surface=Reference.Surface;
+  if (!Reference.bFromLayerFile || Reference.LayerBindings.IsEmpty() ||
+      Surface.TriangleUVs.Num()!=Surface.TriangleIndices.Num()) return Fixed;
+  if (!Reference.LayerBindings.ContainsByPredicate([](const FHerbWindBinding& B) {
+        return B.RootOuter>0.f && B.RootInner>0.f;
+      })) return Fixed;
+  const auto EdgeKey=[](uint32 A,uint32 B) {
+    return (uint64(FMath::Min(A,B))<<32)|uint64(FMath::Max(A,B));
+  };
+  TMap<uint64,int32> SourceEdgeCounts;
+  for (int32 T=0; T<Surface.NumTriangles(); ++T) {
+    for (int32 K=0; K<3; ++K)
+      ++SourceEdgeCounts.FindOrAdd(EdgeKey(Surface.TriangleIndices[T*3+K],
+          Surface.TriangleIndices[T*3+(K+1)%3]));
+  }
+  const float PositionTolerance=FMath::Max(.001f,Surface.GetDiagonal()*1.e-5f);
+  TMap<int32,TArray<FVector2f>> RootUVByCard;
+  for (int32 T=0; T<Surface.NumTriangles(); ++T) {
+    const int32 Card=Surface.CardOfTriangle[T];
+    if (!Reference.LayerBindings.IsValidIndex(Card)) continue;
+    const auto& B=Reference.LayerBindings[Card];
+    if (B.RootOuter<=0.f || B.RootInner<=0.f) continue;
+    for (int32 K=0; K<3; ++K) {
+      const uint32 A=Surface.TriangleIndices[T*3+K];
+      const uint32 C=Surface.TriangleIndices[T*3+(K+1)%3];
+      if (SourceEdgeCounts.FindRef(EdgeKey(A,C))!=1) continue;
+      const auto P=Surface.Positions[A]; const auto Q=Surface.Positions[C];
+      if (FVector3f::Dist(P,B.RootContact)>B.RootInner ||
+          FVector3f::Dist(Q,B.RootContact)>B.RootInner) continue;
+      const auto Delta=Q-P;
+      if (Delta.SizeSquared()<1.e-12f) continue;
+      const float Along=FVector3f::DotProduct(B.RootContact-P,Delta)/Delta.SizeSquared();
+      if (Along<0.f || Along>1.f || FVector3f::Dist(P+Along*Delta,B.RootContact)>PositionTolerance) continue;
+      RootUVByCard.FindOrAdd(Card).AddUnique(FMath::Lerp(Surface.TriangleUVs[T*3+K],
+          Surface.TriangleUVs[T*3+(K+1)%3],Along));
+    }
+  }
+  if (RootUVByCard.IsEmpty()) return Fixed;
+  const FStaticMeshConstAttributes Attributes(Mesh);
+  const auto Positions=Attributes.GetVertexPositions();
+  const auto UVs=Attributes.GetVertexInstanceUVs();
+  if (UVs.GetNumChannels()<1) return Fixed;
+  TMap<FIntVector,int32> TargetEdgeCounts;
+  const auto VisitEdges=[&](auto&& Visit) {
+    for (const auto T : Mesh.Triangles().GetElementIDs()) {
+      const auto Corners=Mesh.GetTriangleVertexInstances(T);
+      for (int32 K=0; K<3; ++K) {
+        const auto A=Corners[K]; const auto C=Corners[(K+1)%3];
+        if (!SourceCardByInstance.IsValidIndex(A.GetValue()) ||
+            !SourceCardByInstance.IsValidIndex(C.GetValue())) continue;
+        const int32 Card=SourceCardByInstance[A.GetValue()];
+        if (Card!=SourceCardByInstance[C.GetValue()] || !RootUVByCard.Contains(Card)) continue;
+        const int32 VA=Mesh.GetVertexInstanceVertex(A).GetValue();
+        const int32 VC=Mesh.GetVertexInstanceVertex(C).GetValue();
+        Visit(A,C,Card,FIntVector(FMath::Min(VA,VC),FMath::Max(VA,VC),Card));
+      }
+    }
+  };
+  VisitEdges([&](FVertexInstanceID A,FVertexInstanceID C,int32 Card,const FIntVector& Key) {
+    ++TargetEdgeCounts.FindOrAdd(Key);
+  });
+  VisitEdges([&](FVertexInstanceID A,FVertexInstanceID C,int32 Card,const FIntVector& Key) {
+    if (TargetEdgeCounts.FindRef(Key)!=1) return;
+    const auto& B=Reference.LayerBindings[Card];
+    const auto P=Positions[Mesh.GetVertexInstanceVertex(A)];
+    const auto Delta=Positions[Mesh.GetVertexInstanceVertex(C)]-P;
+    const auto U=UVs.Get(A,0); const auto UVDelta=UVs.Get(C,0)-U;
+    if (Delta.SizeSquared()<1.e-12f || UVDelta.SizeSquared()<1.e-12f) return;
+    // A growing side edge must retain its moving tip.
+    if (FMath::Abs(FVector3f::DotProduct(Delta.GetSafeNormal(),B.Primary.Delta().GetSafeNormal()))>.25f) return;
+    const float Along=FVector3f::DotProduct(B.RootContact-P,Delta)/Delta.SizeSquared();
+    if (Along<0.f || Along>1.f || FVector3f::Dist(P+Along*Delta,B.RootContact)>PositionTolerance) return;
+    for (const auto RootUV : RootUVByCard.FindChecked(Card)) {
+      const float UVAlong=FVector2f::DotProduct(RootUV-U,UVDelta)/UVDelta.SizeSquared();
+      if (UVAlong<0.f || UVAlong>1.f || FMath::Abs(UVAlong-Along)>.001f ||
+          FVector2f::Distance(U+UVAlong*UVDelta,RootUV)>1.e-5f) continue;
+      if (Along<1.f-1.e-4f) Fixed.Add(A.GetValue());
+      if (Along>1.e-4f) Fixed.Add(C.GetValue());
+    }
+  });
+  return Fixed;
+}
+
 // 裁切网格与原始卡片必须处于同一局部空间与缩放：包围盒对角线出现数量级差异时放弃参考
 // （单位/缩放不一致会让最近点匹配选到错误的卡片）。
 static bool IsPlantWindCardReferenceScaleCompatible(
@@ -5735,6 +5826,17 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
       UE_LOG(LogTemp, Display, TEXT("AssetHive wind %s LOD%d: %d source corners reuse LOD0 weights, %d use card fallback"),
              *StaticMesh->GetName(), LodIndex, ProjectedCutCorners-ProjectedBefore, FallbackCutCorners-FallbackBefore);
     }
+    TSet<int32> FixedLodRootCorners;
+    if (LodIndex>0 && !bOpaqueCut && bUseCardReference && CardReference->bFromLayerFile && !CutSourcePoints.IsEmpty()) {
+      TArray<int32> SourceCards;
+      SourceCards.Init(INDEX_NONE,CutSourcePoints.Num());
+      for (int32 I=0; I<CutSourcePoints.Num(); ++I)
+        if (CutSourcePoints[I].bAssigned) SourceCards[I]=CutSourcePoints[I].Card;
+      FixedLodRootCorners=PlantWindFixedLodRootEdgeCorners(*Mesh,*CardReference,SourceCards);
+      if (!FixedLodRootCorners.IsEmpty())
+        UE_LOG(LogTemp,Display,TEXT("AssetHive wind %s LOD%d: %d corners retain the original fixed root edge"),
+            *StaticMesh->GetName(),LodIndex,FixedLodRootCorners.Num());
+    }
     if (UVs.GetNumChannels() < RequiredChannels) {
       UVs.SetNumChannels(RequiredChannels);
     }
@@ -5783,6 +5885,7 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
           } else {
             Weights = WeightsAt(P);
           }
+          if (FixedLodRootCorners.Contains(VertexInstanceID.GetValue())) Weights=FVector3f::ZeroVector;
           Weight = Weights.X; ChildWeight = Weights.Y; Ripple = Weights.Z;
         }
         UVs.Set(VertexInstanceID,1,FVector2f(M ? M->Position : 0.f,M ? M->Direction : 0.f));
@@ -13054,6 +13157,74 @@ bool FAssetHiveWindRootInterpolationTest::RunTest(const FString &Parameters) {
   return true;
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindLodRootEdgeTest, "AssetHive.Plants.SyntheticWindLodRootEdge",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveWindLodRootEdgeTest::RunTest(const FString& Parameters) {
+  UStaticMesh* Mesh=NewObject<UStaticMesh>(GetTransientPackage(),NAME_None,RF_Transient);
+  FGCObjectScopeGuard Guard(Mesh);
+  const FVector3f Points[2][3]={
+      {FVector3f(-1,0,0),FVector3f(1,0,0),FVector3f(0,0,10)},
+      {FVector3f(-3,0,0),FVector3f(3,0,0),FVector3f(0,0,10)}};
+  for (int32 Lod=0; Lod<2; ++Lod) {
+    Mesh->AddSourceModel(); FMeshDescription Description;
+    FStaticMeshAttributes Attributes(Description); Attributes.Register();
+    auto Positions=Attributes.GetVertexPositions(); auto UV=Attributes.GetVertexInstanceUVs(); UV.SetNumChannels(1);
+    const auto Group=Description.CreatePolygonGroup(); TArray<FVertexInstanceID> Corners;
+    for (const auto P : Points[Lod]) {
+      const auto V=Description.CreateVertex(); Positions[V]=P;
+      const auto VI=Description.CreateVertexInstance(V);
+      UV.Set(VI,0,FVector2f((P.X+1.f)*.5f,P.Z*.1f)); Corners.Add(VI);
+    }
+    Description.CreateTriangle(Group,Corners);
+    Mesh->CreateMeshDescription(Lod,MoveTemp(Description)); Mesh->CommitMeshDescription(Lod);
+  }
+  const FString Json=TEXT("{\"primaryAxes\":[{\"base\":[0.5,0,0],\"tip\":[0.5,0,1]}],")
+      TEXT("\"secondaryAxes\":[{\"base\":[0.5,0,0],\"tip\":[0.5,0,1]}],")
+      TEXT("\"bindings\":[{\"island\":0,\"boundsCenter\":[0.5,0,0.5],\"primary\":0,\"secondary\":0,")
+      TEXT("\"primaryAttachment\":1,\"secondaryAttachment\":1,\"terminal\":true,\"blade\":[[0.5,0,0],[0.5,0,1]],")
+      TEXT("\"rootContact\":{\"center\":[0.5,0,0],\"innerHeight\":0.12,\"outerHeight\":0.15}}]}");
+  TSharedPtr<FJsonObject> Layer;
+  if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json),Layer)) return false;
+  FPlantWindCardReference Reference;
+  if (!TestTrue(TEXT("Bind a measured source basal edge"),BuildPlantWindCardReference(Mesh,
+      EPlantWindFrondMergeMode::None,Reference,false,false,Layer.Get()))) return false;
+  Reference.bAssetUsesBranch2=true;
+  FPlantBranch2Bounds Bounds; Bounds.Min.Z=0.f; Bounds.Max.Z=.64f; FString Summary;
+  if (!TestTrue(TEXT("Bake a wider low LOD basal edge"),ApplySyntheticSpeedTreeWind(Mesh,
+      EPlantSyntheticWind::Herb,&Reference,Summary,Bounds))) return false;
+  const auto SourceUV=FStaticMeshConstAttributes(*Mesh->GetMeshDescription(0)).GetVertexInstanceUVs();
+  TestTrue(TEXT("Source basal corners remain fixed and its apex still moves"),
+      SourceUV.Get(FVertexInstanceID(0),2).IsNearlyZero() && SourceUV.Get(FVertexInstanceID(1),2).IsNearlyZero() &&
+      SourceUV.Get(FVertexInstanceID(2),2).X>.69f);
+  FMeshDescription* Target=Mesh->GetMeshDescription(1);
+  FStaticMeshAttributes TargetAttributes(*Target); const auto TargetUV=TargetAttributes.GetVertexInstanceUVs();
+  for (int32 I=0; I<2; ++I) {
+    const FVertexInstanceID VI(I);
+    TestTrue(TEXT("The real basal edge stays fixed even when its corners are outside the source root sphere"),TargetUV.Get(VI,2).IsNearlyZero());
+    TestEqual(TEXT("Fixed edge retains original UV0"),TargetUV.Get(VI,0),FVector2f((Points[1][I].X+1.f)*.5f,0));
+    TestEqual(TEXT("Fixed edge retains its original discrete wind axis"),TargetUV.Get(VI,1),TargetUV.Get(FVertexInstanceID(2),1));
+    TestEqual(TEXT("Fixed edge has zero Branch2"),AssetHivePlantWind::UV3Word(TargetUV.Get(VI,3).X)%256,0);
+    TestEqual(TEXT("Fixed edge has zero packed Ripple"),AssetHivePlantWind::RippleNibble(TargetUV.Get(VI,3).X,1)|
+        (AssetHivePlantWind::RippleNibble(TargetUV.Get(VI,3).Y,0)<<4),0);
+  }
+  TestTrue(TEXT("Low LOD growing apex retains local wind"),TargetUV.Get(FVertexInstanceID(2),2).X>.69f);
+  const TArray<int32> SameCard={0,0,0};
+  TestEqual(TEXT("Both low LOD basal corners have an exact source witness"),PlantWindFixedLodRootEdgeCorners(*Target,Reference,SameCard).Num(),2);
+  TestTrue(TEXT("A competing source card cannot be pinned through the root edge"),PlantWindFixedLodRootEdgeCorners(*Target,Reference,{0,1,0}).IsEmpty());
+  for (int32 I=0; I<2; ++I) TargetUV.Set(FVertexInstanceID(I),0,FVector2f((Points[1][I].X+1.f)*.5f,.03f));
+  TestTrue(TEXT("A spatial overlap without the original UV witness cannot pin the edge"),PlantWindFixedLodRootEdgeCorners(*Target,Reference,SameCard).IsEmpty());
+  for (int32 I=0; I<2; ++I) TargetUV.Set(FVertexInstanceID(I),0,FVector2f((Points[1][I].X+1.f)*.5f,0));
+  Reference.LayerBindings[0].RootContact.Y=.1f;
+  TestTrue(TEXT("A root away from the original source boundary cannot pin an edge"),PlantWindFixedLodRootEdgeCorners(*Target,Reference,SameCard).IsEmpty());
+  Reference.LayerBindings[0].RootContact.Y=0.f;
+  Reference.LayerBindings[0].RootOuter=0.f;
+  TestTrue(TEXT("An unprotected source cannot acquire a fabricated fixed edge"),PlantWindFixedLodRootEdgeCorners(*Target,Reference,SameCard).IsEmpty());
+  Reference.LayerBindings[0].RootOuter=1.5f;
+  auto Positions=TargetAttributes.GetVertexPositions(); Positions[FVertexID(0)].Z=-3.f; Positions[FVertexID(1)].Z=3.f;
+  TestTrue(TEXT("A growing edge through the root retains its free endpoint"),PlantWindFixedLodRootEdgeCorners(*Target,Reference,SameCard).IsEmpty());
+  return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveWindLodImportTest, "AssetHive.Plants.SyntheticWindLodReuseImport",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FAssetHiveWindLodImportTest::RunTest(const FString &Parameters) {
@@ -13187,6 +13358,28 @@ bool FAssetHiveWindLodImportTest::RunTest(const FString &Parameters) {
       Row->SetBoolField(TEXT("finite"),Finite);
       Row->SetBoolField(TEXT("sharedOnlyProxy"),SharedOnlyProxy);
       Row->SetNumberField(TEXT("rootEnvelopeVertices"),RootEnvelopeVertices);
+      bool DumpWindTriangles=false;
+      Data->TryGetBoolField(TEXT("dumpWindTriangles"),DumpWindTriangles);
+      if (DumpWindTriangles) {
+        const auto Positions=Attributes.GetVertexPositions();
+        TArray<TSharedPtr<FJsonValue>> WindTriangles;
+        for (const auto Triangle : Description->Triangles().GetElementIDs()) {
+          TArray<TSharedPtr<FJsonValue>> WindCorners;
+          for (const auto VI : Description->GetTriangleVertexInstances(Triangle)) {
+            const auto P=Positions[Description->GetVertexInstanceVertex(VI)];
+            const auto OriginalUV=UVs.Get(VI,0);
+            const auto LocalWind=UVs.Get(VI,2);
+            const auto PackedWind=UVs.GetNumChannels()>3 ? UVs.Get(VI,3) : FVector2f::ZeroVector;
+            TArray<TSharedPtr<FJsonValue>> WindCornerValues;
+            for (const float Value : {P.X,P.Y,P.Z,OriginalUV.X,OriginalUV.Y,
+                                      LocalWind.X,LocalWind.Y,PackedWind.X,PackedWind.Y})
+              WindCornerValues.Add(MakeShared<FJsonValueNumber>(Value));
+            WindCorners.Add(MakeShared<FJsonValueArray>(WindCornerValues));
+          }
+          WindTriangles.Add(MakeShared<FJsonValueArray>(WindCorners));
+        }
+        Row->SetArrayField(TEXT("windTriangles"),WindTriangles);
+      }
       Results.Add(MakeShared<FJsonValueObject>(Row));
     }
     ObjectTools::DeleteSingleObject(Mesh,false);
