@@ -455,8 +455,6 @@ static void CollectEnvironmentProfileTags(
   }
 }
 
-// FBX 植被命名：SM_/T_/MI_Env_<标准AssetTag>_<标识>，Zion 用资产名，第三方用资产 ID。
-// 网格与材质另带变体号，纹理另带类型缩写且不带分辨率。
 // 不透明裁切整批导入时使用 Op 表示：第三方放到资产目录下的 Op 子目录，其他资产目录加 _Op。
 // 网格保留原变体名；材质实例加 _Op，便于 masked 与裁切两套 MI 并存。
 static FString BuildPlantRepresentationFolder(const FString &AssetFolder,
@@ -471,42 +469,11 @@ static bool HasMicroPlantTag(const TArray<FString> &Tags) {
   return HasAssetTag(Tags, TEXT("Micro")) || HasAssetTag(Tags, TEXT("MicroFoliage"));
 }
 
-static FString ResolvePlantTagSegment(const TArray<FString> &Tags) {
-  if (HasMicroPlantTag(Tags)) return TEXT("Micro");
-  const TCHAR *PreferredTags[] = {TEXT("Tree"), TEXT("Bush"), TEXT("Grass"),
-                                  TEXT("MicroFoliage"), TEXT("HeroFoliage")};
-  for (const TCHAR *Preferred : PreferredTags) {
-    if (HasAssetTag(Tags, Preferred)) {
-      return FString(Preferred);
-    }
-  }
-  for (const FString &Tag : Tags) {
-    const FString SafeTag = MakeSafeObjectName(Tag.TrimStartAndEnd());
-    if (!SafeTag.IsEmpty()) {
-      // 缺少细分植被标签时用 Foliage 与供应商名解耦（SM_Env_Foliage_<资产ID>_01）。
-      // ThirdParty 是来源/目录标记，不能作为命名段（2026-10-27 约定）：Megascans 来源与
-      // 统一后的 ThirdParty 标签都回落到 Foliage，保持既有资产名不变。
-      const FString NormalizedTag = NormalizeAssetTagToken(Tag);
-      if (NormalizedTag == TEXT("megascans") ||
-          NormalizedTag == TEXT("thirdparty") ||
-          NormalizedTag == TEXT("第三方")) {
-        return FString(TEXT("Foliage"));
-      }
-      return SafeTag;
-    }
-  }
-  return TEXT("Plant");
-}
-
-static FString BuildPlantObjectStem(const TArray<FString> &Tags,
-                                    const FString &AssetId,
-                                    const FString &AssetName = FString(),
-                                    bool bIsZionAsset = false) {
-  const FString Identifier =
-      MakeSafeObjectName(bIsZionAsset ? AssetName : AssetId).TrimStartAndEnd();
-  const FString Tag = ResolvePlantTagSegment(Tags);
-  return Identifier.IsEmpty() ? FString::Printf(TEXT("Env_%s"), *Tag)
-                             : FString::Printf(TEXT("Env_%s_%s"), *Tag, *Identifier);
+static FString BuildPlantMeshName(const FString &Identifier, const FString &VariantKey) {
+  FString Name = TEXT("SM_Env_Foliage");
+  if (!Identifier.IsEmpty()) Name += TEXT("_") + Identifier;
+  if (!VariantKey.IsEmpty()) Name += TEXT("_") + VariantKey;
+  return Name;
 }
 
 // 纹理和 MI 共用资产名。多个材质组用源槽名区分，未命名的组沿用组号。
@@ -519,7 +486,7 @@ static FString BuildPlantMaterialStem(const FString &AssetName, const FString &M
 }
 
 // 3D Plants 导出档案（md §5.2，2026-09-30 插件侧定稿）：路径 / 面数 / Nanite /
-// 碰撞 / 纹理预设按标准 Asset Tag 分子类；命名模板仍只对 FBX 原始资产生效。
+// 碰撞 / 纹理预设按标准 Asset Tag 分子类。
 // ---------------------------------------------------------------------------
 // 合成 SpeedTree 风（Megascans 3D Plants，2026-10-07）
 //
@@ -1789,7 +1756,6 @@ static FPlantAssetProfile ResolvePlantAssetProfile(
   return Profile;
 }
 
-// 命名模板只对原始资产为 FBX 的 3D Plants 生效（st9 保持原有命名）。
 // 口径与软件侧 buildExportModelPlan 一致：模型文件存在且全部为 .fbx。
 static bool AssetHasFbxPlantModels(const TSharedPtr<FJsonObject> &AssetObject) {
   if (!AssetObject.IsValid()) {
@@ -7143,7 +7109,7 @@ CreateFoliageTypeAsset(const FString &AssetFolder, const FString &AssetName,
   if (!StaticMesh) {
     return nullptr;
   }
-  // 命名跟随静态网格体：SM_ 前缀换成 FT_（SM_Env_Grass_x_01 -> FT_Env_Grass_x_01）。
+  // FoliageType 跟随静态网格体名称，将 SM_ 前缀换成 FT_。
   FString FoliageStem = StaticMesh->GetName();
   if (FoliageStem.StartsWith(TEXT("SM_"), ESearchCase::CaseSensitive)) {
     FoliageStem.RightChopInline(3);
@@ -8775,8 +8741,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     };
     FString AssetType = TEXT("");
     AssetObject->TryGetStringField(TEXT("assetType"), AssetType);
-    FString AssetSource = TEXT("");
-    AssetObject->TryGetStringField(TEXT("source"), AssetSource);
     FString CategoryFolder = TEXT("Others");
     AssetObject->TryGetStringField(TEXT("categoryFolder"), CategoryFolder);
     FString AssetFolderName = TEXT("");
@@ -8796,7 +8760,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       }
     }
     AssetType = AssetType.ToLower();
-    AssetSource = AssetSource.ToLower();
     bool bCreateFoliageForAsset = false;
     const bool bHasCreateFoliageOverride = AssetObject->TryGetBoolField(
         TEXT("createFoliage"), bCreateFoliageForAsset);
@@ -8816,7 +8779,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     if (Dependencies.bMeshOnly) AssetObject->TryGetStringField(TEXT("firstImportError"), FirstImportError);
     bool bSkippedNewMeshes = false;
     FAssetHiveMeshStaging Staging;
-    const bool bIsCustomAsset = AssetSource == TEXT("custom");
     const bool bIs3DAsset = AssetType == TEXT("3d");
     const bool bHasLibraryId = !AssetId.TrimStartAndEnd().IsEmpty();
     if (!bHasLibraryId) {
@@ -9065,16 +9027,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             : FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
     FString PlantDisplayName = bZionPlant ? SafeAssetFolderName : FolderStemSource;
     if (!bZionPlant && bHasLibraryId) PlantDisplayName.RemoveFromEnd(TEXT("_") + SafeAssetId, ESearchCase::IgnoreCase);
-    const bool bFbxPlantNaming = AssetType == TEXT("3dplant") && AssetHasFbxPlantModels(AssetObject);
-    const bool bUsePlantNaming = bThirdPartyPlant || bFbxPlantNaming;
-    TArray<FString> AuthoredPlantTags;
-    const bool bHasNamingTags = bThirdPartyPlant &&
-        AssetObject->TryGetStringArrayField(TEXT("plantNamingTags"), AuthoredPlantTags);
-    const FString PlantObjectStem = bUsePlantNaming
-        ? BuildPlantObjectStem(bHasNamingTags ? AuthoredPlantTags : AssetStandardTags,
-                               SafeAssetId, SafeAssetFolderName, bIsZionAsset)
-        : FString();
-    const bool bOpaquePlantSet = bFbxPlantNaming && IsOpaquePlantModelSet(AssetObject);
+    const bool bFbxPlantModels = AssetType == TEXT("3dplant") && AssetHasFbxPlantModels(AssetObject);
+    const bool bOpaquePlantSet = bFbxPlantModels && IsOpaquePlantModelSet(AssetObject);
     // 第三方的两种表示放在同一 Name_ID 资产目录下。
     const FString PlantFolderName = BuildPlantRepresentationFolder(
         SafeAssetFolderName, bThirdPartyPlant, bOpaquePlantSet);
@@ -9424,8 +9378,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         }
       }
 
+      const FString PlantMeshIdentifier = (bZionPlant ? SafeAssetFolderName : SafeAssetId).TrimStartAndEnd();
+      const bool bNumberSinglePlant = bThirdPartyPlant || bFbxPlantModels || bHasExplicitModelVariants;
       bool bHandledModelImport = false;
-      if (AssetType == TEXT("3dplant") && bIsModelAsset) {
+      if (AssetType == TEXT("3dplant")) {
         struct FPlantModelEntry {
           FString SourceFile;
           FString VariantKey = TEXT("01");
@@ -9503,21 +9459,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             continue;
           }
 
-          const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
-          const bool bNeedsVariantSuffix =
-              bFbxPlantAsset || bHasExplicitModelVariants ||
-              VariantKeys.Num() > 1;
-          const FString VariantStem =
-              bNeedsVariantSuffix
-                  ? FString::Printf(
-                        TEXT("%s_%s"),
-                        bFbxPlantAsset ? *PlantObjectStem : *AssetStem,
-                        *VariantKey)
-                  : (bFbxPlantAsset ? PlantObjectStem : AssetStem);
-          // 不透明裁切变体不再往对象名上加 _OPAQUE（2026-10-16 约定）：整批裁切时后缀
-          // 落在资产文件夹上（见 PlantFolderName），网格与普通版本同名，靠目录区分。
-          const FString BaseMeshName =
-              FString::Printf(TEXT("SM_%s"), *VariantStem);
+          // 裁切版本由 Op 目录区分，沿用相同的网格名称。
+          const bool bIncludeVariant = bNumberSinglePlant || VariantKeys.Num() > 1;
+          const FString BaseMeshName = BuildPlantMeshName(
+              PlantMeshIdentifier, bIncludeVariant ? VariantKey : FString());
 
           Models.Add({BaseFile, BaseMeshName, VariantKey, true});
         }
@@ -9559,22 +9504,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           if (bIs3DAsset) {
             ModelAssetName = FString::Printf(TEXT("SM_%s_%s"),
                                              *EnvironmentStem, *VariantKey);
-          } else if (bZionPlant || (bIsCustomAsset && bIsModelAsset)) {
-            const bool bFbxPlantAsset = !PlantObjectStem.IsEmpty();
-            const bool bNeedsVariantSuffix =
-                bFbxPlantAsset || bHasExplicitModelVariants ||
-                ValidModelCount > 1;
-            ModelAssetName =
-                bNeedsVariantSuffix
-                    ? FString::Printf(
-                          TEXT("SM_%s_%s"),
-                          bFbxPlantAsset ? *PlantObjectStem : *AssetStem,
-                          *VariantKey)
-                    : FString::Printf(
-                          TEXT("SM_%s"),
-                          bFbxPlantAsset ? *PlantObjectStem : *AssetStem);
-            // 不透明裁切变体不再往对象名上加 _OPAQUE（2026-10-16 约定）：整批裁切时后缀
-            // 落在资产文件夹上，网格/材质与普通版本同名，靠目录区分。
+          } else if (AssetType == TEXT("3dplant")) {
+            const bool bIncludeVariant = bNumberSinglePlant || ValidModelCount > 1;
+            ModelAssetName = BuildPlantMeshName(
+                PlantMeshIdentifier, bIncludeVariant ? VariantKey : FString());
           } else {
             ModelAssetName = FString::Printf(TEXT("SM_%s_%s"), *AssetStem,
                                              *DetectModelSuffix(SourceFile));
@@ -11874,10 +11807,6 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
               BuildEnvironmentObjectStem(PbrMaxThirdPartyProfile,
                                          TEXT("Bucket"), TEXT("abc123")),
               FString(TEXT("Env_Bucket_abc123")));
-    TestEqual(TEXT("ThirdParty 本身不作为植被命名段"),
-              BuildPlantObjectStem(MakeTags(TEXT("ThirdParty"), TEXT("foliage")),
-                                   TEXT("abc123")),
-              FString(TEXT("Env_Foliage_abc123")));
 
     // 扫描面数预算：ThirdParty 标签与旧来源标记都按 Dressing 预算处理。
     TestTrue(TEXT("ThirdParty 计入扫描预算"),
@@ -11983,19 +11912,18 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                                                TEXT("01")),
             FString(TEXT("MI_Env_abc123_002_01")));
 
-  // 第三方植被保留 ID；Zion 植被在同一个位置使用资产名。
-  TArray<FString> PlantTags;
-  PlantTags.Add(TEXT("Grass"));
-  const FString PlantStem = BuildPlantObjectStem(PlantTags, TEXT("abc123"));
-  TestEqual(TEXT("Plant stem uses tag and asset ID"), PlantStem,
-            FString(TEXT("Env_Grass_abc123")));
-  const FString ZionPlantStem =
-      BuildPlantObjectStem({FString(TEXT("Tree"))}, TEXT("abc123"), TEXT("Conifer"), true);
-  TestEqual(TEXT("Zion plant replaces the ID segment with its asset name"),
-            ZionPlantStem, FString(TEXT("Env_Tree_Conifer")));
-  TestEqual(TEXT("Zion plant mesh name omits the internal ID"),
-            FString::Printf(TEXT("SM_%s_01"), *ZionPlantStem),
-            FString(TEXT("SM_Env_Tree_Conifer_01")));
+  TestEqual(TEXT("Zion grass mesh uses Foliage and the original variant number"),
+            BuildPlantMeshName(TEXT("baimangcao_bukaihua"), TEXT("01")),
+            FString(TEXT("SM_Env_Foliage_baimangcao_bukaihua_01")));
+  TestEqual(TEXT("Plant mesh preserves a letter variant"),
+            BuildPlantMeshName(TEXT("Conifer"), TEXT("A")),
+            FString(TEXT("SM_Env_Foliage_Conifer_A")));
+  TestEqual(TEXT("An unnumbered plant mesh keeps the Foliage prefix"),
+            BuildPlantMeshName(TEXT("Conifer"), FString()),
+            FString(TEXT("SM_Env_Foliage_Conifer")));
+  TestEqual(TEXT("Third-party plant mesh uses Foliage with the library ID"),
+            BuildPlantMeshName(TEXT("abc123"), TEXT("01")),
+            FString(TEXT("SM_Env_Foliage_abc123_01")));
   const FString SurfaceStem = BuildPlantMaterialStem(TEXT("Conifer"), TEXT("Conifer_Mat"), 1, false);
   TestEqual(TEXT("Zion plant texture name uses the asset name"),
             FString::Printf(TEXT("T_%s_ORM"), *SurfaceStem),
@@ -12007,16 +11935,6 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
             FString(TEXT("Env_Foliage_Conifer_Bark")));
   TestEqual(TEXT("未命名的多组保留组号"), BuildPlantMaterialStem(TEXT("Conifer"), FString(), 2, true),
             FString(TEXT("Env_Foliage_Conifer_002")));
-  TestEqual(TEXT("Third-party plant still uses its ID when a name is available"),
-            BuildPlantObjectStem(PlantTags, TEXT("abc123"), TEXT("Conifer"), false),
-            FString(TEXT("Env_Grass_abc123")));
-  TestEqual(TEXT("Plant masked mesh name"),
-            FString::Printf(TEXT("SM_%s_%s"), *PlantStem, TEXT("01")),
-            FString(TEXT("SM_Env_Grass_abc123_01")));
-  // 裁切网格与 masked 同名，使用 Op 目录标识区分。
-  TestEqual(TEXT("Plant cut mesh keeps the plain name"),
-            FString::Printf(TEXT("SM_%s_%s"), *PlantStem, TEXT("01")),
-            FString(TEXT("SM_Env_Grass_abc123_01")));
   TestEqual(TEXT("Plant texture name uses slot abbreviation"),
             FString::Printf(TEXT("T_%s_%s"), *SurfaceStem, TEXT("D")),
             FString(TEXT("T_Env_Foliage_Conifer_D")));
@@ -12035,15 +11953,6 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
                 SurfaceStem, true,
                 false),
             FString(TEXT("MI_Env_Foliage_Conifer_Billboard")));
-  TArray<FString> MegascansPlantTags;
-  MegascansPlantTags.Add(TEXT("Megascans"));
-  const FString MegascansPlantStem =
-      BuildPlantObjectStem(MegascansPlantTags, TEXT("abc123"));
-  TestEqual(TEXT("Megascans plant stem uses Foliage segment"),
-            MegascansPlantStem, FString(TEXT("Env_Foliage_abc123")));
-  TestEqual(TEXT("Megascans plant mesh uses Foliage segment"),
-            FString::Printf(TEXT("SM_%s_%s"), *MegascansPlantStem, TEXT("01")),
-            FString(TEXT("SM_Env_Foliage_abc123_01")));
 
   TMap<UStaticMesh *, FString> OpaqueOnlyPlantVariants;
   OpaqueOnlyPlantVariants.Add(nullptr, TEXT("01"));
