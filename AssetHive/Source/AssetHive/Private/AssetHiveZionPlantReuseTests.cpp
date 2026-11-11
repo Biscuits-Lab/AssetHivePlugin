@@ -1,6 +1,8 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "AssetHiveZionPlantReuse.h"
 #include "Misc/AutomationTest.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveZionPlantReuseTest,
     "AssetHive.Import.ZionPlantMaterialReuse",
@@ -69,9 +71,32 @@ bool FAssetHiveZionPlantReuseTest::RunTest(const FString &Parameters) {
   First->SetNumberField(TEXT("xMin"), 1.0 + 1.e-12);
   TestEqual(TEXT("填入 MI 后相同的 float 值可以共享"), Wind, WindKey(Profile, nullptr));
   TestEqual(TEXT("UV3 解码按 MI 的 float 精度比较"), Proof, RemapProof(Profile, nullptr, true));
+  First->RemoveField(TEXT("xMin"));
+  First->SetNumberField(TEXT("XMIN"), 1);
+  TestEqual(TEXT("参数名大小写不影响最终风参数"), Wind, WindKey(Profile, nullptr));
+  TestEqual(TEXT("解码参数名大小写不影响共享依据"), Proof, RemapProof(Profile, nullptr, true));
   First->SetNumberField(TEXT("XMIN"), 7);
-  TestTrue(TEXT("参数别名有冲突时不提供共享依据"), WindKey(Profile, nullptr).IsEmpty());
-  TestTrue(TEXT("解码参数别名有冲突时保留独立实例"), RemapProof(Profile, nullptr, true).IsEmpty());
+  TestNotEqual(TEXT("别名的实际数值变化会改变风参数"), Wind, WindKey(Profile, nullptr));
+  TestNotEqual(TEXT("别名的实际解码值变化会阻止共享 MI"), Proof, RemapProof(Profile, nullptr, true));
+  TestEqual(TEXT("材质覆盖按参数名忽略大小写"), Wind, WindKey(Profile, Material));
+  TestEqual(TEXT("解码证明采用材质覆盖后的别名值"), Proof, RemapProof(Profile, Material, true));
+
+  const int32 ScalarCount = First->Values.Num();
+  TSharedPtr<FJsonObject> ParsedAliases;
+  const auto AliasReader = TJsonReaderFactory<>::Create(TEXT("{\"XMIN\":7,\"xMin\":1}"));
+  if (!TestTrue(TEXT("按导入链路解析含大小写别名的 JSON"),
+                FJsonSerializer::Deserialize(AliasReader, ParsedAliases))) return false;
+  for (const auto &Entry : ParsedAliases->Values) First->SetField(Entry.Key, Entry.Value);
+  // UE 5.8 的 SharedString 键会合并大小写别名；旧版 FString 键可同时保留两项。
+  if (First->Values.Num() == ScalarCount + 1) {
+    TestTrue(TEXT("同时存在冲突别名时不提供共享依据"), WindKey(Profile, nullptr).IsEmpty());
+    TestTrue(TEXT("同时存在冲突解码别名时保留独立实例"), RemapProof(Profile, nullptr, true).IsEmpty());
+  } else {
+    TestEqual(TEXT("JSON 合并别名后只保留一个参数"), First->Values.Num(), ScalarCount);
+    TestEqual(TEXT("JSON 合并别名时保留最后写入值"), First->GetNumberField(TEXT("xMin")), 1.0);
+    TestEqual(TEXT("合并后的风参数与实际写入值一致"), Wind, WindKey(Profile, nullptr));
+    TestEqual(TEXT("合并后的解码证明与实际写入值一致"), Proof, RemapProof(Profile, nullptr, true));
+  }
 
   const auto Asset = [](const FString &Name, const FString &Type) -> TSharedPtr<FJsonValue> {
     auto Object = MakeShared<FJsonObject>();
