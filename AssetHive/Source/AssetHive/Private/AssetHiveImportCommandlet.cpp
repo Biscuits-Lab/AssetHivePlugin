@@ -476,10 +476,10 @@ static FString BuildPlantMeshName(const FString &Identifier, const FString &Vari
   return Name;
 }
 
-// 纹理和 MI 共用资产名。多个材质组用源槽名区分，未命名的组沿用组号。
-static FString BuildPlantMaterialStem(const FString &AssetName, const FString &MaterialName,
+// 与网格共用标识：Zion 使用资产名，第三方使用库 ID。多组追加源槽名或组号。
+static FString BuildPlantMaterialStem(const FString &Identifier, const FString &MaterialName,
                                       int32 GroupId, bool bMultipleGroups) {
-  const FString Base = TEXT("Env_Foliage_") + AssetName;
+  const FString Base = TEXT("Env_Foliage_") + Identifier;
   if (!bMultipleGroups) return Base;
   return Base + TEXT("_") + (MaterialName.IsEmpty()
       ? FString::Printf(TEXT("%03d"), GroupId) : MaterialName);
@@ -9025,8 +9025,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         AssetType == TEXT("3dplant") && bIsZionAsset
             ? SafeAssetFolderName
             : FString::Printf(TEXT("%s_%s"), *SafeAssetName, *SafeAssetId);
-    FString PlantDisplayName = bZionPlant ? SafeAssetFolderName : FolderStemSource;
-    if (!bZionPlant && bHasLibraryId) PlantDisplayName.RemoveFromEnd(TEXT("_") + SafeAssetId, ESearchCase::IgnoreCase);
+    const FString PlantObjectIdentifier = (bZionPlant ? SafeAssetFolderName : SafeAssetId).TrimStartAndEnd();
     const bool bFbxPlantModels = AssetType == TEXT("3dplant") && AssetHasFbxPlantModels(AssetObject);
     const bool bOpaquePlantSet = bFbxPlantModels && IsOpaquePlantModelSet(AssetObject);
     // 第三方的两种表示放在同一 Name_ID 资产目录下。
@@ -9378,7 +9377,6 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         }
       }
 
-      const FString PlantMeshIdentifier = (bZionPlant ? SafeAssetFolderName : SafeAssetId).TrimStartAndEnd();
       const bool bNumberSinglePlant = bThirdPartyPlant || bFbxPlantModels || bHasExplicitModelVariants;
       bool bHandledModelImport = false;
       if (AssetType == TEXT("3dplant")) {
@@ -9462,7 +9460,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           // 裁切版本由 Op 目录区分，沿用相同的网格名称。
           const bool bIncludeVariant = bNumberSinglePlant || VariantKeys.Num() > 1;
           const FString BaseMeshName = BuildPlantMeshName(
-              PlantMeshIdentifier, bIncludeVariant ? VariantKey : FString());
+              PlantObjectIdentifier, bIncludeVariant ? VariantKey : FString());
 
           Models.Add({BaseFile, BaseMeshName, VariantKey, true});
         }
@@ -9507,7 +9505,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
           } else if (AssetType == TEXT("3dplant")) {
             const bool bIncludeVariant = bNumberSinglePlant || ValidModelCount > 1;
             ModelAssetName = BuildPlantMeshName(
-                PlantMeshIdentifier, bIncludeVariant ? VariantKey : FString());
+                PlantObjectIdentifier, bIncludeVariant ? VariantKey : FString());
           } else {
             ModelAssetName = FString::Printf(TEXT("SM_%s_%s"), *AssetStem,
                                              *DetectModelSuffix(SourceFile));
@@ -10380,7 +10378,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             OpacityTexture, TextureBySlot.FindRef(TEXT("emissive")), bMasked, &Dependencies);
       } else {
         if (AssetType == TEXT("3dplant")) {
-          const FString PlantMaterialStem = BuildPlantMaterialStem(PlantDisplayName,
+          const FString PlantMaterialStem = BuildPlantMaterialStem(PlantObjectIdentifier,
               NamedMaterialNames.FindRef(GroupId), GroupId,
               bNamedZionPlant ? ReferencedNamedGroups.Num() > 1 : GroupIds.Num() > 1);
           if (bNamedZionPlant) {
@@ -11924,6 +11922,27 @@ bool FAssetHiveAssetIdNamingTest::RunTest(const FString &Parameters) {
   TestEqual(TEXT("Third-party plant mesh uses Foliage with the library ID"),
             BuildPlantMeshName(TEXT("abc123"), TEXT("01")),
             FString(TEXT("SM_Env_Foliage_abc123_01")));
+  const FString ThirdPartyPlantStem = BuildPlantMaterialStem(TEXT("abc123"), FString(), 1, false);
+  TestEqual(TEXT("第三方植被 MI 使用与网格相同的库 ID"),
+            UAssetHiveSettings::GetPlantMaterialName(ThirdPartyPlantStem, false, false),
+            FString(TEXT("MI_Env_Foliage_abc123")));
+  for (const TCHAR *Suffix : {TEXT("D"), TEXT("N"), TEXT("ORM"), TEXT("O"), TEXT("SSC")}) {
+    TestEqual(TEXT("第三方植被纹理使用与网格相同的库 ID"),
+              FString::Printf(TEXT("T_%s_%s"), *ThirdPartyPlantStem, Suffix),
+              FString(TEXT("T_Env_Foliage_abc123_")) + Suffix);
+  }
+  TestEqual(TEXT("第三方裁切 MI 保留库 ID 和 Op 后缀"),
+            UAssetHiveSettings::GetPlantMaterialName(ThirdPartyPlantStem, false, true),
+            FString(TEXT("MI_Env_Foliage_abc123_Op")));
+  TestEqual(TEXT("第三方 Billboard MI 保留库 ID"),
+            UAssetHiveSettings::GetPlantMaterialName(ThirdPartyPlantStem, true, false),
+            FString(TEXT("MI_Env_Foliage_abc123_Billboard")));
+  TestEqual(TEXT("第三方多材质组在库 ID 后追加槽名"),
+            BuildPlantMaterialStem(TEXT("abc123"), TEXT("Branch"), 2, true),
+            FString(TEXT("Env_Foliage_abc123_Branch")));
+  TestEqual(TEXT("第三方未命名材质组在库 ID 后追加组号"),
+            BuildPlantMaterialStem(TEXT("abc123"), FString(), 2, true),
+            FString(TEXT("Env_Foliage_abc123_002")));
   const FString SurfaceStem = BuildPlantMaterialStem(TEXT("Conifer"), TEXT("Conifer_Mat"), 1, false);
   TestEqual(TEXT("Zion plant texture name uses the asset name"),
             FString::Printf(TEXT("T_%s_ORM"), *SurfaceStem),
@@ -14102,6 +14121,74 @@ bool FAssetHiveBillboardProjectTest::RunTest(const FString &Parameters) {
       }
       TestEqual(Family + TEXT(" imported one mesh"), Meshes, 1);
     }
+  }
+  return true;
+}
+
+// Optional integration fixture: verify the ID at the import call sites, not only in name helpers.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveThirdPartyIdProjectTest, "AssetHive.Import.ThirdPartyIdProjectImport",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveThirdPartyIdProjectTest::RunTest(const FString &Parameters) {
+  FString File;
+  if (!FParse::Value(FCommandLine::Get(), TEXT("AssetHiveThirdPartyIdJob="), File)) {
+    AddInfo(TEXT("Supply -AssetHiveThirdPartyIdJob=<job> in a scratch project with plant parents."));
+    return true;
+  }
+  FString Json;
+  TSharedPtr<FJsonObject> Job;
+  if (!TestTrue(TEXT("Read desktop export job"), FFileHelper::LoadFileToString(Json, *File) &&
+      FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Json), Job))) return false;
+  auto *Importer = NewObject<UAssetHiveImportCommandlet>();
+  FGCObjectScopeGuard Guard(Importer);
+  auto &Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+  const auto &Inputs = Job->GetArrayField(TEXT("assets"));
+  TArray<FString> FirstPaths;
+  for (int32 Pass = 0; Pass < 2; ++Pass) {
+    TArray<FString> Folders, Paths;
+    if (!TestEqual(TEXT("Import third-party batch"), Importer->ImportJob(Job, TEXT("/Game/AssetHiveIdTest"), {}, &Folders), 0) ||
+        !TestEqual(TEXT("Every fixture imported"), Folders.Num(), Inputs.Num())) return false;
+    for (int32 Index = 0; Index < Inputs.Num(); ++Index) {
+      const auto Input = Inputs[Index]->AsObject();
+      const FString Id = MakeSafeObjectName(Input->GetStringField(TEXT("id")));
+      const FString Stem = TEXT("Env_Foliage_") + Id;
+      TArray<FAssetData> Assets;
+      Registry.GetAssetsByPath(FName(*Folders[Index]), Assets, true);
+      int32 MeshCount = 0, MaterialCount = 0, TextureCount = 0;
+      for (const auto &Asset : Assets) {
+        UObject *Object = Asset.GetAsset();
+        if (!TestNotNull(TEXT("Imported object"), Object)) continue;
+        Paths.Add(Object->GetPathName());
+        if (auto *Mesh = Cast<UStaticMesh>(Object)) {
+          ++MeshCount;
+          TestTrue(Mesh->GetName() + TEXT(" mesh ID"), Mesh->GetName().StartsWith(TEXT("SM_") + Stem + TEXT("_")));
+          for (const auto &Slot : Mesh->GetStaticMaterials()) {
+            auto *MI = Cast<UMaterialInstanceConstant>(Slot.MaterialInterface);
+            TestTrue(Mesh->GetName() + TEXT(" material reference ID"), MI &&
+                (MI->GetName() == TEXT("MI_") + Stem || MI->GetName().StartsWith(TEXT("MI_") + Stem + TEXT("_"))));
+          }
+        } else if (auto *MI = Cast<UMaterialInstanceConstant>(Object)) {
+          ++MaterialCount;
+          TestTrue(MI->GetName() + TEXT(" material ID"), MI->GetName() == TEXT("MI_") + Stem ||
+              MI->GetName().StartsWith(TEXT("MI_") + Stem + TEXT("_")));
+          TestTrue(MI->GetName() + TEXT(" texture overrides present"), MI->TextureParameterValues.Num() >= 4);
+          for (const auto &Parameter : MI->TextureParameterValues) {
+            TestTrue(MI->GetName() + TEXT(" texture reference ID"), Parameter.ParameterValue &&
+                Parameter.ParameterValue->GetName().StartsWith(TEXT("T_") + Stem + TEXT("_")));
+          }
+        } else if (auto *Texture = Cast<UTexture>(Object)) {
+          ++TextureCount;
+          TestTrue(Texture->GetName() + TEXT(" texture ID"), Texture->GetName().StartsWith(TEXT("T_") + Stem + TEXT("_")));
+        }
+      }
+      TestEqual(Id + TEXT(" mesh count"), MeshCount, Input->GetArrayField(TEXT("modelVariants")).Num());
+      const int32 Groups = Input->GetArrayField(TEXT("materialGroups")).Num();
+      TestEqual(Id + TEXT(" material count"), MaterialCount, Groups);
+      TestEqual(Id + TEXT(" texture count"), TextureCount, Groups * 4);
+      AddInfo(FString::Printf(TEXT("Pass %d %s: %d meshes, %d materials, %d textures"), Pass, *Id, MeshCount, MaterialCount, TextureCount));
+    }
+    Paths.Sort();
+    if (Pass == 0) FirstPaths = Paths;
+    else TestTrue(TEXT("Reimport reuses the same asset paths"), FirstPaths == Paths);
   }
   return true;
 }
