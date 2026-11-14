@@ -6316,11 +6316,10 @@ static void Configure3DAssetCollision(UStaticMesh *StaticMesh) {
   if (!bHasCollision && GEditor) {
     if (UStaticMeshEditorSubsystem *Subsystem =
             GEditor->GetEditorSubsystem<UStaticMeshEditorSubsystem>()) {
-      // 临时凸包碰撞参数（2026-10-09 定稿）：Hull Count 64、Max Hull Verts 32、
-      // Hull Precision 1000000（UE 上限）。精度过低会抹掉模型轮廓细节。
-      constexpr int32 TemporaryHullCount = 64;
-      constexpr int32 TemporaryHullMaxVerts = 32;
-      constexpr int32 TemporaryHullPrecision = 1000000;
+      // 与静态网格编辑器 SConvexDecomposition 面板的默认值一致。
+      constexpr int32 TemporaryHullCount = 4;
+      constexpr int32 TemporaryHullMaxVerts = 16;
+      constexpr int32 TemporaryHullPrecision = 100000;
       Subsystem->SetConvexDecompositionCollisions(
           StaticMesh, TemporaryHullCount, TemporaryHullMaxVerts,
           TemporaryHullPrecision);
