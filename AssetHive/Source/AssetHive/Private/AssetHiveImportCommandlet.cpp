@@ -915,6 +915,7 @@ inline int32 WeldCoincidentVertices(int32 VertexCount, TGetPosition &&GetPositio
 // influence once at the attachment, including leaves attached to a bent twig.
 struct FHerbWindAxis {
   FVector3f Base = FVector3f::ZeroVector, Tip = FVector3f::ZeroVector;
+  bool bCantileverWeight = false;
   FVector3f Delta() const { return Tip - Base; }
   float Length() const { return Delta().Size(); }
   float Along(const FVector3f& P) const {
@@ -922,6 +923,12 @@ struct FHerbWindAxis {
         FMath::Max(Delta().SizeSquared(), SMALL_NUMBER), 0.f, 1.f);
   }
   float Distance(const FVector3f& P) const { return FVector3f::Dist(P, Base + Along(P) * Delta()); }
+  float PrimaryWeight(float Fraction) const {
+    // A long, unbranched culm must keep increasing its bending slope toward
+    // the tip. SmoothStep flattens at the tip and introduces an S-shaped bend.
+    const float T = FMath::Clamp((Fraction - .025f) / .975f, 0.f, 1.f);
+    return bCantileverWeight ? .70f * T * T : .70f * FMath::SmoothStep(.025f, 1.f, Fraction);
+  }
 };
 struct FHerbWindBinding {
   FHerbWindAxis Primary, Secondary, Blade;
@@ -4704,6 +4711,7 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
     if (!bSurfaceOnly || HasSurface[I]) Grid.Add(Cell(C),I);
   }
   const auto Axis=[&](const FJsonObject& Row,const TCHAR* Field,const TCHAR* Table,FHerbWindAxis& A) {
+    A.bCantileverWeight=false;
     const auto* Value=Row.Values.Find(Field);
     if (!Value || !Value->IsValid()) return false;
     if ((*Value)->IsNull()) return true;
@@ -4722,6 +4730,12 @@ static bool ReadPlantLayerBindings(const FJsonObject& Variant,const FMeshDescrip
       const auto* Base=(*AxisObject)->Values.Find(TEXT("base"));
       const auto* Tip=(*AxisObject)->Values.Find(TEXT("tip"));
       if (!Base || !Tip || !Vector(*Base,A.Base) || !Vector(*Tip,A.Tip)) return false;
+      if ((*AxisObject)->HasField(TEXT("weightProfile"))) {
+        FString Profile;
+        if (!(*AxisObject)->TryGetStringField(TEXT("weightProfile"),Profile) ||
+            (Profile!=TEXT("smoothstep") && Profile!=TEXT("cantilever"))) return false;
+        A.bCantileverWeight = Profile==TEXT("cantilever");
+      }
     } else if (!V->TryGetArray(Points) || Points->Num()!=2 || !Vector((*Points)[0],A.Base) || !Vector((*Points)[1],A.Tip)) return false;
     A.Base=Islands.MeshMin+A.Base*Size; A.Tip=Islands.MeshMin+A.Tip*Size; return true;
   };
@@ -6089,7 +6103,7 @@ static bool ApplySyntheticSpeedTreeWind(UStaticMesh *StaticMesh, EPlantSynthetic
             const float Primary = B.PrimaryAttachment < 0.f ? B.Primary.Along(Position) : B.PrimaryAttachment;
             const float Child = B.SecondaryAttachment < 0.f ? B.Secondary.Along(Position) : B.SecondaryAttachment;
             const float Root = B.RootOuter > 0.f ? FMath::SmoothStep(B.RootInner, B.RootOuter, FVector3f::Dist(Position, B.RootContact)) : 1.f;
-            return Root * FVector3f(.70f * FMath::SmoothStep(.025f,1.f,Primary),
+            return Root * FVector3f(B.Primary.PrimaryWeight(Primary),
                              .64f * FMath::SmoothStep(.035f,1.f,Child),
                              M->Ripple * FMath::SmoothStep(.30f,1.f,B.Blade.Along(Position)));
           };
@@ -13619,6 +13633,27 @@ bool FAssetHiveWindUnusedSourceVerticesTest::RunTest(const FString &Parameters) 
     TestEqual(TEXT("Unused native vertex has no local wind axis"),
         Result[Islands.IslandOfVertex[Unused.GetValue()]].Primary.Length(),0.f);
   }
+  Variant=MakeVariant();
+  auto CulmAxis=MakeShared<FJsonObject>();
+  CulmAxis->SetField(TEXT("base"),VectorJson(0.,0.,0.));
+  CulmAxis->SetField(TEXT("tip"),VectorJson(0.,0.,1.));
+  CulmAxis->SetStringField(TEXT("weightProfile"),TEXT("cantilever"));
+  Variant->GetArrayField(TEXT("bindings"))[0]->AsObject()->SetObjectField(TEXT("primary"),CulmAxis);
+  TestTrue(TEXT("Long culm profile is read from the original axis"),
+      ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,FString()));
+  if (Result.Num()==4) {
+    const auto& Axis=Result[Islands.IslandOfVertex[0]].Primary;
+    TestTrue(TEXT("Culm root remains fixed"),Axis.PrimaryWeight(0.f)==0.f);
+    TestTrue(TEXT("Culm bend slope increases toward the tip"),
+        Axis.PrimaryWeight(.9f)-Axis.PrimaryWeight(.8f) > Axis.PrimaryWeight(.6f)-Axis.PrimaryWeight(.5f));
+    TestTrue(TEXT("Culm endpoint retains its original peak"),FMath::IsNearlyEqual(Axis.PrimaryWeight(1.f),.7f));
+    const auto& Legacy=Result[Islands.IslandOfVertex[3]].Primary;
+    TestEqual(TEXT("Unmarked axes retain the original weight contract"),
+        Legacy.PrimaryWeight(.7f),.70f*FMath::SmoothStep(.025f,1.f,.7f));
+  }
+  CulmAxis->SetStringField(TEXT("weightProfile"),TEXT("unknown"));
+  TestFalse(TEXT("Unknown culm profiles cannot silently bake the wrong field"),
+      ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,FString()));
   Variant=MakeVariant(); Variant->GetObjectField(TEXT("counts"))->SetNumberField(TEXT("noSurfaceIslands"),1);
   TestFalse(TEXT("A real surface count mismatch remains rejected"),
       ReadPlantLayerBindings(*Variant,Mesh,Islands,Result,Error,FString()));
