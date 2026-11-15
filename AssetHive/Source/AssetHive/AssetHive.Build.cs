@@ -28,6 +28,7 @@ public class AssetHive : ModuleRules
             "Foliage",
             "Json",
             "JsonUtilities",
+            "PythonScriptPlugin",
             "LevelEditor",
             "MaterialEditor",
             "UnrealEd",

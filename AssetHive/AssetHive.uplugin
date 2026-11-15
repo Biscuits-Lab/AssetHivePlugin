@@ -21,5 +21,11 @@
 			"LoadingPhase": "Default"
 		}
 	],
-	"IsExperimentalVersion": false
+	"IsExperimentalVersion": false,
+	"Plugins": [
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		}
+	]
 }

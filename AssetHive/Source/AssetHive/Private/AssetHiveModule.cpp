@@ -1,4 +1,5 @@
 #include "AssetHiveModule.h"
+#include "AssetHiveSuitImport.h"
 #include "AssetHiveSettings.h"
 #include "AssetHiveEditorToolbar.h"
 #include "AssetHiveImportCommandlet.h"
@@ -98,7 +99,8 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
                                                  MakeShared<FJsonValueString>(TEXT("plantExportV2")),
                                                  MakeShared<FJsonValueString>(TEXT("plantCantileverWeights")),
                                                  MakeShared<FJsonValueString>(TEXT("meshOnlyOverwrite")),
-                                                 MakeShared<FJsonValueString>(TEXT("selectiveOverwrite"))});
+                                                 MakeShared<FJsonValueString>(TEXT("selectiveOverwrite")),
+                                                 MakeShared<FJsonValueString>(TEXT("characterSuitV1"))});
         Info->SetNumberField(TEXT("protocolVersion"), 2);
         Info->SetStringField(TEXT("sessionId"), SessionId);
         Info->SetStringField(TEXT("projectPath"), FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()));
@@ -154,6 +156,17 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
     RequestStates.Add(RequestId, Accepted);
     SendJson(Accepted);
     const TWeakPtr<TAtomic<bool>> WeakLifetime = LifetimeToken;
+    if ((*Job)->HasField(TEXT("characterSuit")))
+    {
+        // Interchange's synchronous import pumps the task graph. Do not call it from a task-graph task.
+        FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([this, WeakLifetime, RequestId, JobData = *Job](float)
+        {
+            const auto Lifetime = WeakLifetime.Pin();
+            if (Lifetime.IsValid() && Lifetime->Load()) RunImport(RequestId, JobData);
+            return false;
+        }));
+        return;
+    }
     AsyncTask(ENamedThreads::GameThread, [this, WeakLifetime, RequestId, JobData = *Job]()
     {
         const auto Lifetime = WeakLifetime.Pin();
@@ -192,21 +205,35 @@ void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJso
 {
     check(IsInGameThread());
 
-    TStrongObjectPtr<UAssetHiveImportCommandlet> Importer(NewObject<UAssetHiveImportCommandlet>(GetTransientPackage()));
-    // Read the project setting for each NEW import. Desktop payloads cannot override it.
     const FString Root = UAssetHiveSettings::GetImportRootPath();
     TArray<FString> ImportedFolders;
-    TArray<TSharedPtr<FJsonValue>> AssetResults;
-    const int32 ExitCode = Importer->ImportJob(Job, Root, [this, RequestId](int32 Percent, const FString& Stage, bool bShowInEditor)
-    {
-        RecordProgress(RequestId, Percent, Stage, bShowInEditor);
-    }, &ImportedFolders, &AssetResults);
     auto Result = MakeShared<FJsonObject>();
-    Result->SetStringField(TEXT("type"), ExitCode == 0 ? TEXT("complete") : TEXT("error"));
+    const TSharedPtr<FJsonObject>* SuitJob = nullptr;
+    if (Job->TryGetObjectField(TEXT("characterSuit"), SuitJob) && SuitJob && SuitJob->IsValid())
+    {
+        RecordProgress(RequestId, 0, TEXT("正在检查/处理套装资源"), false);
+        const auto SuitResult = AssetHiveSuitImport::Run(SuitJob->ToSharedRef(), [this, RequestId](int32 Percent, const FString& Stage)
+        {
+            RecordProgress(RequestId, Percent, Stage, false);
+        });
+        Result->SetStringField(TEXT("type"), TEXT("complete"));
+        Result->SetObjectField(TEXT("suitResult"), SuitResult);
+        Result->SetStringField(TEXT("message"), TEXT("套装逐项处理完成"));
+    }
+    else
+    {
+        TStrongObjectPtr<UAssetHiveImportCommandlet> Importer(NewObject<UAssetHiveImportCommandlet>(GetTransientPackage()));
+        TArray<TSharedPtr<FJsonValue>> AssetResults;
+        const int32 ExitCode = Importer->ImportJob(Job, Root, [this, RequestId](int32 Percent, const FString& Stage, bool bShowInEditor)
+        {
+            RecordProgress(RequestId, Percent, Stage, bShowInEditor);
+        }, &ImportedFolders, &AssetResults);
+        Result->SetStringField(TEXT("type"), ExitCode == 0 ? TEXT("complete") : TEXT("error"));
+        Result->SetArrayField(TEXT("assetResults"), AssetResults);
+        Result->SetStringField(TEXT("message"), ExitCode == 0 ? TEXT("Unreal 导入完成") : TEXT("导入失败，请查看 Unreal Output Log"));
+    }
     Result->SetStringField(TEXT("requestId"), RequestId);
     Result->SetStringField(TEXT("destinationPath"), Root);
-    Result->SetArrayField(TEXT("assetResults"), AssetResults);
-    Result->SetStringField(TEXT("message"), ExitCode == 0 ? TEXT("Unreal 导入完成") : TEXT("导入失败，请查看 Unreal Output Log"));
     RequestStates.Add(RequestId, Result);
     CompletedRequests.Add(RequestId);
     // Bounded session-local history for reconnect queries. Never evict an active import.
