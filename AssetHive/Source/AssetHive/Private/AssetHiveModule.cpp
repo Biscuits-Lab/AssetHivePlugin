@@ -96,7 +96,8 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
         Info->SetArrayField(TEXT("capabilities"), {MakeShared<FJsonValueString>(TEXT("zion3dMaterialNames")),
                                                  MakeShared<FJsonValueString>(TEXT("zionPlantMaterialReuse")),
                                                  MakeShared<FJsonValueString>(TEXT("plantExportV2")),
-                                                 MakeShared<FJsonValueString>(TEXT("meshOnlyOverwrite"))});
+                                                 MakeShared<FJsonValueString>(TEXT("meshOnlyOverwrite")),
+                                                 MakeShared<FJsonValueString>(TEXT("selectiveOverwrite"))});
         Info->SetNumberField(TEXT("protocolVersion"), 2);
         Info->SetStringField(TEXT("sessionId"), SessionId);
         Info->SetStringField(TEXT("projectPath"), FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()));
