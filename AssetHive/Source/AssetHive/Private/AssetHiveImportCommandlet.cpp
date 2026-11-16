@@ -7751,7 +7751,8 @@ CreateEnvironmentAssetMaterialInstance(
     const FEnvironmentAssetProfile &Profile, UTexture *AlbedoTexture,
     UTexture *NormalTexture, UTexture *ORMTexture, UTexture *MegaMaskTexture,
     UTexture *OpacityTexture, UTexture *EmissiveTexture, bool bMasked,
-    FAssetHiveDependencyPolicy* Policy = nullptr) {
+    FAssetHiveDependencyPolicy* Policy = nullptr,
+    FName OpacityParameterOverride = NAME_None) {
   UMaterialInstanceConstant* Existing = nullptr;
   if (Policy && Policy->Reuse(MaterialFolder, MaterialAssetName, Existing)) return Existing;
   const bool bUseMaskedParent = bMasked && Profile.bBaseFamily;
@@ -7790,7 +7791,8 @@ CreateEnvironmentAssetMaterialInstance(
   const FString NormalParameter = UAssetHiveSettings::GetAssetNormalParameter();
   const FString ORMParameter =
       UAssetHiveSettings::GetAssetORMTextureParameter();
-  const FString MaskParameter = UAssetHiveSettings::GetAssetMaskParameter();
+  const FString MaskParameter = OpacityParameterOverride.IsNone()
+      ? UAssetHiveSettings::GetAssetMaskParameter() : OpacityParameterOverride.ToString();
   const FString MegaMaskParameter =
       UAssetHiveSettings::GetAssetMegaMaskParameter();
   const FString EmissiveParameter =
@@ -8783,13 +8785,15 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             static_cast<int32>(FMath::Clamp(OpaqueFaceBudgetRaw, 1.0, 5000000.0));
       }
     }
-    AssetType = AssetType.ToLower();
+    AssetType = AssetType.TrimStartAndEnd().ToLower();
+    if (AssetType == TEXT("atlases")) AssetType = TEXT("atlas");
     bool bCreateFoliageForAsset = false;
     const bool bHasCreateFoliageOverride = AssetObject->TryGetBoolField(
         TEXT("createFoliage"), bCreateFoliageForAsset);
     if (!bHasCreateFoliageOverride) {
       bCreateFoliageForAsset = bCreateFoliageDefault;
     }
+    const bool bIsAtlas = AssetType == TEXT("atlas");
     const bool bIsSurface = AssetType == TEXT("surface");
     const bool bIsDecal = AssetType == TEXT("decal");
     const bool bIsHdri = AssetType == TEXT("hdri");
@@ -8812,6 +8816,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     bool bSkippedNewMeshes = false;
     FAssetHiveMeshStaging Staging;
     const bool bIs3DAsset = AssetType == TEXT("3d");
+    const bool bUsesObjectMaterial = bIs3DAsset || bIsAtlas;
     const bool bHasLibraryId = !AssetId.TrimStartAndEnd().IsEmpty();
     if (!bHasLibraryId) {
       AssetId = TEXT("UnknownId");
@@ -8826,6 +8831,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // 所有 Asset Type 都收标签：第三方目录判定对 Surface / Decal 同样生效，而这两类的
     // job 只有 tags、没有 standardAssetTags。
     CollectAssetTags(AssetObject, AssetStandardTags);
+    if (bIsAtlas) AssetStandardTags.AddUnique(TEXT("ThirdParty"));
     // 分类用的标签集合（标准 Asset Tag 优先，缺失时回落到合并 tags）。3D 资产的分类
     // 与减面档位都基于这一份，避免两处口径漂移。
     TArray<FString> EnvironmentProfileTags;
@@ -8840,9 +8846,9 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // Megascans / PBRMAX 来源标记（见 IsThirdPartyAsset）；Surface / Decal 的 job 只有
     // tags、没有 standardAssetTags。
     const bool bThirdPartyFolder =
-        (bIs3DAsset || AssetType == TEXT("3dplant") || bIsSurface || bIsDecal) &&
+        (bUsesObjectMaterial || AssetType == TEXT("3dplant") || bIsSurface || bIsDecal) &&
         IsThirdPartyAsset(AssetStandardTags);
-    if (bIs3DAsset) {
+    if (bUsesObjectMaterial) {
       // 第三方 Props（2026-10-28）：来源标记只写在 tags 里（Megascans / PBRMAX）而标准标签
       // 只有 Props 时，也给分类补 ThirdParty 标记，让"第三方 Props 走 Objects 档"对旧载荷生效。
       // （标记已在上面统一补齐，这里保留注释说明来源。）
@@ -8857,7 +8863,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       // Props → Props、Destructible → Destructible、MEGA → MEGA），保持这份映射
       // 只有一处权威定义；非 Zion 资产仍由导出侧给出分类。
       // 用户选定的二级目录走独立的 zionSubfolder 字段，在下面单独拼接。
-      if (CategoryFolder.TrimStartAndEnd().IsEmpty()) {
+      if (bIsAtlas || CategoryFolder.TrimStartAndEnd().IsEmpty()) {
         CategoryFolder = EnvironmentProfile.FolderName;
       }
       // 迁移期兜底：第三方资产若来自不带标准标签的老 job / 老库，导出侧仍会给出按类型
@@ -8943,7 +8949,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const bool bScanSourceAsset = ShouldApplyDressingTriangleBudget(
         bIs3DAsset, bThirdPartyAssetTags, FixedTriangleBudget);
     FString AssetDestinationPath =
-        bIs3DAsset ? TEXT("/Game/Environment/Asset") : DestinationPath;
+        bUsesObjectMaterial ? TEXT("/Game/Environment/Asset") : DestinationPath;
     if (AssetType == TEXT("3dplant")) {
       // md §5.2：Content/Environment/Asset/Vegetation/<Tree|Bush|Grass|Micro|HeroFoliage>/
       AssetDestinationPath = TEXT("/Game/Environment/Asset/Vegetation");
@@ -8966,7 +8972,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     //     Material/Tex/Mesh 子目录、命名从文件夹名派生），但目录进**自身分类下的 Temp**：
     //     Props/Temp、Kit/Temp、MEGA/Temp、Destructible/Temp、Objects/Temp。
     // 两者都不追加 ThirdParty 层（Temp 也不叠第三方层）。
-    const bool bExplicitZionAsset = HasZionTaggedAsset(AssetObject);
+    const bool bExplicitZionAsset = !bIsAtlas && HasZionTaggedAsset(AssetObject);
     const bool bMicroPlant = AssetType == TEXT("3dplant") && PlantProfile.SubtypeFolder == TEXT("Micro");
     const FString ZionPlantParentMaterialPath = bMicroPlant
         ? TEXT("/Game/MaterialLibrary/Environment/MI_Foliage/MI_Env_Micro_ST_VT.MI_Env_Micro_ST_VT")
@@ -8975,7 +8981,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       UE_LOG(LogTemp, Log, TEXT("AssetHive import: Zion 植被默认父材质: %s"),
              *ZionPlantParentMaterialPath);
     }
-    const bool bTempAsset = HasAssetTag(AssetStandardTags, TEXT("Temp"));
+    const bool bTempAsset = !bIsAtlas && HasAssetTag(AssetStandardTags, TEXT("Temp"));
     const bool bIsZionAsset = bExplicitZionAsset || bTempAsset;
     const bool bThirdPartyPlant = AssetType == TEXT("3dplant") && !bIsZionAsset;
     if (bThirdPartyPlant && !bHasLibraryId) {
@@ -9067,7 +9073,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     // "Temp_ 前缀"只在文件夹名这一处计算，SM_/T_/MI_ 与文件夹因此天然一致，
     // 不会出现 ID 重复或 "__"。
     const FString EnvironmentStem =
-        bIs3DAsset ? BuildEnvironmentObjectStem(EnvironmentProfile, AssetName,
+        bUsesObjectMaterial ? BuildEnvironmentObjectStem(EnvironmentProfile, AssetName,
                                                 AssetId, SafeAssetFolderName)
                    : FString();
     // Zion 资产的二级目录：基础分类目录之后、资产文件夹之前的那一层。
@@ -9365,7 +9371,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     FString PrimaryModelVariantKey = TEXT("01");
     bool bPrimaryModelVariantResolved = false;
     const TArray<TSharedPtr<FJsonValue>> *ModelFiles = nullptr;
-    if (AssetObject->TryGetArrayField(TEXT("modelFiles"), ModelFiles) &&
+    if (!bIsAtlas && AssetObject->TryGetArrayField(TEXT("modelFiles"), ModelFiles) &&
         ModelFiles != nullptr) {
       TMap<FString, FString> ExplicitVariantByFile;
       bool bHasExplicitModelVariants = false;
@@ -9719,7 +9725,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       MissingParent = UAssetHiveSettings::GetSurfaceParentMaterialPath();
     } else if (bIsDecal && !UAssetHiveSettings::GetDecalParentMaterial(DecalParentMode)) {
       MissingParent = UAssetHiveSettings::GetDecalParentMaterialPath(DecalParentMode);
-    } else if (bIs3DAsset && !bNamedZion3D && Dependencies.bCreateMissing) {
+    } else if (bUsesObjectMaterial && !bNamedZion3D && Dependencies.bCreateMissing) {
       TMap<int32, bool> MaskedByGroup;
       const TArray<TSharedPtr<FJsonValue>>* Files = nullptr;
       if (EnvironmentProfile.bBaseFamily && AssetObject->TryGetArrayField(TEXT("textureFiles"), Files)) {
@@ -10016,7 +10022,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
                                             AssetType == TEXT("3dplant");
         const bool bIsPlant = AssetType == TEXT("3dplant");
         const bool bAllowAsset3DSlots =
-            bIs3DAsset &&
+            bUsesObjectMaterial &&
             (SlotName == TEXT("albedo") || SlotName == TEXT("normal") ||
              SlotName == TEXT("orm") || SlotName == TEXT("mask") ||
              SlotName == TEXT("opacity") || SlotName == TEXT("emissive") ||
@@ -10084,7 +10090,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             ImportedTextureName = FString::Printf(TEXT("T_%s_%s"),
                 *NamedMaterialNames.FindRef(GroupId),
                 *(bNamedZionPlant && SlotName == TEXT("albedo") ? FString(TEXT("D")) : To3DTextureSlotSuffix(SlotName)));
-          } else if (bIs3DAsset) {
+          } else if (bUsesObjectMaterial) {
             const FString GroupSegment =
                 bMultipleTextureGroups
                     ? FString::Printf(TEXT("_G%03d"), GroupId)
@@ -10154,7 +10160,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             // (VTData != nullptr) == VirtualTextureStreaming assertion.
             ForceTextureDataReady(Texture);
             Texture->PreEditChange(nullptr);
-            if (bIs3DAsset) {
+            if (bUsesObjectMaterial) {
               Apply3DAssetTexturePreset(Texture, SlotName, EnvironmentProfile,
                                         bUseVT);
             } else if (bIsSurface || bIsDecal) {
@@ -10427,7 +10433,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             TextureBySlot.FindRef(TEXT("ao")),
             TextureBySlot.FindRef(TEXT("metalness")),
             TextureBySlot.FindRef(TEXT("emissive")), SurfaceBaseTiling);
-      } else if (bIs3DAsset) {
+      } else if (bUsesObjectMaterial) {
         SetStageProgress(
             static_cast<float>(FMath::Clamp(AssetBaseProgress + 25, 0, 99)),
             FString::Printf(TEXT("Composite Textures: %s"), *AssetName), false);
@@ -10490,7 +10496,8 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
             GroupMaterialFolder, MaterialName, EnvironmentProfile,
             TextureBySlot.FindRef(TEXT("albedo")),
             TextureBySlot.FindRef(TEXT("normal")), ORMTexture, MegaMaskTexture,
-            OpacityTexture, TextureBySlot.FindRef(TEXT("emissive")), bMasked, &Dependencies);
+            OpacityTexture, TextureBySlot.FindRef(TEXT("emissive")), bMasked, &Dependencies,
+            bIsAtlas ? FName(TEXT("OpacityMask_VT")) : NAME_None);
       } else {
         if (AssetType == TEXT("3dplant")) {
           FString MaterialIdentifier = PlantObjectIdentifier;
