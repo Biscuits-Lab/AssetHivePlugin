@@ -9,6 +9,24 @@ from unittest.mock import patch
 unreal_stub = types.ModuleType('unreal')
 unreal_stub.EditorAssetLibrary = types.SimpleNamespace(get_metadata_tag=lambda obj, key: obj.tags.get(key, ''))
 unreal_stub.MaterialEditingLibrary = types.SimpleNamespace()
+class SlowTask:
+    instances = []
+    def __init__(self, work, desc, enabled=True):
+        self.work = work
+        self.opened = 0
+        self.closed = False
+        self.frames = []
+        self.instances.append(self)
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        self.closed = True
+    def make_dialog(self, cancel):
+        self.opened += 1
+    def enter_progress_frame(self, work, desc):
+        self.frames.append(work)
+
+unreal_stub.ScopedSlowTask = SlowTask
 unreal_stub.log = lambda text: None
 unreal_stub.log_error = lambda text: None
 sys.modules.setdefault('unreal', unreal_stub)
@@ -48,6 +66,10 @@ class SuitImportTests(unittest.TestCase):
             applied = module.apply_job(self.job)
         importer.assert_not_called()
         self.assertEqual(applied['entries'][0]['status'], 'skipped')
+        task = SlowTask.instances[-1]
+        self.assertEqual(task.opened, 1)
+        self.assertTrue(task.closed)
+        self.assertEqual(sum(task.frames), task.work)
 
     def test_manually_moved_asset_is_found_without_recreating_it(self):
         moved = Asset(self.entry['key'], '/Game/Test/Moved.Moved', self.entry)
@@ -98,6 +120,55 @@ class SuitImportTests(unittest.TestCase):
                 self.assertEqual(bool(row['path']), exists)
                 importer.assert_not_called()
                 writer.assert_not_called()
+
+
+    def test_weapon_reuses_existing_master_and_non_virtual_parameters(self):
+        parent = types.SimpleNamespace()
+        entry = {'config': {'family': 'weapon', 'parentPath': module.WEAPON_TEMPLATE}, 'textures': {'D': 'color', 'N': 'normal', 'ORM': 'orm'}}
+        with patch.object(module, 'load', return_value=parent), patch.object(module.unreal, 'Material', types.SimpleNamespace, create=True), patch.object(module.MEL, 'get_texture_parameter_names', return_value=['Diffuse', 'Normal', 'ORM', 'OpacityMasked', 'VT_Diffuse'], create=True), patch.object(module.MEL, 'get_static_switch_parameter_names', return_value=['Use VT', 'Use OpacityMasked'], create=True):
+            self.assertIs(module.weapon_parent(entry), parent)
+            self.assertEqual(module.material_parameters(parent, entry), {'D': 'Diffuse', 'N': 'Normal', 'ORM': 'ORM', 'A': 'OpacityMasked'})
+        with patch.object(module, 'load', return_value=None), patch.object(module.unreal, 'Material', types.SimpleNamespace, create=True):
+            with self.assertRaises(RuntimeError):
+                module.weapon_parent(entry)
+
+    def test_weapon_instance_switches_reparent_and_preserve_later_ue_edits(self):
+        values = {'Use VT': True, 'Use OpacityMasked': False}
+        def setter(obj, name, value):
+            values[name] = value
+            return False  # Current engine writes successfully but always returns False.
+        entry = {'config': {'family': 'weapon', 'parentPath': module.WEAPON_TEMPLATE, 'virtualTexture': False, 'useOpacityMasked': True}, 'textures': {'A': 'mask'}}
+        with patch.object(module.MEL, 'set_material_instance_static_switch_parameter_value', side_effect=setter, create=True) as write, patch.object(module.MEL, 'get_material_instance_static_switch_parameter_value', side_effect=lambda obj, name: values[name], create=True):
+            module.configure_weapon_instance(object(), entry, {'config': {'parentPath': '/old/generated'}})
+            self.assertEqual(values, {'Use VT': False, 'Use OpacityMasked': True})
+            write.reset_mock()
+            module.configure_weapon_instance(object(), entry, entry)
+            write.assert_not_called()
+
+
+    def test_weapon_physics_reuses_assigned_asset_and_does_not_change_suits(self):
+        entry = {'key': 'weapon:mesh', 'kind': 'skeletalMesh', 'config': {'family': 'weapon', 'createPhysicsAsset': True, 'physicsAssetPath': '/Game/Weapon/SK_Test_Physics'}}
+        existing = Asset('user-owned', '/Game/Shared/Physics.Physics', {})
+        mesh = types.SimpleNamespace(get_editor_property=lambda name: existing)
+        with patch.object(module, 'load') as loader, patch.object(module, 'save') as writer, patch.object(module.unreal, 'PhysicsAsset', Asset, create=True), patch.object(module.EAL, 'rename_asset', create=True) as rename:
+            self.assertTrue(module.weapon_physics_enabled(entry))
+            self.assertIs(module.weapon_physics_for_import(entry, mesh), existing)
+            module.save_weapon_physics(entry, mesh, existing)
+            loader.assert_not_called()
+            writer.assert_not_called()
+            rename.assert_not_called()
+        self.assertFalse(module.weapon_physics_enabled({'kind': 'skeletalMesh', 'config': {'createPhysicsAsset': True}}))
+
+    def test_new_weapon_physics_is_named_and_missing_physics_is_reported(self):
+        entry = {'key': 'weapon:mesh', 'kind': 'skeletalMesh', 'config': {'family': 'weapon', 'createPhysicsAsset': True, 'physicsAssetPath': '/Game/Weapon/SK_Test_Physics'}}
+        created = Asset('', '/Game/Weapon/SK_Test_PhysicsAsset.SK_Test_PhysicsAsset', {})
+        mesh = types.SimpleNamespace(get_editor_property=lambda name: created)
+        with patch.object(module, 'save') as writer, patch.object(module.unreal, 'PhysicsAsset', Asset, create=True), patch.object(module.EAL, 'rename_asset', return_value=True, create=True) as rename:
+            module.save_weapon_physics(entry, mesh, None)
+            rename.assert_called_once_with(created.path, entry['config']['physicsAssetPath'])
+            writer.assert_called_once_with(created, {'key': 'weapon:mesh:physics', 'kind': 'weaponPhysics'})
+            with patch.object(module, 'load', return_value=None), patch.object(module.unreal, 'SkeletalMeshEditorSubsystem', types.SimpleNamespace(create_physics_asset=lambda *args: None), create=True), self.assertRaises(RuntimeError):
+                module.save_weapon_physics(entry, types.SimpleNamespace(get_editor_property=lambda name: None, get_path_name=lambda: '/Game/Weapon/SK_Test.SK_Test'), None)
 
 
 if __name__ == '__main__':

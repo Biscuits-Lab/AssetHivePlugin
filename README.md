@@ -62,3 +62,15 @@ and a development preview against the same editor simultaneously.
 After changing plugin source, rebuild with your engine and restart the editor.
 The regression test `AssetHive.Transport.ListenerRecovery` checks exclusive port
 selection and recovery when a previously occupied port becomes available.
+
+
+## Suit import progress
+
+Suit sends keep one parent progress dialog open throughout the import and save batch. Nested UE tasks reuse this dialog; unchanged batches do not open it. Texture settings are applied together only when properties differ, preserving the existing compression and color-space contract. Per-item validation, receipts and import timings remain available. Environment and animation import flows are unchanged.
+
+## Weapon import
+
+Character weapon jobs use `/Game/Characters/Weapon_PJZ/<category>/<identity>/`, with `Material`, `Texture`, and `Mesh/SkeletalMesh` subdirectories. Arrow is an independent asset under Bow. Desktop management retains SM, but UE jobs exclude it.
+
+A bound FBX supplies its own skeleton on first import; the resulting Skeleton uses `SKEL_<identity>` and compatible later imports reuse it. The plugin does not rig meshes or create animation/physics assets. Weapon jobs do not use suit body materials or the suit shared Skeleton. Weapon instances reuse /Game/MaterialLibrary/Weapon/Common/M_Weapon_Slab; no parent material is generated. D/N/ORM/A bind Diffuse/Normal/ORM/OpacityMasked, with Use VT disabled and Use OpacityMasked enabled only when A exists. Missing master materials produce an error. Existing generated-parent instances migrate on their next send; old parent assets are not automatically deleted. Inspection, incremental sends, receipts, and managed deletion recovery use the character job protocol.
+Weapon PhysicsAsset policy: create missing SK_<canonical>_Physics beside the skeletal mesh; preserve and reuse existing assigned physics assets, including artist edits. Suit imports are unchanged.
