@@ -100,7 +100,8 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
                                                  MakeShared<FJsonValueString>(TEXT("plantCantileverWeights")),
                                                  MakeShared<FJsonValueString>(TEXT("meshOnlyOverwrite")),
                                                  MakeShared<FJsonValueString>(TEXT("selectiveOverwrite")),
-                                                 MakeShared<FJsonValueString>(TEXT("characterSuitV1"))});
+                                                 MakeShared<FJsonValueString>(TEXT("characterSuitV1")),
+                                                 MakeShared<FJsonValueString>(TEXT("atlasTextureOnly"))});
         Info->SetNumberField(TEXT("protocolVersion"), 2);
         Info->SetStringField(TEXT("sessionId"), SessionId);
         Info->SetStringField(TEXT("projectPath"), FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()));
