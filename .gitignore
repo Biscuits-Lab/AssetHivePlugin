@@ -9,3 +9,7 @@
 *.suo
 *.log
 docs
+
+# Character importer and test Python caches
+/AssetHive/Content/Python/__pycache__/
+/AssetHive/Tests/__pycache__/
