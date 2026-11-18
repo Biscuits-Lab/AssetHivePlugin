@@ -8,6 +8,7 @@
 #include "ContentBrowserModule.h"
 #include "IContentBrowserSingleton.h"
 #include "Dom/JsonObject.h"
+#include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -157,22 +158,13 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
     RequestStates.Add(RequestId, Accepted);
     SendJson(Accepted);
     const TWeakPtr<TAtomic<bool>> WeakLifetime = LifetimeToken;
-    if ((*Job)->HasField(TEXT("characterSuit")))
-    {
-        // Interchange's synchronous import pumps the task graph. Do not call it from a task-graph task.
-        FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([this, WeakLifetime, RequestId, JobData = *Job](float)
-        {
-            const auto Lifetime = WeakLifetime.Pin();
-            if (Lifetime.IsValid() && Lifetime->Load()) RunImport(RequestId, JobData);
-            return false;
-        }));
-        return;
-    }
-    AsyncTask(ENamedThreads::GameThread, [this, WeakLifetime, RequestId, JobData = *Job]()
+    // Run from the editor tick so modal confirmation and synchronous Interchange can pump their event loops.
+    FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([this, WeakLifetime, RequestId, JobData = *Job](float)
     {
         const auto Lifetime = WeakLifetime.Pin();
         if (Lifetime.IsValid() && Lifetime->Load()) RunImport(RequestId, JobData);
-    });
+        return false;
+    }));
 }
 
 void FAssetHiveModule::RecordProgress(const FString& RequestId, float Percent, const FString& Stage, bool bShowInEditor)
@@ -228,7 +220,14 @@ void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJso
         const int32 ExitCode = Importer->ImportJob(Job, Root, [this, RequestId](int32 Percent, const FString& Stage, bool bShowInEditor)
         {
             RecordProgress(RequestId, Percent, Stage, bShowInEditor);
-        }, &ImportedFolders, &AssetResults);
+        }, &ImportedFolders, &AssetResults, [](const FString& AssetName, const FString& AssetFolder)
+        {
+            const FText Message = FText::Format(
+                NSLOCTEXT("AssetHive", "OverwriteMessage", "「{0}」的目标目录已有资产。\n{1}\n\n是否按当前覆盖策略继续导入？\n选择「否」将跳过此资产。"),
+                FText::FromString(AssetName), FText::FromString(AssetFolder));
+            return FMessageDialog::Open(EAppMsgType::YesNo, EAppReturnType::No, Message,
+                NSLOCTEXT("AssetHive", "OverwriteTitle", "AssetHive · 确认覆盖")) == EAppReturnType::Yes;
+        });
         Result->SetStringField(TEXT("type"), ExitCode == 0 ? TEXT("complete") : TEXT("error"));
         Result->SetArrayField(TEXT("assetResults"), AssetResults);
         Result->SetStringField(TEXT("message"), ExitCode == 0 ? TEXT("Unreal 导入完成") : TEXT("导入失败，请查看 Unreal Output Log"));

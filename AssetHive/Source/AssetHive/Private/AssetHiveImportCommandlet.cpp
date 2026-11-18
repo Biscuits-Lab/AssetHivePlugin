@@ -8658,7 +8658,8 @@ int32 UAssetHiveImportCommandlet::Main(const FString& Params) {
 
 int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const FString& DestinationPath, TFunction<void(int32, const FString&, bool)> OnProgress,
-    TArray<FString>* OutImportedFolders, TArray<TSharedPtr<FJsonValue>>* OutAssetResults) {
+    TArray<FString>* OutImportedFolders, TArray<TSharedPtr<FJsonValue>>* OutAssetResults,
+    TFunction<bool(const FString&, const FString&)> ConfirmOverwrite) {
   if (OutAssetResults) OutAssetResults->Reset();
   TGuardValue<bool> ImportFailureGuard(GAssetHiveImportFailed, false);
   if (OutImportedFolders) OutImportedFolders->Reset();
@@ -8752,7 +8753,7 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     AssetObject->TryGetStringField(TEXT("name"), AssetName);
     AssetObject->TryGetStringField(TEXT("id"), AssetId);
     const FString ResultId = AssetId;
-    FString FailureMessage;
+    FString FailureMessage, SkipMessage;
     TGuardValue<bool> AssetFailureGuard(GAssetHiveImportFailed, false);
     ON_SCOPE_EXIT {
       ++AssetIndex;
@@ -8760,8 +8761,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
       if (OutAssetResults) {
         auto Item = MakeShared<FJsonObject>();
         Item->SetStringField(TEXT("assetId"), ResultId);
-        Item->SetStringField(TEXT("status"), GAssetHiveImportFailed ? TEXT("failed") : TEXT("success"));
-        if (!FailureMessage.IsEmpty()) Item->SetStringField(TEXT("message"), FailureMessage);
+        Item->SetStringField(TEXT("status"), SkipMessage.IsEmpty()
+            ? (GAssetHiveImportFailed ? TEXT("failed") : TEXT("success")) : TEXT("skipped"));
+        const FString& Message = SkipMessage.IsEmpty() ? FailureMessage : SkipMessage;
+        if (!Message.IsEmpty()) Item->SetStringField(TEXT("message"), Message);
         OutAssetResults->Add(MakeShared<FJsonValueObject>(Item));
       }
     };
@@ -8949,10 +8952,10 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
     const bool bScanSourceAsset = ShouldApplyDressingTriangleBudget(
         bIs3DAsset, bThirdPartyAssetTags, FixedTriangleBudget);
     FString AssetDestinationPath =
-        bUsesObjectMaterial ? TEXT("/Game/Environment/Asset") : DestinationPath;
+        bUsesObjectMaterial ? UAssetHiveSettings::EnvironmentImportRootPath : DestinationPath;
     if (AssetType == TEXT("3dplant")) {
       // md §5.2：Content/Environment/Asset/Vegetation/<Tree|Bush|Grass|Micro|HeroFoliage>/
-      AssetDestinationPath = TEXT("/Game/Environment/Asset/Vegetation");
+      AssetDestinationPath = FString(UAssetHiveSettings::EnvironmentImportRootPath) / TEXT("Vegetation");
     }
     FString SurfaceExportRootPath;
     if ((bIsSurface || bIsDecal) && AssetObject->TryGetStringField(TEXT("exportRootPath"),
@@ -9139,6 +9142,24 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
         bUsesZionFolders ? AssetFolder / TEXT("Mesh")
                          : (bUsesFoliageFolders ? AssetFolder / TEXT("Meshes")
                                                 : AssetFolder);
+    if (ConfirmOverwrite && (!Dependencies.bSelective || Dependencies.bOverwriteMeshes || Dependencies.UpdatesDependencies())) {
+      IAssetRegistry& Registry = FAssetRegistryModule::GetRegistry();
+      if (IFileManager::Get().DirectoryExists(*FPackageName::LongPackageNameToFilename(AssetFolder))) {
+        Registry.ScanPathsSynchronous({AssetFolder});
+      }
+      // Query the actual output folders so a sibling or nested representation does not trigger confirmation.
+      FARFilter Filter;
+      Filter.PackagePaths = {FName(*AssetFolder)};
+      Filter.PackagePaths.AddUnique(FName(*TextureFolder));
+      Filter.PackagePaths.AddUnique(FName(*MaterialFolder));
+      Filter.PackagePaths.AddUnique(FName(*MeshFolder));
+      TArray<FAssetData> ExistingAssets;
+      Registry.GetAssets(Filter, ExistingAssets);
+      if (!ExistingAssets.IsEmpty() && !ConfirmOverwrite(AssetName, AssetFolder)) {
+        SkipMessage = TEXT("已跳过覆盖");
+        continue;
+      }
+    }
     const bool bUseVT = IsAssetVirtualTextureImportEnabled();
     FString MaterialMatching;
     AssetObject->TryGetStringField(TEXT("materialMatching"), MaterialMatching);
@@ -11306,6 +11327,72 @@ int32 UAssetHiveImportCommandlet::ImportJob(const TSharedPtr<FJsonObject>& Root,
 #include "StaticMeshAttributes.h"
 #include "UObject/GCObjectScopeGuard.h"
 #include "UObject/SavePackage.h"
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveOverwriteConfirmationTest, "AssetHive.Import.OverwriteConfirmation",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveOverwriteConfirmationTest::RunTest(const FString&) {
+  FAssetHiveMeshStaging Fixture;
+  Fixture.Folder = TEXT("/Game/AssetHiveOverwriteTest_") + FGuid::NewGuid().ToString(EGuidFormats::Digits);
+  const FString Source = FPaths::CreateTempFilename(*FPaths::ProjectSavedDir(), TEXT("AssetHiveOverwrite"), TEXT(".hdr"));
+  ON_SCOPE_EXIT { IFileManager::Get().Delete(*Source); };
+  const ANSICHAR Header[] = "#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n\n-Y 8 +X 16\n";
+  const uint8 Pixel[] = {64, 96, 128, 128};
+  TArray<uint8> Image;
+  Image.Append(reinterpret_cast<const uint8*>(Header), UE_ARRAY_COUNT(Header) - 1);
+  for (int32 Index = 0; Index < 8 * 16; ++Index) Image.Append(Pixel, UE_ARRAY_COUNT(Pixel));
+  if (!TestTrue(TEXT("Write HDRI fixture"), FFileHelper::SaveArrayToFile(Image, *Source))) return false;
+
+  auto Slot = MakeShared<FJsonObject>();
+  Slot->SetStringField(TEXT("slot"), TEXT("hdr"));
+  Slot->SetStringField(TEXT("file"), Source);
+  auto Asset = MakeShared<FJsonObject>();
+  Asset->SetStringField(TEXT("id"), TEXT("test"));
+  Asset->SetStringField(TEXT("name"), TEXT("Sky"));
+  Asset->SetStringField(TEXT("assetType"), TEXT("hdri"));
+  Asset->SetArrayField(TEXT("textureFiles"), {MakeShared<FJsonValueString>(Source)});
+  Asset->SetArrayField(TEXT("textureSlots"), {MakeShared<FJsonValueObject>(Slot)});
+  auto Job = MakeShared<FJsonObject>();
+  Job->SetArrayField(TEXT("assets"), {MakeShared<FJsonValueObject>(Asset)});
+  auto* Importer = NewObject<UAssetHiveImportCommandlet>();
+  FGCObjectScopeGuard Guard(Importer);
+  TArray<FString> Folders;
+  TArray<TSharedPtr<FJsonValue>> Results;
+  int32 Prompts = 0;
+  bool bAllowOverwrite = false;
+  const auto RunImport = [&] {
+    return Importer->ImportJob(Job, Fixture.Folder, {}, &Folders, &Results,
+        [&](const FString& Name, const FString& Path) {
+          ++Prompts;
+          TestEqual(TEXT("Prompt names the asset"), Name, FString(TEXT("Sky")));
+          TestTrue(TEXT("Prompt shows the destination"), Path.StartsWith(Fixture.Folder + TEXT("/")));
+          return bAllowOverwrite;
+        });
+  };
+  if (!TestEqual(TEXT("Import fresh asset"), RunImport(), 0) ||
+      !TestEqual(TEXT("New asset produces no prompt"), Prompts, 0) ||
+      !TestEqual(TEXT("New asset produces one folder"), Folders.Num(), 1)) return false;
+  TArray<FAssetData> Assets;
+  FAssetRegistryModule::GetRegistry().GetAssetsByPath(FName(*Folders[0]), Assets);
+  if (!TestEqual(TEXT("Imported HDRI is registered"), Assets.Num(), 1)) return false;
+  UObject* ImportedAsset = Assets[0].GetAsset();
+  if (!TestNotNull(TEXT("Imported HDRI is in memory"), ImportedAsset)) return false;
+  UPackage* Package = ImportedAsset->GetPackage();
+  Package->SetDirtyFlag(false);
+
+  TestEqual(TEXT("Declining overwrite is a completed request"), RunImport(), 0);
+  TestEqual(TEXT("Existing unsaved asset prompts once"), Prompts, 1);
+  TestTrue(TEXT("Declining overwrite reports a skipped asset"), Results.Num() == 1 &&
+      Results[0]->AsObject()->GetStringField(TEXT("status")) == TEXT("skipped"));
+  TestTrue(TEXT("Declining leaves the existing package untouched"), Folders.IsEmpty() && !Package->IsDirty());
+
+  bAllowOverwrite = true;
+  TestEqual(TEXT("Confirming overwrite imports the asset"), RunImport(), 0);
+  TestEqual(TEXT("A new request asks again"), Prompts, 2);
+  TestTrue(TEXT("Confirming reports success"), Results.Num() == 1 &&
+      Results[0]->AsObject()->GetStringField(TEXT("status")) == TEXT("success"));
+  TestTrue(TEXT("Confirmed overwrite dirties the imported package"), Package->IsDirty());
+  return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveMeshOverwritePolicyTest, "AssetHive.Import.MeshOverwritePolicy",
     EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
