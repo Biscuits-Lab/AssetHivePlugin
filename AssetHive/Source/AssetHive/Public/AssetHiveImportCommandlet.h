@@ -16,5 +16,6 @@ public:
     virtual int32 Main(const FString& Params) override;
     int32 ImportJob(const TSharedPtr<FJsonObject>& Job, const FString& DestinationPath,
         TFunction<void(int32, const FString&, bool)> OnProgress, TArray<FString>* OutImportedFolders = nullptr,
-        TArray<TSharedPtr<FJsonValue>>* OutAssetResults = nullptr);
+        TArray<TSharedPtr<FJsonValue>>* OutAssetResults = nullptr,
+        TFunction<bool(const FString&, const FString&)> ConfirmOverwrite = {});
 };

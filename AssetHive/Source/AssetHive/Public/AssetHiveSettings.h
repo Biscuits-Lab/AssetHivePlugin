@@ -209,6 +209,7 @@ public:
 
     static bool IsValidImportRootPath(const FString& Path);
     static FString GetDefaultImportRootPath();
+    static constexpr const TCHAR* EnvironmentImportRootPath = TEXT("/Game/Environment/Asset");
     static FString GetImportRootPath();
     static FString NormalizeImportRootPath(const FString& Path);
     static FString ToProjectContentRelativePath(const FString& RootPath);

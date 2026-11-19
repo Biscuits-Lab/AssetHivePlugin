@@ -5,10 +5,14 @@
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetRegistry/IAssetRegistry.h"
 #include "ContentBrowserModule.h"
+#include "EditorFramework/AssetImportData.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/Texture.h"
+#include "FoliageType.h"
 #include "Framework/Application/SlateApplication.h"
-#include "HAL/FileManager.h"
 #include "IContentBrowserSingleton.h"
 #include "Interfaces/IPluginManager.h"
+#include "Materials/MaterialInstanceConstant.h"
 #include "Misc/CoreDelegates.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
@@ -30,13 +34,18 @@
 #include "Widgets/SWindow.h"
 #include "Widgets/Text/STextBlock.h"
 
+#if WITH_DEV_AUTOMATION_TESTS
+#include "Engine/Texture2D.h"
+#include "Misc/AutomationTest.h"
+#include "Misc/ScopeExit.h"
+#endif
+
 #define LOCTEXT_NAMESPACE "AssetHiveEditorToolbar"
 
 namespace {
 
 const FName GAssetHiveToolbarOwner("AssetHiveEditorToolbar");
 const FName GAssetHiveStyleSetName("AssetHiveStyle");
-FString GetAssetHiveContentRoot() { return UAssetHiveSettings::GetImportRootPath(); }
 
 TSharedPtr<FSlateStyleSet> GAssetHiveStyleSet;
 
@@ -81,6 +90,38 @@ struct FUnusedAssetFolderEntry {
 
 using FUnusedAssetFolderEntryPtr = TSharedPtr<FUnusedAssetFolderEntry>;
 
+FString GetEnvironmentAssetFolder(const FString& PackagePath, const FString& EnvironmentPrefix) {
+  FString Folder = PackagePath;
+  const FString Leaf = FPaths::GetCleanFilename(Folder);
+  if (Leaf == TEXT("Tex") || Leaf == TEXT("MI") || Leaf == TEXT("Material") ||
+      Leaf == TEXT("Mesh") || Leaf == TEXT("Meshes")) {
+    Folder = FPaths::GetPath(Folder);
+  }
+  const bool bVegetation = Folder.StartsWith(EnvironmentPrefix + TEXT("Vegetation/"));
+  if (bVegetation && FPaths::GetCleanFilename(Folder) == TEXT("Op")) {
+    Folder = FPaths::GetPath(Folder);
+  }
+  if (!Folder.StartsWith(EnvironmentPrefix)) return {};
+  TArray<FString> Parts;
+  Folder.Mid(EnvironmentPrefix.Len()).ParseIntoArray(Parts, TEXT("/"));
+  if (Parts.Num() < (bVegetation ? 3 : 2) || Parts.Last() == TEXT("ThirdParty") ||
+      Parts.Last() == TEXT("Temp")) return {};
+  return Folder;
+}
+
+bool HasAssetHiveImportSource(const FAssetData& Asset) {
+  FString SourceJson;
+  if (!Asset.GetTagValue(UObject::SourceFileTagName(), SourceJson)) return false;
+  const TOptional<FAssetImportInfo> Info = FAssetImportInfo::FromJson(MoveTemp(SourceJson));
+  if (!Info.IsSet()) return false;
+  return Info->SourceFiles.ContainsByPredicate([](const FAssetImportInfo::FSourceFile& Source) {
+    FString Filename = Source.RelativeFilename;
+    FPaths::NormalizeFilename(Filename);
+    Filename = TEXT("/") + Filename;
+    return Filename.Contains(TEXT("/AssetLibrary/")) || Filename.Contains(TEXT("/Temp/assethive/"));
+  });
+}
+
 TArray<FUnusedAssetFolderEntryPtr> FindUnusedAssetFolders() {
   TArray<FUnusedAssetFolderEntryPtr> Result;
   FAssetRegistryModule &AssetRegistryModule =
@@ -88,12 +129,17 @@ TArray<FUnusedAssetFolderEntryPtr> FindUnusedAssetFolders() {
           TEXT("AssetRegistry"));
   IAssetRegistry &AssetRegistry = AssetRegistryModule.Get();
 
-  TArray<FString> ScanPaths;
-  ScanPaths.Add(GetAssetHiveContentRoot());
+  const FString ConfiguredRoot = UAssetHiveSettings::GetImportRootPath();
+  const FString ConfiguredPrefix = ConfiguredRoot + TEXT("/");
+  const FString EnvironmentRoot = UAssetHiveSettings::EnvironmentImportRootPath;
+  const FString EnvironmentPrefix = EnvironmentRoot + TEXT("/");
+  TArray<FString> ScanPaths{ConfiguredRoot};
+  ScanPaths.AddUnique(EnvironmentRoot);
   AssetRegistry.ScanPathsSynchronous(ScanPaths, false);
+  AssetRegistry.WaitForCompletion();
 
   FARFilter Filter;
-  Filter.PackagePaths.Add(FName(*GetAssetHiveContentRoot()));
+  for (const FString& Path : ScanPaths) Filter.PackagePaths.Add(FName(*Path));
   Filter.bRecursivePaths = true;
   TArray<FAssetData> AllAssets;
   AssetRegistry.GetAssets(Filter, AllAssets);
@@ -101,36 +147,37 @@ TArray<FUnusedAssetFolderEntryPtr> FindUnusedAssetFolders() {
   TMap<FString, TArray<FAssetData>> FolderToAssets;
   for (const FAssetData &Asset : AllAssets) {
     const FString PackagePath = Asset.PackagePath.ToString();
-    if (!PackagePath.StartsWith(GetAssetHiveContentRoot())) {
-      continue;
+    if (PackagePath.StartsWith(EnvironmentPrefix)) {
+      const FString FolderPath = GetEnvironmentAssetFolder(PackagePath, EnvironmentPrefix);
+      if (!FolderPath.IsEmpty()) FolderToAssets.FindOrAdd(FolderPath).Add(Asset);
+    } else if (PackagePath.StartsWith(ConfiguredPrefix)) {
+      TArray<FString> Parts;
+      PackagePath.Mid(ConfiguredPrefix.Len()).ParseIntoArray(Parts, TEXT("/"));
+      if (Parts.Num() >= 2) FolderToAssets.FindOrAdd(ConfiguredRoot / Parts[0] / Parts[1]).Add(Asset);
     }
-    FString Remainder = PackagePath.Mid(GetAssetHiveContentRoot().Len());
-    if (Remainder.StartsWith(TEXT("/"))) {
-      Remainder = Remainder.Mid(1);
-    }
-    TArray<FString> Parts;
-    Remainder.ParseIntoArray(Parts, TEXT("/"), true);
-    if (Parts.Num() < 2) {
-      continue;
-    }
-    const FString FolderPath = FString::Printf(
-        TEXT("%s/%s/%s"), *GetAssetHiveContentRoot(), *Parts[0], *Parts[1]);
-    FolderToAssets.FindOrAdd(FolderPath).Add(Asset);
   }
 
   for (auto &Pair : FolderToAssets) {
     const FString &FolderPath = Pair.Key;
     const TArray<FAssetData> &FolderAssets = Pair.Value;
-    const FString FolderPrefix = FolderPath + TEXT("/");
+    const bool bEnvironmentFolder = FolderPath.StartsWith(EnvironmentPrefix);
+    if (bEnvironmentFolder) {
+      const bool bHasOtherAssets = FolderAssets.ContainsByPredicate([](const FAssetData& Asset) {
+        return !Asset.IsInstanceOf(UStaticMesh::StaticClass()) && !Asset.IsInstanceOf(UTexture::StaticClass()) &&
+            !Asset.IsInstanceOf(UMaterialInstanceConstant::StaticClass()) && !Asset.IsInstanceOf(UFoliageType::StaticClass());
+      });
+      if (bHasOtherAssets || !FolderAssets.ContainsByPredicate(HasAssetHiveImportSource)) continue;
+    }
+    TSet<FName> FolderPackages;
+    for (const FAssetData& Asset : FolderAssets) FolderPackages.Add(Asset.PackageName);
 
     bool bUsedExternally = false;
-    for (const FAssetData &Asset : FolderAssets) {
+    for (FName Package : FolderPackages) {
       TArray<FName> Referencers;
-      AssetRegistry.GetReferencers(Asset.PackageName, Referencers,
+      AssetRegistry.GetReferencers(Package, Referencers,
                                    UE::AssetRegistry::EDependencyCategory::All);
-      for (const FName &Referencer : Referencers) {
-        const FString RefStr = Referencer.ToString();
-        if (RefStr == FolderPath || RefStr.StartsWith(FolderPrefix)) {
+      for (FName Referencer : Referencers) {
+        if (FolderPackages.Contains(Referencer)) {
           continue;
         }
         bUsedExternally = true;
@@ -146,6 +193,7 @@ TArray<FUnusedAssetFolderEntryPtr> FindUnusedAssetFolders() {
       Entry->FolderPath = FolderPath;
       Entry->AssetCount = FolderAssets.Num();
       Entry->Assets = FolderAssets;
+      Entry->bSelected = !bEnvironmentFolder;
       Result.Add(Entry);
     }
   }
@@ -226,7 +274,7 @@ private:
     const FString HeaderText =
         Entries.Num() > 0
             ? FString::Printf(
-                  TEXT("在 /Game/AssetHive 下发现 %d 个未被引用的资产文件夹"),
+                  TEXT("发现 %d 个未被引用的 AssetHive 资产文件夹"),
                   Entries.Num())
             : TEXT("没有发现未被引用的 AssetHive 资产文件夹");
 
@@ -316,13 +364,11 @@ private:
 
   FReply OnDeleteClicked() {
     TArray<FAssetData> AssetsToDelete;
-    TArray<FString> FoldersToRemove;
     for (const auto &Entry : Entries) {
       if (!Entry->bSelected) {
         continue;
       }
       AssetsToDelete.Append(Entry->Assets);
-      FoldersToRemove.Add(Entry->FolderPath);
     }
     if (AssetsToDelete.Num() == 0) {
       FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT(
@@ -330,28 +376,18 @@ private:
       return FReply::Handled();
     }
 
-    const FString ConfirmText = FString::Printf(
-        TEXT("将删除 %d 个资产文件夹，共 %d 个文件。是否继续？"),
-        FoldersToRemove.Num(), AssetsToDelete.Num());
-    const EAppReturnType::Type Confirm = FMessageDialog::Open(
-        EAppMsgType::YesNo, FText::FromString(ConfirmText));
-    if (Confirm != EAppReturnType::Yes) {
+    TSet<FSoftObjectPath> CurrentCandidates;
+    for (const auto& Entry : FindUnusedAssetFolders()) {
+      for (const FAssetData& Asset : Entry->Assets) CurrentCandidates.Add(Asset.GetSoftObjectPath());
+    }
+    if (AssetsToDelete.ContainsByPredicate([&CurrentCandidates](const FAssetData& Asset) {
+          return !CurrentCandidates.Contains(Asset.GetSoftObjectPath());
+        })) {
+      RefreshList();
+      FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(TEXT("资产引用或位置已变化，请重新勾选后再删除。")));
       return FReply::Handled();
     }
-
-    ObjectTools::DeleteAssets(AssetsToDelete, false);
-
-    FContentBrowserModule &CBM =
-        FModuleManager::LoadModuleChecked<FContentBrowserModule>(
-            TEXT("ContentBrowser"));
-    IContentBrowserSingleton &Browser = CBM.Get();
-    for (const FString &FolderPath : FoldersToRemove) {
-      FString RelPath = FolderPath.Mid(FString(TEXT("/Game/")).Len());
-      const FString DiskPath = FPaths::ConvertRelativePathToFull(
-          FPaths::Combine(FPaths::ProjectContentDir(), RelPath));
-      IFileManager::Get().DeleteDirectory(*DiskPath, false, true);
-    }
-    (void)Browser;
+    ObjectTools::DeleteAssets(AssetsToDelete, true);
 
     RefreshList();
     return FReply::Handled();
@@ -448,6 +484,49 @@ void RegisterToolbarMenu() {
   bRegistered = true;
   UE_LOG(LogTemp, Log, TEXT("[AssetHive] Registered status-bar combo button"));
 }
+
+#if WITH_DEV_AUTOMATION_TESTS
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FAssetHiveUnusedEnvironmentAssetsTest, "AssetHive.Editor.UnusedEnvironmentAssets",
+    EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FAssetHiveUnusedEnvironmentAssetsTest::RunTest(const FString&) {
+  const FString Prefix = FString(UAssetHiveSettings::EnvironmentImportRootPath) / TEXT("Vegetation/Tree/ThirdParty");
+  const FString RunId = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+  const FString ImportedFolder = Prefix / (TEXT("Imported_") + RunId);
+  const FString OtherFolder = Prefix / (TEXT("Other_") + RunId);
+  TArray<UTexture2D*> Textures;
+  ON_SCOPE_EXIT {
+    for (UTexture2D* Texture : Textures) {
+      FAssetRegistryModule::AssetDeleted(Texture);
+      Texture->ClearFlags(RF_Public | RF_Standalone);
+      Texture->SetFlags(RF_Transient);
+      Texture->GetPackage()->SetDirtyFlag(false);
+    }
+  };
+  auto AddTexture = [&](const FString& Folder, const TCHAR* Name, const TCHAR* Source) {
+    auto* Texture = NewObject<UTexture2D>(CreatePackage(*(Folder / Name)), Name, RF_Public | RF_Standalone);
+    if (Source) {
+      Texture->AssetImportData = NewObject<UAssetImportData>(Texture);
+      Texture->AssetImportData->UpdateFilenameOnly(Source);
+    }
+    FAssetRegistryModule::AssetCreated(Texture);
+    Textures.Add(Texture);
+  };
+  AddTexture(ImportedFolder / TEXT("Tex"), TEXT("T_Masked"), TEXT("//server/share/AssetLibrary/T_Masked.png"));
+  AddTexture(ImportedFolder / TEXT("Op/Tex"), TEXT("T_Op"), nullptr);
+  AddTexture(OtherFolder / TEXT("Tex"), TEXT("T_Manual"), TEXT("//server/share/ManualArt/T_Manual.png"));
+  const auto Entries = FindUnusedAssetFolders();
+  const auto* Imported = Entries.FindByPredicate([&ImportedFolder](const FUnusedAssetFolderEntryPtr& Entry) {
+    return Entry->FolderPath == ImportedFolder;
+  });
+  if (!TestNotNull(TEXT("AssetHive imports under the environment root are detected"), Imported)) return false;
+  TestEqual(TEXT("Masked and opaque dependencies are grouped as one asset"), (*Imported)->AssetCount, 2);
+  TestFalse(TEXT("Environment results require selection"), (*Imported)->bSelected);
+  TestFalse(TEXT("Unrelated imports are omitted"), Entries.ContainsByPredicate([&OtherFolder](const FUnusedAssetFolderEntryPtr& Entry) {
+    return Entry->FolderPath == OtherFolder;
+  }));
+  return true;
+}
+#endif
 
 } // namespace
 
