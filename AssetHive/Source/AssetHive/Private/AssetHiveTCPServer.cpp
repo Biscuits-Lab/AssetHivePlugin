@@ -122,6 +122,21 @@ uint32 FAssetHiveTCPServer::Run()
         double LastReceive = FPlatformTime::Seconds();
         while (bRunThread && bAlive)
         {
+            // A second desktop instance must not sit in the listen backlog for
+            // minutes while the active client keeps its connection alive.
+            bool bAnotherPending = false;
+            if (ListenerSocket->HasPendingConnection(bAnotherPending) && bAnotherPending)
+            {
+                if (FSocket* Other = ListenerSocket->Accept(TEXT("AssetHiveBusyClient")))
+                {
+                    Other->SetNonBlocking(true);
+                    const FTCHARToUTF8 Reply(TEXT("{\"type\":\"busy\",\"protocolVersion\":2,\"message\":\"Another AssetHive client is connected\"}\n"));
+                    int32 Sent = 0;
+                    Other->Send(reinterpret_cast<const uint8*>(Reply.Get()), Reply.Length(), Sent);
+                    Other->Close();
+                    Subsystem->DestroySocket(Other);
+                }
+            }
             uint8 Chunk[65536];
             int32 Read = 0;
             // UE reports would-block as success with zero bytes; a closed stream returns false.

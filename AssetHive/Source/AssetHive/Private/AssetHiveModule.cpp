@@ -13,11 +13,16 @@
 #include "Serialization/JsonSerializer.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "UObject/StrongObjectPtr.h"
+#include "PropertyEditorModule.h"
+#include "AssetHiveModelCatalogDetails.h"
 
 IMPLEMENT_MODULE(FAssetHiveModule, AssetHive)
 
 void FAssetHiveModule::StartupModule()
 {
+    if (!IsRunningCommandlet())
+        FModuleManager::LoadModuleChecked<FPropertyEditorModule>(TEXT("PropertyEditor")).RegisterCustomClassLayout(
+            TEXT("AssetHiveModelPolycountCatalog"), FOnGetDetailCustomizationInstance::CreateStatic(&FAssetHiveModelCatalogDetails::MakeInstance));
     LifetimeToken = MakeShared<TAtomic<bool>>(true);
     SessionId = FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens);
     TryStartEditorIntegration();
@@ -55,6 +60,8 @@ bool FAssetHiveModule::TickConnection(float DeltaTime)
 
 void FAssetHiveModule::ShutdownModule()
 {
+    if (auto* PropertyEditor = FModuleManager::GetModulePtr<FPropertyEditorModule>(TEXT("PropertyEditor")))
+        PropertyEditor->UnregisterCustomClassLayout(TEXT("AssetHiveModelPolycountCatalog"));
     AssetHiveThumbnailRefresh::Shutdown();
     if (LifetimeToken.IsValid()) LifetimeToken->Store(false);
     if (TickHandle.IsValid()) FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
@@ -101,6 +108,7 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
                                                  MakeShared<FJsonValueString>(TEXT("meshOnlyOverwrite")),
                                                  MakeShared<FJsonValueString>(TEXT("selectiveOverwrite")),
                                                  MakeShared<FJsonValueString>(TEXT("characterSuitV1")),
+                                                 MakeShared<FJsonValueString>(TEXT("characterUpgradeV1")),
                                                  MakeShared<FJsonValueString>(TEXT("atlasTextureOnly"))});
         Info->SetNumberField(TEXT("protocolVersion"), 2);
         Info->SetStringField(TEXT("sessionId"), SessionId);

@@ -49,6 +49,101 @@ class Asset:
 
 
 class SuitImportTests(unittest.TestCase):
+    def test_item_destination_accepts_current_character_root_and_rejects_old_root(self):
+        entry = {'kind': 'texture', 'channel': 'D', 'sourcePath': str(script),
+                 'targetPath': '/Game/Characters/GameplayItem/Chest/Test/Texture/T_Test_D',
+                 'config': {'family': 'item'}}
+        module.validate_entry(entry)
+        for destination in ['/Game/GameplayItems/Chest/Test/Texture/T_Test_D',
+                            '/Game/Characters/GameplayItem/../Other/T_Test_D']:
+            entry['targetPath'] = destination
+            with self.assertRaisesRegex(RuntimeError, 'Invalid Suit destination'):
+                module.validate_entry(entry)
+
+    def test_item_master_uses_exact_vt_parameters_and_rejects_unsupported_channels(self):
+        parent = types.SimpleNamespace()
+        entry = {'kind': 'material', 'config': {'family': 'item', 'parentPath': module.ITEM_TEMPLATE, 'virtualTexture': True}, 'textures': {'D': 'd', 'N': 'n', 'ORM': 'orm', 'E': 'e'}}
+        with patch.object(module, 'load', return_value=parent), patch.object(module.unreal, 'Material', type(parent), create=True), \
+             patch.object(module.MEL, 'get_texture_parameter_names', return_value=['Diffuse_VT', 'Normal_VT', 'ORM_VT', 'Emissive_Tex_VT'], create=True), \
+             patch.object(module.MEL, 'get_static_switch_parameter_names', return_value=['UseEmissive'], create=True):
+            self.assertIs(module.item_parent(entry), parent)
+            self.assertEqual(module.material_parameters(parent, entry)['E'], 'Emissive_Tex_VT')
+            entry['textures']['A'] = 'a'
+            with self.assertRaisesRegex(RuntimeError, '不支持'):
+                module.item_parent(entry)
+            del entry['textures']['A']
+            entry['config']['virtualTexture'] = False
+            with self.assertRaisesRegex(RuntimeError, 'VT'):
+                module.item_parent(entry)
+
+    def test_item_emissive_uses_its_switch_and_preserves_later_artist_edits(self):
+        entry = {'config': {'family': 'item', 'parentPath': module.ITEM_TEMPLATE}, 'textures': {'E': 'e'}}
+        values = {}
+        with patch.object(module.MEL, 'set_material_instance_static_switch_parameter_value', side_effect=lambda obj, key, value: values.update({key: value}), create=True) as writer, \
+             patch.object(module.MEL, 'get_material_instance_static_switch_parameter_value', side_effect=lambda obj, key: values.get(key), create=True):
+            module.configure_emissive_instance(object(), entry, {})
+            self.assertEqual(values, {'UseEmissive': True})
+            values['UseEmissive'] = False
+            writer.reset_mock()
+            module.configure_emissive_instance(object(), entry, entry)
+            writer.assert_not_called()
+
+    def test_item_upgrade_requires_choice_for_custom_material_but_not_engine_default(self):
+        entry = {'kind': 'staticMesh', 'config': {'family': 'item', 'itemMaterialVersion': 1}, 'materials': {'Mat': 'managed-mi'}}
+        custom = types.SimpleNamespace(get_path_name=lambda: '/Game/Custom/MI_Artist.MI_Artist')
+        slot = types.SimpleNamespace(material_slot_name='Mat', material_interface=custom, get_editor_property=lambda name: 'Mat')
+        obj = types.SimpleNamespace(get_editor_property=lambda name: [slot])
+        with patch.object(module, 'receipt', return_value={'config': {'deferMaterials': True}}):
+            self.assertEqual(module.deferred_item_material_conflicts(obj, entry), ['Mat'])
+            slot.material_interface = None
+            self.assertEqual(module.deferred_item_material_conflicts(obj, entry), [])
+
+    def test_disconnected_source_control_stops_before_mutation_but_disabled_provider_is_allowed(self):
+        control = types.SimpleNamespace(is_enabled=lambda: True, is_available=lambda: False)
+        with patch.object(unreal_stub, 'SourceControl', control, create=True):
+            self.assertIn('未开始修改资源', module.source_control_issue())
+            control.is_enabled = lambda: False
+            self.assertEqual(module.source_control_issue(), '')
+
+    def test_pure_rename_moves_only_owned_skeleton_and_physics(self):
+        entry = {'key': 'owner:skeletalMesh:main', 'kind': 'skeletalMesh',
+                 'skeletonPath': '/Game/New/SKEL_Test',
+                 'config': {'family': 'weapon', 'ownSkeleton': True, 'createPhysicsAsset': True,
+                            'physicsAssetPath': '/Game/New/SK_Test_Physics'}}
+        skeleton = Asset(entry['key'] + ':skeleton', '/Game/Old/SKEL_Test.SKEL_Test', {})
+        physics = Asset(entry['key'] + ':physics', '/Game/Old/SK_Test_Physics.SK_Test_Physics', {})
+        mesh = types.SimpleNamespace(get_editor_property=lambda prop: {'skeleton': skeleton, 'physics_asset': physics}[prop])
+        with patch.object(module, 'load', return_value=None), \
+             patch.object(module.EAL, 'rename_asset', return_value=True, create=True) as rename, \
+             patch.object(module.EAL, 'save_loaded_asset', return_value=True, create=True):
+            module.synchronize_owned_helpers(entry, mesh)
+            self.assertEqual(rename.call_count, 2)
+            physics.tags[module.KEY] = 'artist-owned'
+            entry['config']['ownSkeleton'] = False
+            rename.reset_mock()
+            module.synchronize_owned_helpers(entry, mesh)
+            rename.assert_not_called()
+
+    def test_suit_explicit_new_skeleton_does_not_enable_physics(self):
+        entry = {'kind': 'skeletalMesh', 'config': {'family': 'suit', 'ownSkeleton': True,
+                 'skeletonOverride': 'create', 'createPhysicsAsset': False}}
+        self.assertTrue(module.owned_skeleton_entry(entry))
+        self.assertFalse(module.weapon_physics_enabled(entry))
+
+    def test_npc_destination_and_material_contract(self):
+        entry = {'key': 'npc:texture:D', 'kind': 'texture', 'channel': 'D', 'sourcePath': __file__,
+                 'targetPath': module.NPC_ROOT + 'Merchant/Merchant_FireKeeper/Texture/T_FireKeeper_01_Body_D',
+                 'config': {'family': 'npc'}}
+        module.validate_entry(entry)
+        entry['targetPath'] = module.MONSTER_ROOT + 'Merchant/T_Test'
+        with self.assertRaises(RuntimeError):
+            module.validate_entry(entry)
+        entry['config'].update(ownSkeleton=True, materialRole='monsterSkin')
+        self.assertTrue(module.owned_skeleton_entry(entry))
+        self.assertTrue(module.monster_material_entry(entry))
+        entry['config']['materialRole'] = 'monsterWeapon'
+        self.assertTrue(module.weapon_material_entry(entry))
+
     def setUp(self):
         self.entry = {'key': 'owner:texture:head:D', 'name': 'T_Test_Head_D', 'kind': 'texture', 'targetPath': module.ROOT + 'Female_01/Mesh/Test/Textures/T_Test_Head_D', 'fingerprint': 'original'}
         self.job = {'suits': [{'assetId': 'owner', 'selectedSlot': '', 'entries': [self.entry]}]}

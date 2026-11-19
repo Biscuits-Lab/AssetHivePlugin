@@ -14,6 +14,9 @@ STAMP = 'AssetHive.SuitReceipt'
 ROOT = '/Game/Characters/Hero/Asset_PJZ/'
 WEAPON_ROOT = '/Game/Characters/Weapon_PJZ/'
 MONSTER_ROOT = '/Game/Characters/Monster/'
+NPC_ROOT = '/Game/Characters/NPC/'
+ITEM_ROOT = '/Game/Characters/GameplayItem/'
+ITEM_TEMPLATE = '/Game/MaterialLibrary/Character/Common/M_GamePlayItem_Base_VT'
 MONSTER_CLOTH_TEMPLATE = '/Game/MaterialLibrary/Character/Common/M_Char_Monster_ComplexShading'
 MONSTER_SKIN_TEMPLATE = '/Game/MaterialLibrary/Character/Common/M_Char_Monster_skin'
 TEMPLATE = '/Game/MaterialLibrary/Character/MI_Suit_ComplexShading/'
@@ -83,7 +86,14 @@ def read_registry():
     if not os.path.isfile(path):
         return {}
     with open(path, encoding='utf-8') as source:
-        return json.load(source)
+        records = json.load(source)
+    # Bone arrays belong to this inspection, not the persistent identity receipt.
+    # Old versions stored both full hierarchies on every mesh and rewrote them
+    # after each imported resource. Drop only these derived validation fields.
+    for record in records.values():
+        record.pop('bones', None)
+        record.pop('targetBones', None)
+    return records
 
 
 def write_registry(records):
@@ -109,6 +119,9 @@ def owned_objects(keys):
 
 def material_parameters(parent, entry=None):
     names = [str(name) for name in MEL.get_texture_parameter_names(parent)]
+    if entry and item_material_entry(entry):
+        mapping = {'D': 'Diffuse_VT', 'N': 'Normal_VT', 'ORM': 'ORM_VT', 'E': 'Emissive_Tex_VT'}
+        return {channel: name for channel, name in mapping.items() if name in names}
     if entry and entry.get('config', {}).get('materialRole', '').startswith('hero_'):
         role = entry['config']['materialRole']
         mapping = ({'D': 'VT_DiffuseColor', 'Opacity': 'VT_Alpha', 'Root': 'VT_Root', 'ID': 'VT_Unique_Hair_ID', 'Height': 'VT_Depth', 'Tangent': 'VT_FlowMap'}
@@ -130,18 +143,52 @@ def weapon_entry(entry):
     return entry.get('config', {}).get('family') == 'weapon'
 
 
+def item_material_entry(entry):
+    return entry.get('config', {}).get('family') == 'item'
+
+
+def item_parent(entry):
+    config = entry.get('config', {})
+    parent = load(config.get('parentPath', ''))
+    if config.get('parentPath', '').split('.')[0] != ITEM_TEMPLATE or not isinstance(parent, unreal.Material):
+        raise RuntimeError('Gameplay Item 母材质缺失或路径不正确：' + ITEM_TEMPLATE)
+    missing = set(entry.get('textures', {})) - set(material_parameters(parent, entry))
+    if missing:
+        raise RuntimeError('当前 Gameplay Item 母材质仅支持 D、N、ORM、E，不支持这些贴图通道：' + ', '.join(sorted(missing)))
+    if not config.get('virtualTexture'):
+        raise RuntimeError('Gameplay Item 母材质使用 VT 采样，贴图必须启用虚拟纹理')
+    if 'E' in entry.get('textures', {}) and 'UseEmissive' not in {str(name) for name in MEL.get_static_switch_parameter_names(parent)}:
+        raise RuntimeError('Gameplay Item 母材质缺少 UseEmissive 开关')
+    return parent
+
+
+def is_default_mesh_material(material):
+    return not material or object_path(material).split('.')[0] in (
+        '/Engine/EngineMaterials/DefaultMaterial', '/Engine/EngineMaterials/WorldGridMaterial')
+
+
+def deferred_item_material_conflicts(obj, entry):
+    if entry['kind'] not in ('staticMesh', 'skeletalMesh') or entry.get('config', {}).get('family') != 'item':
+        return []
+    if not receipt(obj).get('config', {}).get('deferMaterials') or not entry['config'].get('itemMaterialVersion'):
+        return []
+    slots = obj.get_editor_property('static_materials' if entry['kind'] == 'staticMesh' else 'materials')
+    return [slot_name(slot) for slot in slots if (slot_name(slot) in entry.get('materials', {}) or slot_name(slot) in entry.get('externalMaterials', {})) and not is_default_mesh_material(slot.material_interface)]
+
+
 def weapon_material_entry(entry):
     config = entry.get('config', {})
-    return weapon_entry(entry) or (config.get('family') == 'monster' and config.get('materialRole') == 'monsterWeapon')
+    return weapon_entry(entry) or (config.get('family') in ('monster', 'npc') and config.get('materialRole') == 'monsterWeapon')
 
 
 def monster_material_entry(entry):
     config = entry.get('config', {})
-    return config.get('family') == 'monster' and config.get('materialRole') in ('monsterCloth', 'monsterSkin')
+    return config.get('family') in ('monster', 'npc') and config.get('materialRole') in ('monsterCloth', 'monsterSkin')
 
 
 def owned_skeleton_entry(entry):
-    return entry.get('config', {}).get('family') in ('weapon', 'monster') and entry.get('config', {}).get('ownSkeleton', False)
+    config = entry.get('config', {})
+    return config.get('ownSkeleton', False) and (config.get('family') in ('weapon', 'monster', 'npc', 'item') or config.get('skeletonOverride') == 'create')
 
 
 def validate_weapon_helper(entry, path, key, expected_type, deleted_owners=()):
@@ -159,7 +206,8 @@ def validate_weapon_helper(entry, path, key, expected_type, deleted_owners=()):
 
 
 def weapon_physics_enabled(entry):
-    return entry['kind'] == 'skeletalMesh' and owned_skeleton_entry(entry) and entry.get('config', {}).get('createPhysicsAsset', False)
+    config = entry.get('config', {})
+    return entry['kind'] == 'skeletalMesh' and config.get('family') in ('weapon', 'monster', 'npc', 'item') and config.get('createPhysicsAsset', False)
 
 
 def weapon_physics_for_import(entry, mesh):
@@ -192,6 +240,30 @@ def save_weapon_physics(entry, mesh, previous_physics):
             raise RuntimeError('武器物理资产规范命名失败')
     if not previous_physics or owned:
         save(physics, {'key': key, 'kind': 'weaponPhysics'})
+
+
+def synchronize_owned_helpers(entry, mesh):
+    """Pure mesh renames must also move owned helpers; never move shared/user assets."""
+    if entry.get('kind') != 'skeletalMesh':
+        return
+    helpers = []
+    if owned_skeleton_entry(entry):
+        helpers.append(('skeleton', entry.get('skeletonPath'), ':skeleton'))
+    if weapon_physics_enabled(entry):
+        helpers.append(('physics_asset', entry.get('config', {}).get('physicsAssetPath'), ':physics'))
+    for prop, target, suffix in helpers:
+        helper = mesh.get_editor_property(prop)
+        if not helper or not target or str(EAL.get_metadata_tag(helper, KEY)) != entry['key'] + suffix:
+            continue
+        if object_path(helper).split('.')[0] == target:
+            continue
+        collision = load(target)
+        if collision and collision != helper:
+            raise RuntimeError('骨架或物理资产改名目标已被占用：' + target)
+        if not EAL.rename_asset(object_path(helper), target):
+            raise RuntimeError('骨架或物理资产改名失败：' + target)
+        if not EAL.save_loaded_asset(helper, only_if_is_dirty=False):
+            raise RuntimeError('骨架或物理资产改名保存失败：' + target)
 
 
 def weapon_parent(entry):
@@ -266,9 +338,10 @@ def configure_emissive_instance(obj, entry, previous):
     had_emissive = bool(previous.get('textures', {}).get('E'))
     if not reparented and (not has_emissive or had_emissive):
         return
-    MEL.set_material_instance_static_switch_parameter_value(obj, 'Use Emissive', has_emissive)
-    if MEL.get_material_instance_static_switch_parameter_value(obj, 'Use Emissive') != has_emissive:
-        raise RuntimeError('材质实例参数设置失败：Use Emissive')
+    parameter = 'UseEmissive' if item_material_entry(entry) else 'Use Emissive'
+    MEL.set_material_instance_static_switch_parameter_value(obj, parameter, has_emissive)
+    if MEL.get_material_instance_static_switch_parameter_value(obj, parameter) != has_emissive:
+        raise RuntimeError('材质实例参数设置失败：' + parameter)
 
 
 def current_material_values(obj, entry):
@@ -341,7 +414,7 @@ def validate_entry(entry, deleted_owners=()):
     if entry.get('validationError'):
         raise RuntimeError(entry['validationError'])
     path = entry.get('targetPath', '')
-    root = MONSTER_ROOT if entry.get('config', {}).get('family') == 'monster' else WEAPON_ROOT if weapon_entry(entry) else ROOT
+    root = ITEM_ROOT if entry.get('config', {}).get('family') == 'item' else NPC_ROOT if entry.get('config', {}).get('family') == 'npc' else MONSTER_ROOT if entry.get('config', {}).get('family') == 'monster' else WEAPON_ROOT if weapon_entry(entry) else ROOT
     if not path.startswith(root) or any(segment in ('', '.', '..') for segment in path[1:].split('/')):
         raise RuntimeError('Invalid Suit destination: ' + path)
     if entry['kind'] not in ('texture', 'material', 'staticMesh', 'skeletalMesh', 'groom'):
@@ -387,6 +460,9 @@ def validate_entry(entry, deleted_owners=()):
     if entry['kind'] == 'texture' and entry['channel'] == 'N' and entry['config'].get('normalFormat', '').lower() not in ('directx', 'opengl', 'dx', 'gl'):
         raise RuntimeError('请确认法线格式 DirectX / OpenGL')
     if entry['kind'] == 'material':
+        if item_material_entry(entry):
+            item_parent(entry)
+            return
         if config.get('materialRole', '').startswith('hero_'):
             expected = {'hero_face': 'M_Char_Face', 'hero_hair': 'M_Char_Hair', 'hero_eyebrow': 'M_Char_EyeBrow', 'hero_eye': 'M_Char_Eye_CustomIris'}.get(config['materialRole'])
             if config.get('parentPath') != '/Game/MaterialLibrary/Character/Common/' + str(expected):
@@ -501,6 +577,8 @@ def inspect(job):
                         row['currentMaterial'] = current
                         if material_conflicts(current, saved, entry):
                             row.update(status='conflict', message='UE 材质已手调：选择保留 UE 或采用本次映射')
+                if row['status'] == 'ready' and deferred_item_material_conflicts(obj, entry):
+                    row.update(status='conflict', message='此玩法物件已有手动材质：选择保留 UE 材质，或采用新母材质映射')
             elif previous:
                 row.update(status='missing', action='restore', message='UE 中已缺失：选择补回或跳过本次')
         except Exception as error:
@@ -557,6 +635,8 @@ def import_file(entry, destination):
     task.replace_existing = True
     task.replace_existing_settings = False
     task.save = False
+    previous_model = load(destination)
+    previous_skeleton = previous_model.get_editor_property('skeleton') if entry['kind'] == 'skeletalMesh' and previous_model else None
     previous_physics = weapon_physics_for_import(entry, load(destination)) if weapon_physics_enabled(entry) else None
     if entry['kind'] == 'texture':
         task.factory = unreal.TextureFactory()
@@ -600,9 +680,24 @@ def import_file(entry, destination):
     if entry['kind'] == 'skeletalMesh':
         skeleton = obj.get_editor_property('skeleton')
         if owned_skeleton_entry(entry) and not load(entry['skeletonPath']):
-            if not skeleton or not EAL.rename_asset(object_path(skeleton), entry['skeletonPath']):
-                raise RuntimeError('武器骨架规范命名失败')
+            if skeleton == previous_skeleton:
+                # Reimport can retain the old assignment even with an empty import Skeleton.
+                # Create from the updated mesh; never rename an existing/shared skeleton.
+                skeleton = unreal.AssetHiveModelCatalogLibrary.create_skeleton_for_mesh(obj, entry['skeletonPath'])
+                if not skeleton:
+                    raise RuntimeError('创建新骨架失败，原骨架已保留')
+                if not unreal.AssetHiveModelCatalogLibrary.assign_existing_skeleton(obj, skeleton):
+                    raise RuntimeError('新骨架与模型不兼容，未替换原骨架')
+            elif not skeleton or not EAL.rename_asset(object_path(skeleton), entry['skeletonPath']):
+                raise RuntimeError('骨架规范命名失败')
             save(skeleton, {'key': entry['key'] + ':skeleton', 'kind': 'weaponSkeleton'})
+        if skeleton != load(entry['skeletonPath']):
+            # Compatibility was checked before apply; preserve the shared skeleton's tree.
+            skeleton = load(entry['skeletonPath'])
+            if not isinstance(skeleton, unreal.Skeleton):
+                raise RuntimeError('指定的已有骨架不可用')
+            if not unreal.AssetHiveModelCatalogLibrary.assign_existing_skeleton(obj, skeleton):
+                raise RuntimeError('已有骨架与模型不兼容，未修改共享骨架')
         if skeleton != load(entry['skeletonPath']):
             raise RuntimeError('导入后的 Skeleton 不符合目标')
     if weapon_physics_enabled(entry):
@@ -626,6 +721,10 @@ def apply_texture(obj, entry):
     }
     if channel == 'N':
         properties['flip_green_channel'] = entry['config']['normalFormat'].lower() in ('gl', 'opengl')
+    if entry.get('config', {}).get('family') == 'item' and entry['config'].get('itemMaterialVersion'):
+        properties.update(virtual_texture_streaming=True, max_texture_size=2048,
+                          lod_group=unreal.TextureGroup.TEXTUREGROUP_WORLD_NORMAL_MAP if channel == 'N' else unreal.TextureGroup.TEXTUREGROUP_WORLD,
+                          lossy_compression_amount=unreal.TextureLossyCompressionAmount.TLCA_LOW if channel in ('D', 'N') else unreal.TextureLossyCompressionAmount.TLCA_MEDIUM)
     changed = {name: value for name, value in properties.items() if obj.get_editor_property(name) != value}
     # UObject.set_editor_properties issues one Pre/PostEditChange for the batch.
     # Individual setters rebuild texture resources repeatedly, even for unchanged values.
@@ -666,12 +765,24 @@ def configure_hair_instance(obj, entry, previous):
         MEL.set_material_instance_scalar_parameter_value(obj, 'ISEdgeMask', 0.0)
 
 
+def source_control_issue():
+    control = getattr(unreal, 'SourceControl', None)
+    if control and control.is_enabled() and not control.is_available():
+        return 'UE 版本控制未连接或登录已过期，请重新登录后发送；未开始修改资源'
+    return ''
+
+
 def apply_job(job):
     started = time.perf_counter()
     checked = inspect(job)
     timings = {'inspectMs': round((time.perf_counter() - started) * 1000), 'hashMs': 0, 'importMs': 0, 'textureSettingsMs': 0, 'saveMs': 0, 'registryMs': 0}
     if checked['inspectToken'] != job.get('inspectToken'):
         raise RuntimeError('UE 状态在检查后变化，请重新检查')
+    if any(row['action'] not in ('unchanged', 'retained') and job.get('decisions', {}).get(row['key']) != 'skip'
+           and row['status'] != 'blocked' for row in checked['entries']):
+        issue = source_control_issue()
+        if issue:
+            raise RuntimeError(issue)
     # Reuse the fixed branches; create missing directories only.
     for suit in job['suits']:
         root = suit.get('targetRoot', '')
@@ -684,10 +795,11 @@ def apply_job(job):
     records = read_registry()
     decisions = job.get('decisions', {})
     by_key = {entry['key']: entry for suit in job['suits'] for entry in suit['entries']}
+    suit_by_key = {entry['key']: suit for suit in job['suits'] for entry in suit['entries']}
     resolved = {}
     pending_count = sum(row['action'] not in ('unchanged', 'retained') for row in checked['entries'])
     families = {asset.get('family', 'suit') for asset in job['suits']}
-    labels = {'suit': '套装', 'weapon': '武器', 'monster': '怪物', 'npc': 'NPC', 'hair': '头发', 'face': '脸部'}
+    labels = {'suit': '套装', 'weapon': '武器', 'monster': '怪物', 'npc': 'NPC', 'hair': '头发', 'face': '脸部', 'item': '玩法物件'}
     category = labels.get(next(iter(families)), '角色资产') if len(families) == 1 else '角色资产'
     progress_label = 'AssetHive：正在导入' + category
     # One parent slow-task window owns the entire batch. UE child import/save
@@ -734,7 +846,7 @@ def apply_job(job):
                         if import_data:
                             import_data.scripted_add_filename(entry['sourcePath'], 0, '')
                 elif entry['kind'] == 'material':
-                    parent = weapon_parent(entry) if weapon_material_entry(entry) else monster_parent(entry) if monster_material_entry(entry) else load(entry['config']['parentPath'])
+                    parent = item_parent(entry) if item_material_entry(entry) else weapon_parent(entry) if weapon_material_entry(entry) else monster_parent(entry) if monster_material_entry(entry) else load(entry['config']['parentPath'])
                     if not obj:
                         factory = unreal.MaterialInstanceConstantFactoryNew()
                         directory, name = destination.rsplit('/', 1)
@@ -762,7 +874,10 @@ def apply_job(job):
                         configure_emissive_instance(obj, entry, previous_receipt)
                         apply_material_textures(obj, entry, previous_receipt, resolved, decision, row.get('repair', []))
                 else:
-                    if owned_skeleton_entry(entry) and entry['kind'] == 'skeletalMesh' and obj and not load(entry['skeletonPath']):
+                    prior_config = receipt(obj).get('config', {}) if obj else {}
+                    same_skeleton_choice = all(prior_config.get(field) == entry.get('config', {}).get(field)
+                                               for field in ('skeletonOverride', 'skeletonOverridePath'))
+                    if row['action'] == 'updatedRenamed' and same_skeleton_choice and owned_skeleton_entry(entry) and entry['kind'] == 'skeletalMesh' and obj and not load(entry['skeletonPath']):
                         previous_skeleton = obj.get_editor_property('skeleton')
                         if previous_skeleton and str(EAL.get_metadata_tag(previous_skeleton, KEY)) == entry['key'] + ':skeleton':
                             if not EAL.rename_asset(object_path(previous_skeleton), entry['skeletonPath']):
@@ -780,6 +895,7 @@ def apply_job(job):
                         slots = obj.get_editor_property('static_materials' if entry['kind'] == 'staticMesh' else 'materials')
                         old_materials = {str(slot.material_slot_name): slot.material_interface for slot in slots}
                     old_config = receipt(obj).get('config') if obj else None
+                    adopt_item_materials = bool(old_config and old_config.get('deferMaterials') and entry.get('config', {}).get('itemMaterialVersion') and decision != 'keepUE')
                     if row['action'] != 'repair':
                         stage = time.perf_counter()
                         obj = import_file(entry, destination)
@@ -794,12 +910,14 @@ def apply_job(job):
                         slots = obj.get_editor_property(prop)
                         for index, slot in enumerate(slots):
                             name = slot_name(slot)
-                            if str(slot.material_slot_name) in old_materials and name not in row.get('repair', []):
+                            if str(slot.material_slot_name) in old_materials and name not in row.get('repair', []) and not adopt_item_materials and decision != 'applyMapping':
                                 slot.material_interface = old_materials[str(slot.material_slot_name)]
                             elif name in entry['materials']:
                                 slot.material_interface = resolved[entry['materials'][name]]
                             elif name in entry.get('externalMaterials', {}):
                                 slot.material_interface = load(entry['externalMaterials'][name])
+                            elif entry.get('config', {}).get('family') == 'item' and entry['config'].get('deferMaterials'):
+                                pass  # No Item master has been selected; keep existing/default binding.
                             else:
                                 raise RuntimeError('导入后材质槽无法匹配：' + name)
                             # UE Python returns struct copies from array iteration.
@@ -810,7 +928,8 @@ def apply_job(job):
                         helper = obj.get_editor_property(prop)
                         if helper and str(EAL.get_metadata_tag(helper, KEY)) == row['oldKey'] + ':' + suffix:
                             save(helper, {'key': key + ':' + suffix, 'kind': kind})
-                saved = dict(entry)
+                synchronize_owned_helpers(entry, obj)
+                saved = {field: value for field, value in entry.items() if field not in ('bones', 'targetBones')}
                 if entry['kind'] == 'material':
                     saved['appliedMaterial'] = current_material_values(obj, entry)
                     saved['materialBindingVersion'] = 1
@@ -821,6 +940,16 @@ def apply_job(job):
                 row['path'] = object_path(obj)
                 row['status'] = 'unchanged' if row['action'] == 'unchanged' else 'success'
                 resolved[key] = obj
+                if entry['kind'] == 'skeletalMesh':
+                    catalog = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+                    owner = suit_by_key[key]
+                    part = key.rsplit(':', 1)[-1].lower()
+                    is_suit_part = entry.get('config', {}).get('family') == 'suit' and part in ('head', 'upbody', 'downbody', 'arm')
+                    ready = catalog and (catalog.update_model_level(obj, key, owner.get('assetId', ''), owner.get('name', ''), part)
+                                         if is_suit_part else catalog.update_model_level(obj, key))
+                    row['polycountStatus'] = 'ready' if ready else 'pending'
+                    if row['polycountStatus'] == 'pending':
+                        row['message'] = '模型已发送，面数等级待统计；请确认新版插件已加载'
                 next_record = {**saved, 'path': row['path'], 'assetId': row['assetId']}
                 old_key = row.get('oldKey')
                 removed_old_record = bool(old_key and old_key != key and old_key in records)
