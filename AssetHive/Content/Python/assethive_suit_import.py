@@ -17,6 +17,7 @@ MONSTER_ROOT = '/Game/Characters/Monster/'
 NPC_ROOT = '/Game/Characters/NPC/'
 ITEM_ROOT = '/Game/Characters/GameplayItem/'
 ITEM_TEMPLATE = '/Game/MaterialLibrary/Character/Common/M_GamePlayItem_Base_VT'
+ITEM_MASKED_TEMPLATE = '/Game/MaterialLibrary/Character/Common/M_GamePlayItem_Base_Masked_VT'
 MONSTER_CLOTH_TEMPLATE = '/Game/MaterialLibrary/Character/Common/M_Char_Monster_ComplexShading'
 MONSTER_SKIN_TEMPLATE = '/Game/MaterialLibrary/Character/Common/M_Char_Monster_skin'
 TEMPLATE = '/Game/MaterialLibrary/Character/MI_Suit_ComplexShading/'
@@ -120,14 +121,14 @@ def owned_objects(keys):
 def material_parameters(parent, entry=None):
     names = [str(name) for name in MEL.get_texture_parameter_names(parent)]
     if entry and item_material_entry(entry):
-        mapping = {'D': 'Diffuse_VT', 'N': 'Normal_VT', 'ORM': 'ORM_VT', 'E': 'Emissive_Tex_VT'}
+        mapping = {'D': 'Diffuse_VT', 'N': 'Normal_VT', 'ORM': 'ORM_VT', 'E': 'Emissive_Tex_VT', 'A': 'OpacityMasked_VT'}
         return {channel: name for channel, name in mapping.items() if name in names}
     if entry and entry.get('config', {}).get('materialRole', '').startswith('hero_'):
         role = entry['config']['materialRole']
         mapping = ({'D': 'VT_DiffuseColor', 'Opacity': 'VT_Alpha', 'Root': 'VT_Root', 'ID': 'VT_Unique_Hair_ID', 'Height': 'VT_Depth', 'Tangent': 'VT_FlowMap'}
                    if role in ('hero_hair', 'hero_eyebrow') else
                    {'D': 'IrisColorTex', 'N': 'ScleraNormal', 'Height': 'IrisHeight', 'E': 'IrisEmissiveColorTex'} if role == 'hero_eye' else
-                   {'D': 'Diffuse_VT', 'N': 'Normal_VT', 'ORM': 'ORM_VT', 'Opacity': 'OpacityMasked_VT', 'E': 'Emissive_VT'})
+                   {'D': 'Diffuse_VT', 'N': 'Normal_VT', 'ORM': 'ORM_VT', 'Opacity': 'OpacityMasked_VT', 'E': 'Emissive_VT', 'Scatter': 'SSS_VT'})
         return {channel: name for channel, name in mapping.items() if name in names}
     # Verified against Zion M_Char_Suit_ComplexShading via the editor, not guessed from texture order.
     role = entry.get('config', {}).get('materialRole') if entry else ''
@@ -150,11 +151,14 @@ def item_material_entry(entry):
 def item_parent(entry):
     config = entry.get('config', {})
     parent = load(config.get('parentPath', ''))
-    if config.get('parentPath', '').split('.')[0] != ITEM_TEMPLATE or not isinstance(parent, unreal.Material):
-        raise RuntimeError('Gameplay Item 母材质缺失或路径不正确：' + ITEM_TEMPLATE)
+    expected = ITEM_MASKED_TEMPLATE if 'A' in entry.get('textures', {}) else ITEM_TEMPLATE
+    if config.get('parentPath', '').split('.')[0] != expected or not isinstance(parent, unreal.Material):
+        raise RuntimeError('Gameplay Item 母材质缺失或路径不正确：' + expected)
+    if 'A' in entry.get('textures', {}) and parent.get_editor_property('blend_mode') != unreal.BlendMode.BLEND_MASKED:
+        raise RuntimeError('Gameplay Item 透贴母材质必须使用 Masked 模式')
     missing = set(entry.get('textures', {})) - set(material_parameters(parent, entry))
     if missing:
-        raise RuntimeError('当前 Gameplay Item 母材质仅支持 D、N、ORM、E，不支持这些贴图通道：' + ', '.join(sorted(missing)))
+        raise RuntimeError('当前 Gameplay Item 母材质不支持这些贴图通道：' + ', '.join(sorted(missing)))
     if not config.get('virtualTexture'):
         raise RuntimeError('Gameplay Item 母材质使用 VT 采样，贴图必须启用虚拟纹理')
     if 'E' in entry.get('textures', {}) and 'UseEmissive' not in {str(name) for name in MEL.get_static_switch_parameter_names(parent)}:
@@ -396,6 +400,12 @@ def imported_bone_name(name):
 
 def validate_entry(entry, deleted_owners=()):
     config = entry.get('config', {})
+    if entry['kind'] in ('staticMesh', 'skeletalMesh'):
+        validate_lod_sources(entry)
+        if config.get('lodPolicy') == 'existing-settings-v1':
+            library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+            if not library or not hasattr(library, 'complete_configured_lods') or not hasattr(library, 'protect_imported_lod'):
+                raise RuntimeError('请更新 AssetHive UE 插件并重启编辑器，以使用自适应 LOD')
     if config.get('heroPart'):
         gender, body = config.get('gender'), config.get('bodyCode')
         for slot, role in entry.get('heroSharedRoles', {}).items():
@@ -566,6 +576,15 @@ def inspect(job):
                 else:
                     saved = receipt(obj)
                     row['action'] = 'unchanged' if saved.get('fingerprint') == entry['fingerprint'] else 'updated'
+                    if entry['kind'] in ('staticMesh', 'skeletalMesh'):
+                        lod_report = lod_policy_report(obj, entry)
+                        if lod_report:
+                            row['lodReport'] = lod_report
+                            if lod_report.get('pending') and row['action'] == 'unchanged':
+                                row.update(action='updated', message='将按 UE 已有设置补齐缺少的 LOD，美术模型不变')
+                            elif lod_report.get('missing'):
+                                row['message'] = '未配置减面设置：' + '、'.join('LOD' + str(index) for index in lod_report['missing']) + '；本次仍可发送美术模型'
+
                     # A manually moved object stays where the user put it unless the canonical name changed.
                     if previous.get('targetPath') and previous['targetPath'] != entry['targetPath']:
                         collision = load(entry['targetPath'])
@@ -623,6 +642,52 @@ def inspect(job):
                              'action': 'retained', 'status': 'unchanged', 'path': previous.get('path', ''),
                              'message': '库中已移除，UE 保留'})
     return {'entries': rows, 'inspectToken': digest(rows)}
+
+
+def validate_lod_sources(entry):
+    levels = entry.get('config', {}).get('lodSources', [])
+    for index, source in enumerate(levels, 1):
+        if source.get('index') != index or not source.get('sourcePath', '').lower().endswith('.fbx'):
+            raise RuntimeError('LOD 等级必须连续且来源必须为 FBX')
+        with open(source['sourcePath'], 'rb') as stream:
+            actual = hashlib.file_digest(stream, 'sha256').hexdigest()
+        if actual != source.get('sourceHash'):
+            raise RuntimeError('LOD 文件已变化，请重新检查：' + source['sourcePath'])
+
+
+def lod_policy_report(obj, entry, regenerate=False):
+    if entry.get('config', {}).get('lodPolicy') != 'existing-settings-v1':
+        return None
+    library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+    if not library or not hasattr(library, 'complete_configured_lods'):
+        raise RuntimeError('请更新 AssetHive UE 插件并重启编辑器，以使用自适应 LOD')
+    manual = [0] + [source['index'] for source in entry.get('config', {}).get('lodSources', [])]
+    return json.loads(library.complete_configured_lods(obj, manual, regenerate))
+
+
+def apply_model_lods(obj, entry, previous=None):
+    levels = entry.get('config', {}).get('lodSources', [])
+    adaptive = entry.get('config', {}).get('lodPolicy') == 'existing-settings-v1'
+    if not levels and not adaptive:
+        return
+    validate_lod_sources(entry)
+    subsystem_type = unreal.SkeletalMeshEditorSubsystem if entry['kind'] == 'skeletalMesh' else unreal.StaticMeshEditorSubsystem
+    subsystem = unreal.get_editor_subsystem(subsystem_type) or unreal.get_default_object(subsystem_type)
+    library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+    old_levels = {source['index']: source.get('sourceHash') for source in (previous or {}).get('config', {}).get('lodSources', [])}
+    for source in levels:
+        if old_levels.get(source['index']) == source.get('sourceHash') and subsystem.get_lod_count(obj) > source['index']:
+            continue
+        if adaptive:
+            library.protect_imported_lod(obj, source['index'])
+        imported = subsystem.import_lod(obj, source['index'], source['sourcePath'])
+        if imported != source['index']:
+            raise RuntimeError('UE 导入 LOD 失败：LOD' + str(source['index']) + ' ' + source['sourcePath'])
+        if adaptive:
+            library.protect_imported_lod(obj, source['index'])
+    if levels and subsystem.get_lod_count(obj) < levels[-1]['index'] + 1:
+        raise RuntimeError('UE LOD 数量回读不一致')
+    return lod_policy_report(obj, entry, True)
 
 
 def import_file(entry, destination):
@@ -898,7 +963,16 @@ def apply_job(job):
                     adopt_item_materials = bool(old_config and old_config.get('deferMaterials') and entry.get('config', {}).get('itemMaterialVersion') and decision != 'keepUE')
                     if row['action'] != 'repair':
                         stage = time.perf_counter()
-                        obj = import_file(entry, destination)
+                        # A LOD-only update must not reimport LOD0 or recreate helpers.
+                        prior = receipt(obj) if obj else {}
+                        lod_only = bool(obj and entry['kind'] in ('staticMesh', 'skeletalMesh')
+                            and prior.get('sourceHash') == entry.get('sourceHash')
+                            and {k: v for k, v in prior.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy')}
+                            == {k: v for k, v in entry.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy')})
+                        if not lod_only:
+                            obj = import_file(entry, destination)
+                        if entry['kind'] in ('staticMesh', 'skeletalMesh'):
+                            apply_model_lods(obj, entry, prior if lod_only else None)
                         timings['importMs'] += round((time.perf_counter() - stage) * 1000)
                     if entry['kind'] == 'texture':
                         if old_config != entry['config']:
@@ -950,6 +1024,19 @@ def apply_job(job):
                     row['polycountStatus'] = 'ready' if ready else 'pending'
                     if row['polycountStatus'] == 'pending':
                         row['message'] = '模型已发送，面数等级待统计；请确认新版插件已加载'
+                if entry['kind'] in ('staticMesh', 'skeletalMesh'):
+                    # Replace the inspection hint with the final outcome, rather
+                    # than repeating the same warning twice in the result row.
+                    if row.get('message', '').startswith(('未配置减面设置：', '将按 UE 已有设置补齐')):
+                        row.pop('message', None)
+                    lod_report = lod_policy_report(obj, entry)
+                    if lod_report:
+                        row['lodReport'] = lod_report
+                        missing = lod_report.get('missing', [])
+                        if missing:
+                            prefix = '模型保持不变；' if row['status'] == 'unchanged' else '模型已发送；'
+                            warning = prefix + '、'.join('LOD' + str(index) for index in missing) + ' 未生成，请在 UE 配置对应减面设置后重试发送。已提供的美术 LOD 保持不变。'
+                            row['message'] = (row.get('message', '') + ' ' + warning).strip()
                 next_record = {**saved, 'path': row['path'], 'assetId': row['assetId']}
                 old_key = row.get('oldKey')
                 removed_old_record = bool(old_key and old_key != key and old_key in records)

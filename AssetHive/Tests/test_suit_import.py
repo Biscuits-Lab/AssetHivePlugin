@@ -68,10 +68,10 @@ class SuitImportTests(unittest.TestCase):
              patch.object(module.MEL, 'get_static_switch_parameter_names', return_value=['UseEmissive'], create=True):
             self.assertIs(module.item_parent(entry), parent)
             self.assertEqual(module.material_parameters(parent, entry)['E'], 'Emissive_Tex_VT')
-            entry['textures']['A'] = 'a'
+            entry['textures']['SS'] = 'ss'
             with self.assertRaisesRegex(RuntimeError, '不支持'):
                 module.item_parent(entry)
-            del entry['textures']['A']
+            del entry['textures']['SS']
             entry['config']['virtualTexture'] = False
             with self.assertRaisesRegex(RuntimeError, 'VT'):
                 module.item_parent(entry)

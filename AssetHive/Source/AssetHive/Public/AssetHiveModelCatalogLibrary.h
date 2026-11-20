@@ -9,6 +9,12 @@ class ASSETHIVE_API UAssetHiveModelCatalogLibrary : public UBlueprintFunctionLib
     GENERATED_BODY()
 public:
     UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static void ProtectImportedLod(UObject* Model, int32 Index);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static FString CompleteConfiguredLods(UObject* Model, const TArray<int32>& ManualLevels, bool bRegenerate);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
     static bool AssignExistingSkeleton(class USkeletalMesh* Model, class USkeleton* Skeleton);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")

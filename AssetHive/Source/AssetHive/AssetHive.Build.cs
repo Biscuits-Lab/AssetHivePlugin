@@ -1,4 +1,4 @@
-﻿using UnrealBuildTool;
+using UnrealBuildTool;
 
 public class AssetHive : ModuleRules
 {
@@ -37,6 +37,8 @@ public class AssetHive : ModuleRules
             "MeshDescription",
             "StaticMeshDescription",
             "StaticMeshEditor",
+            "SkeletalMeshUtilitiesCommon",
+            "TargetPlatform",
             "ToolMenus",
             "InputCore",
             "Sockets",
