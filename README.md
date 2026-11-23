@@ -26,6 +26,8 @@ The older 1.1.0 release included Windows x64 editor binaries for Unreal Engine 5
 
 ## Editor connection recovery
 
+Animation exports use `characterAnimationV1`. They open Unreal's native FBX animation import window by default, with animation-only, 60 FPS and Exported Time presets. Existing AnimSequences use the native animation reimporter, preserving references. Root Motion and Force Root Lock follow the desktop options. Disable the native window in the desktop dialog to import with those presets automatically. Missing Skeletons, cancelled/failed imports and save failures return per-animation results. Rebuild the plugin with the target engine to enable this capability.
+
 Zion 3D Assets support named material groups: match authored mesh slot names to
 one texture set, create one MI per material identity, and reuse the same MI and
 textures across a batch in the same destination category. Missing names and
@@ -74,3 +76,9 @@ Character weapon jobs use `/Game/Characters/Weapon_PJZ/<category>/<identity>/`, 
 
 A bound FBX supplies its own skeleton on first import; the resulting Skeleton uses `SKEL_<identity>` and compatible later imports reuse it. The plugin does not rig meshes or create animation/physics assets. Weapon jobs do not use suit body materials or the suit shared Skeleton. Weapon instances reuse /Game/MaterialLibrary/Weapon/Common/M_Weapon_Slab; no parent material is generated. D/N/ORM/A bind Diffuse/Normal/ORM/OpacityMasked, with Use VT disabled and Use OpacityMasked enabled only when A exists. Missing master materials produce an error. Existing generated-parent instances migrate on their next send; old parent assets are not automatically deleted. Inspection, incremental sends, receipts, and managed deletion recovery use the character job protocol.
 Weapon PhysicsAsset policy: create missing SK_<canonical>_Physics beside the skeletal mesh; preserve and reuse existing assigned physics assets, including artist edits. Suit imports are unchanged.
+
+Animation imports validate the whole batch before importing: source files, package paths, Skeletons, destination types, read-only files, dirty existing animations and compression settings. `allowEngineCompressionFallback` permits engine default compression only for imported animations when their compression settings are invalid; project settings are never changed. Success requires valid compressed data and a saved asset file, reports the actual object path, and selects the asset in the Content Browser. P4 checkout remains explicit; the importer does not check out files automatically.
+
+`characterAnimationInspectV1` enables read-only animation version checks using `characterAnimation.inspectOnly`. Inspection reports package existence, the saved package hash and loaded-package dirty state without importing or saving. Import receipts include the source FBX hash and saved package hash so the desktop can distinguish archive updates from Unreal edits for each target project.
+
+After the entire animation batch finishes, the Content Browser focuses and selects all successfully saved animations. Failed or cancelled entries do not affect the final selection. The explicit send action can synchronize a locked browser as well.

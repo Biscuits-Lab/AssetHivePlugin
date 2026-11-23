@@ -1,5 +1,6 @@
 #include "AssetHiveModule.h"
 #include "AssetHiveSuitImport.h"
+#include "AssetHiveAnimationImport.h"
 #include "AssetHiveSettings.h"
 #include "AssetHiveEditorToolbar.h"
 #include "AssetHiveImportCommandlet.h"
@@ -110,6 +111,8 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
                                                  MakeShared<FJsonValueString>(TEXT("selectiveOverwrite")),
                                                  MakeShared<FJsonValueString>(TEXT("characterSuitV1")),
                                                  MakeShared<FJsonValueString>(TEXT("characterUpgradeV1")),
+                                                 MakeShared<FJsonValueString>(TEXT("characterAnimationV1")),
+                                                 MakeShared<FJsonValueString>(TEXT("characterAnimationInspectV1")),
                                                  MakeShared<FJsonValueString>(TEXT("atlasTextureOnly"))});
         Info->SetNumberField(TEXT("protocolVersion"), 2);
         Info->SetStringField(TEXT("sessionId"), SessionId);
@@ -210,7 +213,18 @@ void FAssetHiveModule::RunImport(const FString& RequestId, const TSharedPtr<FJso
     TArray<FString> ImportedFolders;
     auto Result = MakeShared<FJsonObject>();
     const TSharedPtr<FJsonObject>* SuitJob = nullptr;
-    if (Job->TryGetObjectField(TEXT("characterSuit"), SuitJob) && SuitJob && SuitJob->IsValid())
+    const TSharedPtr<FJsonObject>* AnimationJob = nullptr;
+    if (Job->TryGetObjectField(TEXT("characterAnimation"), AnimationJob) && AnimationJob && AnimationJob->IsValid())
+    {
+        const auto AnimationResult = AssetHiveAnimationImport::Run(AnimationJob->ToSharedRef(), [this, RequestId](int32 Percent, const FString& Stage)
+        {
+            RecordProgress(RequestId, Percent, Stage, false);
+        });
+        Result->SetStringField(TEXT("type"), TEXT("complete"));
+        Result->SetObjectField(TEXT("animationResult"), AnimationResult);
+        Result->SetStringField(TEXT("message"), TEXT("动画逐项处理完成"));
+    }
+    else if (Job->TryGetObjectField(TEXT("characterSuit"), SuitJob) && SuitJob && SuitJob->IsValid())
     {
         RecordProgress(RequestId, 0, TEXT("正在检查/处理套装资源"), false);
         const auto SuitResult = AssetHiveSuitImport::Run(SuitJob->ToSharedRef(), [this, RequestId](int32 Percent, const FString& Stage)
