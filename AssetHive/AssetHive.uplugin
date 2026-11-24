@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 7,
-	"VersionName": "1.2.3",
+	"Version": 8,
+	"VersionName": "1.2.4",
 	"FriendlyName": "AssetHive",
 	"Description": "AssetHive live import over local TCP, with configurable project import root",
 	"Category": "Importers",
@@ -28,6 +28,14 @@
 	],
 	"IsExperimentalVersion": false,
 	"Plugins": [
+		{
+			"Name": "HairStrands",
+			"Enabled": true
+		},
+		{
+			"Name": "AlembicHairImporter",
+			"Enabled": true
+		},
 		{
 			"Name": "PythonScriptPlugin",
 			"Enabled": true

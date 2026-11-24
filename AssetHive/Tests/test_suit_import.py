@@ -49,6 +49,56 @@ class Asset:
 
 
 class SuitImportTests(unittest.TestCase):
+    def test_same_name_in_another_character_directory_is_not_a_legacy_owner(self):
+        entry = {'key':'new:staticMesh:main','kind':'staticMesh','name':'SM_Main','targetPath':'/Game/Characters/NPC/A/SM_Main'}
+        saved = {**entry, 'targetPath':'/Game/Characters/Monster/B/SM_Main'}
+        self.assertFalse(module.legacy_export_matches(entry, 'old:staticMesh:main', saved))
+        self.assertTrue(module.legacy_export_matches(entry, 'old:staticMesh:main', {**saved, 'targetPath':entry['targetPath']}))
+
+    def test_linked_sidecar_baseline_requires_exact_object_and_preserves_native_receipt(self):
+        obj = Asset('', '/Game/Existing.SM_Existing', {})
+        sidecar = {'path':'/Game/Existing.SM_Existing', 'linkOnly':True, 'fingerprint':'verified'}
+        self.assertEqual(module.receipt(obj, sidecar), sidecar)
+        self.assertEqual(module.receipt(obj, {**sidecar, 'path':'/Game/Other.SM_Other'}), {})
+        self.assertEqual(module.receipt(obj, {**sidecar, 'linkOnly':False}), {})
+        obj = Asset('owner', obj.path, {'fingerprint':'new-import'})
+        self.assertEqual(module.receipt(obj, sidecar), {'fingerprint':'new-import'})
+
+    def test_buqiang_case_only_destination_keeps_existing_material(self):
+        source = '/Game/Suit/Materials/MI_Zhou_Manhunt_head.MI_Zhou_Manhunt_head'
+        target = '/Game/Suit/Materials/MI_Zhou_Manhunt_Head'
+        obj = Asset('', source, {})
+        with patch.object(module.EAL, 'rename_asset', create=True) as rename, patch.object(module, 'load') as load:
+            self.assertEqual(module.relocate_resource(obj, source, target), (source, obj))
+            rename.assert_not_called()
+            load.assert_not_called()
+        self.assertFalse(module.same_ue_package(source, target + '02'))
+
+    def test_real_relocation_still_rejects_occupied_destination(self):
+        obj = Asset('owner:material:head', '/Game/Old/MI_Head', {})
+        with patch.object(module, 'load', return_value=object()), patch.object(module.EAL, 'rename_asset', create=True) as rename:
+            with self.assertRaises(RuntimeError):
+                module.relocate_resource(obj, obj.path, '/Game/New/MI_Head')
+            rename.assert_not_called()
+
+    def test_status_checks_library_paths_without_local_registry_and_preserves_foreign_owner(self):
+        owned = Asset('owner:material:head', '/Game/Suit/MI_Head', {})
+        foreign = Asset('other:staticMesh:head', '/Game/Suit/SM_Head', {})
+        objects = {owned.path: owned, foreign.path: foreign}
+        job = {'suits': [{'assetId': 'owner', 'entries': [
+            {'key': 'owner:material:head', 'path': owned.path},
+            {'key': 'owner:staticMesh:head', 'path': foreign.path},
+            {'key': 'owner:skeletalMesh:head', 'path': '/Game/Deleted/SK_Head'},
+            {'key': 'other:material:head', 'path': owned.path}]}]}
+        with patch.object(module, 'read_registry', return_value={}), patch.object(module, 'load', side_effect=objects.get), patch.object(module, 'owned_objects', return_value={}):
+            rows = {row['key']: row for row in module.suit_status(job)['entries']}
+        self.assertEqual(len(rows), 3)
+        self.assertTrue(rows['owner:material:head']['present'])
+        self.assertFalse(rows['owner:material:head']['associationPending'])
+        self.assertTrue(rows['owner:staticMesh:head']['associationPending'])
+        self.assertFalse(rows['owner:skeletalMesh:head']['present'])
+        self.assertEqual(foreign.tags[module.KEY], 'other:staticMesh:head')
+
     def test_item_destination_accepts_current_character_root_and_rejects_old_root(self):
         entry = {'kind': 'texture', 'channel': 'D', 'sourcePath': str(script),
                  'targetPath': '/Game/Characters/GameplayItem/Chest/Test/Texture/T_Test_D',

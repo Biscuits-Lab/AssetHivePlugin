@@ -9,10 +9,31 @@ class ASSETHIVE_API UAssetHiveModelCatalogLibrary : public UBlueprintFunctionLib
     GENERATED_BODY()
 public:
     UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static bool VerifyGroomSource(UObject* Model, const FString& SourcePath);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static UObject* CopyGroomImportOptions(UObject* Model);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static FString GetLinkSkeletonBones(UObject* Skeleton);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static bool ReimportLinkedModel(UObject* Model, const FString& SourcePath, UObject* ImportOptions);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static UObject* ParseLinkMeshSource(UObject* ReferenceModel, const FString& SourcePath);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static void ReleaseLinkMeshSource(UObject* Model);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
     static void ProtectImportedLod(UObject* Model, int32 Index);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
     static FString CompleteConfiguredLods(UObject* Model, const TArray<int32>& ManualLevels, bool bRegenerate);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static FString CompleteCharacterLods(UObject* Model, const TArray<int32>& ManualLevels, bool bRegenerate);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
     static bool AssignExistingSkeleton(class USkeletalMesh* Model, class USkeleton* Skeleton);

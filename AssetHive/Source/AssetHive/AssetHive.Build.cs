@@ -34,6 +34,8 @@ public class AssetHive : ModuleRules
             "LevelEditor",
             "MaterialEditor",
             "UnrealEd",
+            "HairStrandsCore",
+            "HairStrandsEditor",
             "MeshDescription",
             "StaticMeshDescription",
             "StaticMeshEditor",

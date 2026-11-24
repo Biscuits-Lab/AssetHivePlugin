@@ -43,11 +43,14 @@ def slot_name(slot):
     return str(imported) if imported and str(imported) != 'None' else str(slot.material_slot_name)
 
 
-def receipt(obj):
+def receipt(obj, previous=None):
     try:
-        return json.loads(EAL.get_metadata_tag(obj, STAMP) or '{}')
+        saved = json.loads(EAL.get_metadata_tag(obj, STAMP) or '{}')
     except ValueError:
-        return {}
+        saved = {}
+    if not saved and previous and previous.get('linkOnly') and same_ue_package(previous.get('path'), object_path(obj)):
+        return previous
+    return saved
 
 
 def legacy_export_matches(entry, old_key, saved):
@@ -56,7 +59,9 @@ def legacy_export_matches(entry, old_key, saved):
         return False
     return (old_key.split(':', 1)[1] == entry['key'].split(':', 1)[1]
             and saved.get('kind') == entry.get('kind')
-            and saved.get('name') == entry.get('name'))
+            and saved.get('name') == entry.get('name')
+            and bool(saved.get('targetPath'))
+            and same_ue_package(saved['targetPath'], entry.get('targetPath')))
 
 
 def reassociated_receipt(saved, old_key, new_key):
@@ -84,10 +89,14 @@ def registry_path():
 
 def read_registry():
     path = registry_path()
-    if not os.path.isfile(path):
-        return {}
-    with open(path, encoding='utf-8') as source:
-        records = json.load(source)
+    records = {}
+    links = os.path.join(unreal.Paths.project_dir(), 'Config', 'AssetHive', 'Links.json')
+    if os.path.isfile(links):
+        with open(links, encoding='utf-8') as source:
+            records.update(json.load(source))
+    if os.path.isfile(path):
+        with open(path, encoding='utf-8') as source:
+            records.update(json.load(source))
     # Bone arrays belong to this inspection, not the persistent identity receipt.
     # Old versions stored both full hierarchies on every mesh and rewrote them
     # after each imported resource. Drop only these derived validation fields.
@@ -398,14 +407,8 @@ def imported_bone_name(name):
     return re.sub(r'[.,/`%]', '_', name.rsplit(':', 1)[-1]).strip().replace(' ', '-').lower()
 
 
-def validate_entry(entry, deleted_owners=()):
+def resolve_hero_shared_materials(entry):
     config = entry.get('config', {})
-    if entry['kind'] in ('staticMesh', 'skeletalMesh'):
-        validate_lod_sources(entry)
-        if config.get('lodPolicy') == 'existing-settings-v1':
-            library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
-            if not library or not hasattr(library, 'complete_configured_lods') or not hasattr(library, 'protect_imported_lod'):
-                raise RuntimeError('请更新 AssetHive UE 插件并重启编辑器，以使用自适应 LOD')
     if config.get('heroPart'):
         gender, body = config.get('gender'), config.get('bodyCode')
         for slot, role in entry.get('heroSharedRoles', {}).items():
@@ -421,6 +424,18 @@ def validate_entry(entry, deleted_owners=()):
             if role not in paths:
                 raise RuntimeError('无法确定共享材质用途：' + slot)
             entry.setdefault('externalMaterials', {})[slot] = paths[role]
+
+
+def validate_entry(entry, deleted_owners=()):
+    config = entry.get('config', {})
+    if entry['kind'] in ('staticMesh', 'skeletalMesh'):
+        validate_lod_sources(entry)
+        if config.get('lodPolicy') in ('existing-settings-v1', 'lod1-reduction-v2'):
+            library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+            method = 'complete_character_lods' if config['lodPolicy'] == 'lod1-reduction-v2' else 'complete_configured_lods'
+            if not library or not hasattr(library, method) or not hasattr(library, 'protect_imported_lod'):
+                raise RuntimeError('请更新 AssetHive UE 插件并重启编辑器，以使用自适应 LOD')
+    resolve_hero_shared_materials(entry)
     if entry.get('validationError'):
         raise RuntimeError(entry['validationError'])
     path = entry.get('targetPath', '')
@@ -505,6 +520,26 @@ def validate_entry(entry, deleted_owners=()):
                 raise RuntimeError('母材质贴图参数待指定：' + channel)
 
 
+def same_ue_package(left, right):
+    # UE package/FName identity is case-insensitive; object suffixes are not
+    # another package. A case-only rename would attempt to move an object onto itself.
+    return str(left or '').split('.', 1)[0].rstrip('/').casefold() == str(right or '').split('.', 1)[0].rstrip('/').casefold()
+
+
+def relocate_resource(obj, source, target):
+    if same_ue_package(source, target):
+        return source, obj
+    collision = load(target)
+    if collision and collision != obj:
+        raise RuntimeError('接管目标已被其他 UE 对象占用')
+    if not obj or not EAL.rename_asset(source, target):
+        raise RuntimeError('UE 资源迁移失败；请检查目标冲突、写入权限和版本控制连接')
+    moved = load(target)
+    if not moved:
+        raise RuntimeError('迁移后无法读取目标资源')
+    return target, moved
+
+
 def inspect(job):
     records = read_registry()
     deleted_owners = set(job.get('deletedOwnerIds', [])) - {suit['assetId'] for suit in job['suits']}
@@ -517,7 +552,7 @@ def inspect(job):
     for _, entry in resources:
         previous = records.get(entry['key'], {})
         obj = load(previous.get('path'))
-        if obj and str(EAL.get_metadata_tag(obj, KEY)) == entry['key']:
+        if obj and (str(EAL.get_metadata_tag(obj, KEY)) == entry['key'] or previous.get('linkOnly') and not str(EAL.get_metadata_tag(obj, KEY))):
             located[entry['key']] = [obj]
         elif previous:
             unresolved.append(entry['key'])
@@ -532,6 +567,19 @@ def inspect(job):
         row = {'assetId': suit['assetId'], 'key': entry['key'], 'name': entry['name'], 'kind': entry['kind'],
                'partSlot': entry.get('partSlot', ''), 'targetPath': entry['targetPath'], 'status': 'ready', 'action': 'added', 'message': ''}
         try:
+            previous = records.get(entry['key'], {})
+            if (previous.get('linkedSkeletonPath') and entry.get('config', {}).get('ownSkeleton')
+                    and not entry.get('config', {}).get('skeletonOverride')
+                    and same_ue_package(previous.get('targetPath'), entry.get('targetPath'))
+                    and same_ue_package(previous.get('linkedCanonicalSkeletonPath', previous.get('skeletonPath')), entry.get('skeletonPath'))):
+                entry['linkedSkeletonPath'] = previous['linkedSkeletonPath']
+                entry['linkedCanonicalSkeletonPath'] = previous.get('linkedCanonicalSkeletonPath', previous.get('skeletonPath'))
+                entry['skeletonPath'] = previous['linkedSkeletonPath']
+                entry['config'] = {**entry['config'], 'ownSkeleton': False, 'createPhysicsAsset': False}
+                catalog = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+                if not catalog or not hasattr(catalog, 'get_link_skeleton_bones'):
+                    raise RuntimeError('请更新正式插件，以验证已关联模型的骨架')
+                entry['targetBones'] = json.loads(catalog.get_link_skeleton_bones(load(entry['skeletonPath'])))
             validate_entry(entry, deleted_owners)
             matches = located.get(entry['key'], [])
             if len(matches) > 1:
@@ -553,6 +601,8 @@ def inspect(job):
             previous = records.get(entry['key'], {})
             if obj:
                 key = str(EAL.get_metadata_tag(obj, KEY))
+                if not key and previous.get('linkOnly') and same_ue_package(previous.get('path'), object_path(obj)):
+                    key = entry['key']
                 row['path'] = object_path(obj)
                 if key != entry['key']:
                     old = receipt(obj) or records.get(key, {})
@@ -574,19 +624,20 @@ def inspect(job):
                                    message=('检测到同一规范资源的旧 AssetHive 归属；确认接管后更新，UE 对象不会被删除'
                                             if key else '同名 UE 资产尚未关联；确认关联后更新，UE 对象不会被删除'))
                 else:
-                    saved = receipt(obj)
+                    saved = receipt(obj, previous)
                     row['action'] = 'unchanged' if saved.get('fingerprint') == entry['fingerprint'] else 'updated'
                     if entry['kind'] in ('staticMesh', 'skeletalMesh'):
                         lod_report = lod_policy_report(obj, entry)
                         if lod_report:
                             row['lodReport'] = lod_report
-                            if lod_report.get('pending') and row['action'] == 'unchanged':
-                                row.update(action='updated', message='将按 UE 已有设置补齐缺少的 LOD，美术模型不变')
+                            if (lod_report.get('pending') or lod_report.get('missingManual')) and row['action'] == 'unchanged':
+                                row.update(action='updated', message='将重新验证美术 LOD，并补齐自动减面等级')
                             elif lod_report.get('missing'):
-                                row['message'] = '未配置减面设置：' + '、'.join('LOD' + str(index) for index in lod_report['missing']) + '；本次仍可发送美术模型'
+                                row['message'] = ('请补充美术 LOD1 后自动生成 LOD2–5；本次仍可发送已有模型' if entry.get('config', {}).get('lodPolicy') == 'lod1-reduction-v2'
+                                                  else '未配置减面设置：' + '、'.join('LOD' + str(index) for index in lod_report['missing']) + '；本次仍可发送美术模型')
 
                     # A manually moved object stays where the user put it unless the canonical name changed.
-                    if previous.get('targetPath') and previous['targetPath'] != entry['targetPath']:
+                    if previous.get('targetPath') and not same_ue_package(previous['targetPath'], entry['targetPath']):
                         collision = load(entry['targetPath'])
                         if collision and collision != obj:
                             raise RuntimeError('改名目标已被其他 UE 对象占用')
@@ -618,7 +669,7 @@ def inspect(job):
             # Inspect the actual override so restoration can reconnect it without touching other values.
             repair = [channel for channel, key in entry['textures'].items()
                       if key in missing and parameters.get(channel) in overrides and not overrides[parameters[channel]]]
-            saved = receipt(obj)
+            saved = receipt(obj, records.get(entry['key']))
             if not saved.get('materialBindingVersion'):
                 current = current_material_values(obj, entry)
                 applied = saved.get('appliedMaterial', {}).get('textures', {})
@@ -627,7 +678,7 @@ def inspect(job):
         elif entry['kind'] in ('staticMesh', 'skeletalMesh'):
             slots = obj.get_editor_property('static_materials' if entry['kind'] == 'staticMesh' else 'materials')
             repair = [slot_name(slot) for slot in slots
-                      if not slot.material_interface and entry['materials'].get(slot_name(slot)) in missing]
+                          if not slot.material_interface and entry.get('materials', {}).get(slot_name(slot)) in missing]
         if weapon_physics_enabled(entry) and not obj.get_editor_property('physics_asset'):
             row.update(action='updated', message='补充武器物理资产')
         elif repair:
@@ -656,18 +707,34 @@ def validate_lod_sources(entry):
 
 
 def lod_policy_report(obj, entry, regenerate=False):
-    if entry.get('config', {}).get('lodPolicy') != 'existing-settings-v1':
+    policy = entry.get('config', {}).get('lodPolicy')
+    if policy not in ('existing-settings-v1', 'lod1-reduction-v2'):
         return None
     library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
-    if not library or not hasattr(library, 'complete_configured_lods'):
+    method = 'complete_character_lods' if policy == 'lod1-reduction-v2' else 'complete_configured_lods'
+    if not library or not hasattr(library, method):
         raise RuntimeError('请更新 AssetHive UE 插件并重启编辑器，以使用自适应 LOD')
     manual = [0] + [source['index'] for source in entry.get('config', {}).get('lodSources', [])]
-    return json.loads(library.complete_configured_lods(obj, manual, regenerate))
+    return json.loads(getattr(library, method)(obj, manual, regenerate))
+
+
+def verify_lod_report(entry, report):
+    if entry.get('config', {}).get('lodPolicy') != 'lod1-reduction-v2':
+        return
+    if not report or report.get('policy') != 'lod1-reduction-v2':
+        raise RuntimeError('UE 未返回有效 LOD 验证结果，请更新插件并重试')
+    levels = {level['index']: level for level in report.get('levels', [])}
+    manual = [0] + [s['index'] for s in entry.get('config', {}).get('lodSources', [])]
+    if report.get('missingManual') or any(levels.get(i, {}).get('triangles', 0) <= 0 or levels[i].get('source') != 'imported' for i in manual):
+        raise RuntimeError('UE 美术 LOD 未正确挂入或网格为空，请重新发送')
+    if 1 in levels and levels[1].get('source') in ('imported', 'existing'):
+        if report.get('missing') or report.get('pending') or any(levels.get(i, {}).get('triangles', 0) <= 0 for i in range(2, 6)):
+            raise RuntimeError('UE LOD2–5 自动减面未完成，请检查减面模块并重试')
 
 
 def apply_model_lods(obj, entry, previous=None):
     levels = entry.get('config', {}).get('lodSources', [])
-    adaptive = entry.get('config', {}).get('lodPolicy') == 'existing-settings-v1'
+    adaptive = entry.get('config', {}).get('lodPolicy') in ('existing-settings-v1', 'lod1-reduction-v2')
     if not levels and not adaptive:
         return
     validate_lod_sources(entry)
@@ -676,7 +743,7 @@ def apply_model_lods(obj, entry, previous=None):
     library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
     old_levels = {source['index']: source.get('sourceHash') for source in (previous or {}).get('config', {}).get('lodSources', [])}
     for source in levels:
-        if old_levels.get(source['index']) == source.get('sourceHash') and subsystem.get_lod_count(obj) > source['index']:
+        if entry.get('config', {}).get('lodPolicy') != 'lod1-reduction-v2' and old_levels.get(source['index']) == source.get('sourceHash') and subsystem.get_lod_count(obj) > source['index']:
             continue
         if adaptive:
             library.protect_imported_lod(obj, source['index'])
@@ -687,7 +754,9 @@ def apply_model_lods(obj, entry, previous=None):
             library.protect_imported_lod(obj, source['index'])
     if levels and subsystem.get_lod_count(obj) < levels[-1]['index'] + 1:
         raise RuntimeError('UE LOD 数量回读不一致')
-    return lod_policy_report(obj, entry, True)
+    report = lod_policy_report(obj, entry, True)
+    verify_lod_report(entry, report)
+    return report
 
 
 def import_file(entry, destination):
@@ -710,6 +779,14 @@ def import_file(entry, destination):
             raise RuntimeError('Groom 需要 ABC 以及启用的 Groom/Alembic Groom Importer 插件')
         task.factory = unreal.HairStrandsFactory()
         task.options = unreal.GroomImportOptions()
+        if previous_model:
+            library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+            if not library or not hasattr(library, 'copy_groom_import_options'):
+                raise RuntimeError('请更新正式插件，以保留 Groom 导入设置')
+            previous_options = library.copy_groom_import_options(previous_model)
+            if not previous_options:
+                raise RuntimeError('Groom 缺少原始导入设置，未覆盖现有资源')
+            task.options = previous_options
     if entry['kind'] in ('staticMesh', 'skeletalMesh'):
         options = unreal.FbxImportUI()
         skeletal = entry['kind'] == 'skeletalMesh'
@@ -737,10 +814,19 @@ def import_file(entry, destination):
         mesh_import_data.set_editor_property('force_front_x_axis', False)
         task.options = options
         task.factory = unreal.FbxFactory()
-    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    reimported = False
+    if previous_model and entry['kind'] in ('staticMesh', 'skeletalMesh'):
+        library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+        if not library or not hasattr(library, 'reimport_linked_model'):
+            raise RuntimeError('请更新 AssetHive 插件，以自动更新已关联模型')
+        if not library.reimport_linked_model(previous_model, entry['sourcePath'], task.options):
+            raise RuntimeError('模型自动重新导入失败，未要求手动选择源文件')
+        reimported = True
+    else:
+        unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
     obj = load(destination)
     expected = getattr(unreal, 'GroomAsset', None) if entry['kind'] == 'groom' else {'texture': unreal.Texture2D, 'staticMesh': unreal.StaticMesh, 'skeletalMesh': unreal.SkeletalMesh}[entry['kind']]
-    if not isinstance(obj, expected) or not task.imported_object_paths:
+    if not isinstance(obj, expected) or (not reimported and not task.imported_object_paths):
         raise RuntimeError('UE 未返回预期类型的导入资产：' + entry['name'])
     if entry['kind'] == 'skeletalMesh':
         skeleton = obj.get_editor_property('skeleton')
@@ -892,17 +978,10 @@ def apply_job(job):
                     raise RuntimeError('必要依赖未完成，当前资源待处理')
                 destination = row.get('path', entry['targetPath']).split('.')[0]
                 obj = load(destination)
-                if decision == 'adopt' and destination != entry['targetPath']:
-                    collision = load(entry['targetPath'])
-                    if collision and collision != obj:
-                        raise RuntimeError('接管目标已被其他 UE 对象占用')
-                    if not obj or not EAL.rename_asset(destination, entry['targetPath']):
-                        raise RuntimeError('旧归属 UE 资产迁移到新规范路径失败')
-                    destination = entry['targetPath']; obj = load(destination)
+                if decision == 'adopt':
+                    destination, obj = relocate_resource(obj, destination, entry['targetPath'])
                 if row['action'] in ('renamed', 'updatedRenamed'):
-                    if destination != entry['targetPath'] and not EAL.rename_asset(destination, entry['targetPath']):
-                        raise RuntimeError('UE 资产改名失败；请检查目标冲突、写入权限和版本控制连接')
-                    destination = entry['targetPath']; obj = load(destination)
+                    destination, obj = relocate_resource(obj, destination, entry['targetPath'])
                 if row['action'] in ('unchanged', 'renamed', 'relinked'):
                     if not obj:
                         raise RuntimeError('UE 资产在执行时缺失')
@@ -920,7 +999,7 @@ def apply_job(job):
                     if not isinstance(obj, unreal.MaterialInstanceConstant):
                         raise RuntimeError('同名对象不是材质实例')
                     if decision != 'keepUE':
-                        previous_receipt = receipt(obj)
+                        previous_receipt = receipt(obj, records.get(key))
                         if row.get('oldKey'):
                             previous_receipt = reassociated_receipt(previous_receipt, row['oldKey'], key)
                         if previous_receipt.get('config', {}).get('parentPath') != entry['config']['parentPath']:
@@ -939,7 +1018,7 @@ def apply_job(job):
                         configure_emissive_instance(obj, entry, previous_receipt)
                         apply_material_textures(obj, entry, previous_receipt, resolved, decision, row.get('repair', []))
                 else:
-                    prior_config = receipt(obj).get('config', {}) if obj else {}
+                    prior_config = receipt(obj, records.get(key)).get('config', {}) if obj else {}
                     same_skeleton_choice = all(prior_config.get(field) == entry.get('config', {}).get(field)
                                                for field in ('skeletonOverride', 'skeletonOverridePath'))
                     if row['action'] == 'updatedRenamed' and same_skeleton_choice and owned_skeleton_entry(entry) and entry['kind'] == 'skeletalMesh' and obj and not load(entry['skeletonPath']):
@@ -956,15 +1035,15 @@ def apply_job(job):
                     if actual != entry['sourceHash']:
                         raise RuntimeError('管理文件内容变化，请重新检查')
                     old_materials = {}
-                    if obj and receipt(obj) and entry['kind'] in ('staticMesh', 'skeletalMesh'):
+                    if obj and receipt(obj, records.get(key)) and entry['kind'] in ('staticMesh', 'skeletalMesh'):
                         slots = obj.get_editor_property('static_materials' if entry['kind'] == 'staticMesh' else 'materials')
                         old_materials = {str(slot.material_slot_name): slot.material_interface for slot in slots}
-                    old_config = receipt(obj).get('config') if obj else None
+                    old_config = receipt(obj, records.get(key)).get('config') if obj else None
                     adopt_item_materials = bool(old_config and old_config.get('deferMaterials') and entry.get('config', {}).get('itemMaterialVersion') and decision != 'keepUE')
                     if row['action'] != 'repair':
                         stage = time.perf_counter()
                         # A LOD-only update must not reimport LOD0 or recreate helpers.
-                        prior = receipt(obj) if obj else {}
+                        prior = receipt(obj, records.get(key)) if obj else {}
                         lod_only = bool(obj and entry['kind'] in ('staticMesh', 'skeletalMesh')
                             and prior.get('sourceHash') == entry.get('sourceHash')
                             and {k: v for k, v in prior.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy')}
@@ -974,6 +1053,9 @@ def apply_job(job):
                         if entry['kind'] in ('staticMesh', 'skeletalMesh'):
                             apply_model_lods(obj, entry, prior if lod_only else None)
                         timings['importMs'] += round((time.perf_counter() - stage) * 1000)
+                    elif entry['kind'] in ('staticMesh', 'skeletalMesh') and entry.get('config', {}).get('lodPolicy') == 'lod1-reduction-v2':
+                        # Material repair and a missing artist LOD can coexist.
+                        apply_model_lods(obj, entry, receipt(obj, records.get(key)))
                     if entry['kind'] == 'texture':
                         if old_config != entry['config']:
                             stage = time.perf_counter()
@@ -1002,7 +1084,10 @@ def apply_job(job):
                         helper = obj.get_editor_property(prop)
                         if helper and str(EAL.get_metadata_tag(helper, KEY)) == row['oldKey'] + ':' + suffix:
                             save(helper, {'key': key + ':' + suffix, 'kind': kind})
-                synchronize_owned_helpers(entry, obj)
+                if row['action'] != 'unchanged':
+                    synchronize_owned_helpers(entry, obj)
+                if entry['kind'] in ('staticMesh', 'skeletalMesh'):
+                    verify_lod_report(entry, lod_policy_report(obj, entry))
                 saved = {field: value for field, value in entry.items() if field not in ('bones', 'targetBones')}
                 if entry['kind'] == 'material':
                     saved['appliedMaterial'] = current_material_values(obj, entry)
@@ -1014,7 +1099,7 @@ def apply_job(job):
                 row['path'] = object_path(obj)
                 row['status'] = 'unchanged' if row['action'] == 'unchanged' else 'success'
                 resolved[key] = obj
-                if entry['kind'] == 'skeletalMesh':
+                if entry['kind'] == 'skeletalMesh' and row['action'] != 'unchanged':
                     catalog = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
                     owner = suit_by_key[key]
                     part = key.rsplit(':', 1)[-1].lower()
@@ -1027,7 +1112,7 @@ def apply_job(job):
                 if entry['kind'] in ('staticMesh', 'skeletalMesh'):
                     # Replace the inspection hint with the final outcome, rather
                     # than repeating the same warning twice in the result row.
-                    if row.get('message', '').startswith(('未配置减面设置：', '将按 UE 已有设置补齐')):
+                    if row.get('message', '').startswith(('未配置减面设置：', '将按 UE 已有设置补齐', '将重新验证美术 LOD', '请补充美术 LOD1')):
                         row.pop('message', None)
                     lod_report = lod_policy_report(obj, entry)
                     if lod_report:
@@ -1035,9 +1120,12 @@ def apply_job(job):
                         missing = lod_report.get('missing', [])
                         if missing:
                             prefix = '模型保持不变；' if row['status'] == 'unchanged' else '模型已发送；'
-                            warning = prefix + '、'.join('LOD' + str(index) for index in missing) + ' 未生成，请在 UE 配置对应减面设置后重试发送。已提供的美术 LOD 保持不变。'
+                            warning = (prefix + '请补充美术 LOD1 后自动生成 LOD2–5。' if entry.get('config', {}).get('lodPolicy') == 'lod1-reduction-v2'
+                                       else prefix + '、'.join('LOD' + str(index) for index in missing) + ' 未生成，请在 UE 配置对应减面设置后重试发送。已提供的美术 LOD 保持不变。')
                             row['message'] = (row.get('message', '') + ' ' + warning).strip()
                 next_record = {**saved, 'path': row['path'], 'assetId': row['assetId']}
+                if row['action'] == 'unchanged' and records.get(key, {}).get('linkOnly'):
+                    next_record = records[key]
                 old_key = row.get('oldKey')
                 removed_old_record = bool(old_key and old_key != key and old_key in records)
                 if old_key and old_key != key:
@@ -1057,21 +1145,38 @@ def apply_job(job):
 
 
 def suit_status(job):
+    if job.get('capabilityProbe'):
+        capabilities = ['characterStatusV2', 'characterLinkOnlyV1']
+        library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+        if library and all(hasattr(library, name) for name in ('parse_link_mesh_source', 'release_link_mesh_source', 'reimport_linked_model', 'get_link_skeleton_bones', 'verify_groom_source', 'copy_groom_import_options')):
+            capabilities.append('characterLinkOnlyV2')
+        return {'entries': [], 'capabilities': capabilities}
     ids = {suit['assetId'] for suit in job.get('suits', [])}
     records = {key: value for key, value in read_registry().items() if value.get('assetId') in ids}
+    # Local registry files can be absent in another checkout/version of the same
+    # project. The library's last known paths must still be checked explicitly.
+    for suit in job.get('suits', []):
+        for entry in suit.get('entries', []):
+            key = entry.get('key', '')
+            if key.startswith(suit['assetId'] + ':') and entry.get('path', '').startswith('/Game/'):
+                records.setdefault(key, {**entry, 'assetId': suit['assetId']})
     found = {}
+    unlinked = {}
     missing = []
     for key, value in records.items():
         obj = load(value.get('path'))
-        if obj and str(EAL.get_metadata_tag(obj, KEY)) == key:
+        if obj and (str(EAL.get_metadata_tag(obj, KEY)) == key or value.get('linkOnly') and not str(EAL.get_metadata_tag(obj, KEY)) and same_ue_package(value.get('path'), object_path(obj))):
             found[key] = [obj]
         else:
+            if obj:
+                unlinked[key] = obj
             missing.append(key)
     if missing:
         found.update(owned_objects(missing))
     return {'entries': [{'key': key, 'assetId': value['assetId'],
-                         'present': len(found.get(key, [])) == 1,
-                         'path': object_path(found[key][0]) if len(found.get(key, [])) == 1 else ''}
+                         'present': bool(found.get(key) or unlinked.get(key)),
+                         'associationPending': len(found.get(key, [])) > 1 or not found.get(key) and key in unlinked,
+                         'path': object_path(found[key][0]) if len(found.get(key, [])) == 1 else object_path(unlinked[key]) if key in unlinked and not found.get(key) else ''}
                         for key, value in records.items()]}
 
 
@@ -1081,7 +1186,17 @@ def run_job_file(input_path, output_path):
             job = json.load(source)
         if job.get('version') != 1:
             raise RuntimeError('Unsupported Suit protocol')
-        result = suit_status(job) if job.get('phase') == 'status' else inspect(job) if job.get('phase') == 'inspect' else apply_job(job)
+        if job.get('phase') in ('linkInspect', 'linkNormalize', 'linkApply'):
+            import runpy
+            result = runpy.run_path(os.path.join(os.path.dirname(__file__), 'assethive_link_only.py'))['run'](job)
+        elif job.get('phase') == 'status':
+            result = suit_status(job)
+        elif job.get('phase') == 'inspect':
+            result = inspect(job)
+        elif job.get('phase') == 'apply':
+            result = apply_job(job)
+        else:
+            raise RuntimeError('Unsupported character operation')
     except Exception as error:
         result = {'error': str(error), 'entries': []}
         unreal.log_error(traceback.format_exc())
