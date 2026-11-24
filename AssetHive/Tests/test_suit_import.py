@@ -49,6 +49,25 @@ class Asset:
 
 
 class SuitImportTests(unittest.TestCase):
+    def test_new_link_supersedes_old_import_and_later_send_consumes_revision(self):
+        import json
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            links = root / 'Config/AssetHive/Links.json'
+            links.parent.mkdir(parents=True)
+            registry = root / 'imports.json'
+            linked = {'path':'/Game/Test.Test', 'linkOnly':True, 'fingerprint':'verified'}
+            links.write_text(json.dumps({'key':linked}), encoding='utf-8')
+            registry.write_text(json.dumps({'key':{'fingerprint':'old'}}), encoding='utf-8')
+            with patch.object(module, 'registry_path', return_value=str(registry)), patch.object(module.unreal, 'Paths', types.SimpleNamespace(project_dir=lambda:temp), create=True):
+                current = module.read_registry()['key']
+                self.assertEqual(current['fingerprint'], 'verified')
+                registry.write_text(json.dumps({'key':{'fingerprint':'later-send', 'linkRevision':current['linkRevision']}}), encoding='utf-8')
+                self.assertEqual(module.read_registry()['key']['fingerprint'], 'later-send')
+                links.write_text(json.dumps({'key':{**linked, 'linkRevision':'new-association'}}), encoding='utf-8')
+                self.assertEqual(module.read_registry()['key']['fingerprint'], 'verified')
+
     def test_root_container_requires_the_source_ancestor_chain(self):
         entry = {'key': 'owner:skeletalMesh:main', 'kind': 'skeletalMesh', 'sourcePath': str(script),
                  'targetPath': '/Game/Characters/Monster/Test/SK_Test', 'skeletonPath': '/Game/Characters/Monster/Test/SKEL_Test',
@@ -79,14 +98,15 @@ class SuitImportTests(unittest.TestCase):
         self.assertFalse(module.legacy_export_matches(entry, 'old:staticMesh:main', saved))
         self.assertTrue(module.legacy_export_matches(entry, 'old:staticMesh:main', {**saved, 'targetPath':entry['targetPath']}))
 
-    def test_linked_sidecar_baseline_requires_exact_object_and_preserves_native_receipt(self):
+    def test_verified_sidecar_supersedes_stale_native_receipt_at_exact_object(self):
         obj = Asset('', '/Game/Existing.SM_Existing', {})
         sidecar = {'path':'/Game/Existing.SM_Existing', 'linkOnly':True, 'fingerprint':'verified'}
         self.assertEqual(module.receipt(obj, sidecar), sidecar)
         self.assertEqual(module.receipt(obj, {**sidecar, 'path':'/Game/Other.SM_Other'}), {})
         self.assertEqual(module.receipt(obj, {**sidecar, 'linkOnly':False}), {})
         obj = Asset('owner', obj.path, {'fingerprint':'new-import'})
-        self.assertEqual(module.receipt(obj, sidecar), {'fingerprint':'new-import'})
+        self.assertEqual(module.receipt(obj, sidecar), sidecar)
+        self.assertEqual(module.receipt(obj, {**sidecar, 'linkOnly':False}), {'fingerprint':'new-import'})
 
     def test_buqiang_case_only_destination_keeps_existing_material(self):
         source = '/Game/Suit/Materials/MI_Zhou_Manhunt_head.MI_Zhou_Manhunt_head'

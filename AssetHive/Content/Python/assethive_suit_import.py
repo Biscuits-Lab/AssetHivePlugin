@@ -57,7 +57,7 @@ def receipt(obj, previous=None):
         saved = json.loads(EAL.get_metadata_tag(obj, STAMP) or '{}')
     except ValueError:
         saved = {}
-    if not saved and previous and previous.get('linkOnly') and same_ue_package(previous.get('path'), object_path(obj)):
+    if previous and previous.get('linkOnly') and same_ue_package(previous.get('path'), object_path(obj)):
         return previous
     return saved
 
@@ -100,12 +100,17 @@ def read_registry():
     path = registry_path()
     records = {}
     links = os.path.join(unreal.Paths.project_dir(), 'Config', 'AssetHive', 'Links.json')
-    if os.path.isfile(links):
-        with open(links, encoding='utf-8') as source:
-            records.update(json.load(source))
     if os.path.isfile(path):
         with open(path, encoding='utf-8') as source:
             records.update(json.load(source))
+    if os.path.isfile(links):
+        with open(links, encoding='utf-8') as source:
+            for key, linked in json.load(source).items():
+                revision = linked.get('linkRevision') or digest(linked)
+                # A newly verified association supersedes old imports/UObject
+                # stamps. A later send consumes that revision and becomes current.
+                if records.get(key, {}).get('linkRevision') != revision:
+                    records[key] = {**linked, 'linkRevision': revision}
     # Bone arrays belong to this inspection, not the persistent identity receipt.
     # Old versions stored both full hierarchies on every mesh and rewrote them
     # after each imported resource. Drop only these derived validation fields.
@@ -1149,6 +1154,8 @@ def apply_job(job):
                                        else prefix + '、'.join('LOD' + str(index) for index in missing) + ' 未生成，请在 UE 配置对应减面设置后重试发送。已提供的美术 LOD 保持不变。')
                             row['message'] = (row.get('message', '') + ' ' + warning).strip()
                 next_record = {**saved, 'path': row['path'], 'assetId': row['assetId']}
+                if records.get(key, {}).get('linkRevision'):
+                    next_record['linkRevision'] = records[key]['linkRevision']
                 if row['action'] == 'unchanged' and records.get(key, {}).get('linkOnly'):
                     next_record = records[key]
                 old_key = row.get('oldKey')

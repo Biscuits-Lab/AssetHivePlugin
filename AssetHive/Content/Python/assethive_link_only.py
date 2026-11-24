@@ -147,6 +147,8 @@ def check_dir(token):
 
 
 def prepare(job):
+    from assethive_suit_import import read_registry, same_ue_package
+    associations = read_registry()
     token = uuid.uuid4().hex
     directory = check_dir(token)
     directory.mkdir(parents=True, exist_ok=True)
@@ -186,7 +188,22 @@ def prepare(job):
                     raise RuntimeError('该对象已关联另一库文件')
                 state, deps = snapshot(obj), dependencies(obj)
                 baseline = {key: value for key, value in entry.items() if key not in ('bones', 'targetBones')}
+                if entry['kind'] in ('staticMesh', 'skeletalMesh'):
+                    subsystem_type = unreal.StaticMeshEditorSubsystem if entry['kind'] == 'staticMesh' else unreal.SkeletalMeshEditorSubsystem
+                    subsystem = unreal.get_editor_subsystem(subsystem_type)
+                    count = subsystem.get_lod_count(obj)
+                    pending_lods = [lod['index'] for lod in entry.get('config', {}).get('lodSources', []) if lod['index'] >= count]
+                    row['pendingLods'] = pending_lods
+                    if pending_lods:
+                        baseline['config'] = {**entry['config'], 'lodSources': [lod for lod in entry['config']['lodSources'] if lod['index'] < count]}
+                        baseline['linkedManifestFingerprint'] = entry.get('fingerprint')
+                        # Missing LODs are not part of the verified baseline.
+                        # The next explicit send updates LODs without LOD0 import.
+                        baseline['fingerprint'] = None
                 row.update(state=state, dependencies=deps, baseline=baseline, fingerprint=entry.get('fingerprint'))
+                previous = associations.get(entry['key'], {})
+                row['alreadyLinked'] = bool(previous and same_ue_package(previous.get('path'), row['path'])
+                                            and (previous.get('linkedManifestFingerprint') or previous.get('fingerprint')) == entry.get('fingerprint'))
                 if entry['kind'] == 'material':
                     baseline['appliedMaterial'] = material_contract(obj, entry, targets)
                     baseline['materialBindingVersion'] = 1
@@ -292,11 +309,21 @@ def apply(job):
                     raise RuntimeError('对象归属发生变化')
                 if any(key != row['key'] and package_path(value['path']).casefold() == package_path(row['path']).casefold() for key, value in links.items()):
                     raise RuntimeError('对象已关联其他文件')
+                if row.get('alreadyLinked'):
+                    from assethive_suit_import import read_registry, same_ue_package
+                    previous = read_registry().get(row['key'], {})
+                    if not same_ue_package(previous.get('path'), row['path']) or (previous.get('linkedManifestFingerprint') or previous.get('fingerprint')) != row.get('fingerprint'):
+                        raise RuntimeError('关联记录已变化，请重新检查')
+                    completed.add(row['key'])
+                    row.update(status='unchanged', message='已关联；内容与依赖核验通过，无需重复关联')
+                    rows.append(row)
+                    continue
                 links[row['key']] = dict(row.get('baseline', {}))
                 links[row['key']].update({field: row[field] for field in ['assetId', 'kind', 'path', 'state', 'dependencies']})
                 if 'sourceHash' in row:
                     links[row['key']]['sourceHash'] = row['sourceHash']
                 links[row['key']]['linkOnly'] = True
+                links[row['key']]['linkRevision'] = uuid.uuid4().hex
                 completed.add(row['key'])
                 row.update(status='success', message='仅关联完成；UE 资源内容与依赖未修改')
             except Exception as error:
@@ -321,7 +348,7 @@ def normalize_sources(job):
         obj = unreal.EditorAssetLibrary.load_asset(row['path'])
         if snapshot(obj) != row['state'] or dependencies(obj) != row['dependencies']:
             raise RuntimeError('UE 内容或依赖已变化，请重新核验')
-        sources = [{'index': 0, 'sourcePath': row['sourcePath'], 'sourceHash': row['sourceHash']}] + row.get('lodSources', [])
+        sources = [{'index': 0, 'sourcePath': row['sourcePath'], 'sourceHash': row['sourceHash']}] + [lod for lod in row.get('lodSources', []) if lod['index'] not in row.get('pendingLods', [])]
         normalized = []
         model = None
         try:
@@ -339,6 +366,14 @@ def normalize_sources(job):
                 if not model or not model.get_path_name().startswith('/Temp/AssetHiveLink_'):
                     raise RuntimeError('无法只读解析源模型')
             if model:
+                if row['kind'] == 'staticMesh':
+                    subsystem = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+                    # Interchange assets have no UFbxStaticMeshImportData for
+                    # the native parser to copy. Match actual build settings on
+                    # the private model, including generated lightmap UVs.
+                    for source in sources:
+                        settings = subsystem.get_lod_build_settings(obj, source['index'])
+                        subsystem.set_lod_build_settings(model, source['index'], settings)
                 mappings = {name.casefold(): value for name, value in row['sourceMaterialPaths'].items()}
                 prop = 'static_materials' if row['kind'] == 'staticMesh' else 'materials'
                 slots = model.get_editor_property(prop)
