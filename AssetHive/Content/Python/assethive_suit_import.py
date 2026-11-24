@@ -43,6 +43,15 @@ def slot_name(slot):
     return str(imported) if imported and str(imported) != 'None' else str(slot.material_slot_name)
 
 
+def mapped_slot_name(name, entry):
+    """Resolve UE FBX dot sanitization only when the source slot is unique."""
+    names = set(entry.get('materials', {})) | set(entry.get('externalMaterials', {}))
+    if name in names:
+        return name
+    matches = [source for source in names if source.replace('.', '_') == name]
+    return matches[0] if len(matches) == 1 else name
+
+
 def receipt(obj, previous=None):
     try:
         saved = json.loads(EAL.get_metadata_tag(obj, STAMP) or '{}')
@@ -1065,7 +1074,7 @@ def apply_job(job):
                         prop = 'static_materials' if entry['kind'] == 'staticMesh' else 'materials'
                         slots = obj.get_editor_property(prop)
                         for index, slot in enumerate(slots):
-                            name = slot_name(slot)
+                            name = mapped_slot_name(slot_name(slot), entry)
                             if str(slot.material_slot_name) in old_materials and name not in row.get('repair', []) and not adopt_item_materials and decision != 'applyMapping':
                                 slot.material_interface = old_materials[str(slot.material_slot_name)]
                             elif name in entry['materials']:

@@ -49,6 +49,15 @@ class Asset:
 
 
 class SuitImportTests(unittest.TestCase):
+    def test_fbx_slot_dot_sanitization_is_unique(self):
+        entry = {'materials': {'Body.003': 'body'}}
+        self.assertEqual(module.mapped_slot_name('Body_003', entry), 'Body.003')
+        self.assertEqual(module.mapped_slot_name('Other', entry), 'Other')
+        ambiguous = {'materials': {'A.B_C': 'one', 'A_B.C': 'two'}}
+        self.assertEqual(module.mapped_slot_name('A_B_C', ambiguous), 'A_B_C')
+        entry['materials']['Body_003'] = 'exact'
+        self.assertEqual(module.mapped_slot_name('Body_003', entry), 'Body_003')
+
     def test_same_name_in_another_character_directory_is_not_a_legacy_owner(self):
         entry = {'key':'new:staticMesh:main','kind':'staticMesh','name':'SM_Main','targetPath':'/Game/Characters/NPC/A/SM_Main'}
         saved = {**entry, 'targetPath':'/Game/Characters/Monster/B/SM_Main'}
