@@ -49,6 +49,21 @@ class Asset:
 
 
 class SuitImportTests(unittest.TestCase):
+    def test_root_container_requires_the_source_ancestor_chain(self):
+        entry = {'key': 'owner:skeletalMesh:main', 'kind': 'skeletalMesh', 'sourcePath': str(script),
+                 'targetPath': '/Game/Characters/Monster/Test/SK_Test', 'skeletonPath': '/Game/Characters/Monster/Test/SKEL_Test',
+                 'config': {'family': 'monster', 'ownSkeleton': True},
+                 'bones': [{'name': 'root', 'parent': '', 'rootParents': ['Rig']}],
+                 'targetBones': [{'name': 'Rig', 'parent': ''}, {'name': 'root', 'parent': 'Rig'}]}
+        with patch.object(module, 'validate_weapon_helper', return_value=object()), patch.object(module.unreal, 'Skeleton', object, create=True):
+            module.validate_entry(entry)
+            entry['bones'][0]['rootParents'] = ['OtherRig']
+            with self.assertRaises(RuntimeError):
+                module.validate_entry(entry)
+            entry['bones'][0]['rootParents'] = []
+            with self.assertRaises(RuntimeError):
+                module.validate_entry(entry)
+
     def test_fbx_slot_dot_sanitization_is_unique(self):
         entry = {'materials': {'Body.003': 'body'}}
         self.assertEqual(module.mapped_slot_name('Body_003', entry), 'Body.003')

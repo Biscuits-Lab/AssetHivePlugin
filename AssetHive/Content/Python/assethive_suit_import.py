@@ -485,10 +485,26 @@ def validate_entry(entry, deleted_owners=()):
         if weapon_physics_enabled(entry):
             validate_weapon_helper(entry, entry['config'].get('physicsAssetPath', ''), entry['key'] + ':physics', unreal.PhysicsAsset, deleted_owners)
         target = {bone['name'].lower(): bone['parent'].lower() for bone in entry.get('targetBones', [])}
-        incoming = [{'name': imported_bone_name(bone['name']), 'parent': imported_bone_name(bone['parent'])} for bone in entry.get('bones', [])]
+        incoming = [{'name': imported_bone_name(bone['name']), 'parent': imported_bone_name(bone['parent']),
+                     'rootParents': [imported_bone_name(name) for name in bone.get('rootParents', [])]} for bone in entry.get('bones', [])]
         if len({bone['name'] for bone in incoming}) != len(incoming):
             raise RuntimeError('骨骼名称规范化后重名；请由绑定人员整理')
-        incompatible = [bone['name'] for bone in incoming if bone['name'] not in target or target[bone['name']] != bone['parent']]
+        def parent_matches(bone):
+            if bone['name'] not in target:
+                return False
+            parent = target[bone['name']]
+            if parent == bone['parent']:
+                return True
+            # FBX Null rig containers can become bones in UE. Only accept the
+            # complete ancestor chain actually present in the source FBX.
+            if bone['parent'] or not bone['rootParents']:
+                return False
+            for source_parent in bone['rootParents']:
+                if parent != source_parent or parent not in target:
+                    return False
+                parent = target[parent]
+            return not parent
+        incompatible = [bone['name'] for bone in incoming if not parent_matches(bone)]
         if not incoming or ((not owned or skeleton) and (not target or incompatible)):
             raise RuntimeError('FBX 骨骼名称/父子层级与目标 Skeleton 不兼容：' + ', '.join(incompatible[:8]) + '；请由绑定人员确认，不修改共享骨架')
     if entry['kind'] == 'texture' and entry['channel'] == 'N' and entry['config'].get('normalFormat', '').lower() not in ('directx', 'opengl', 'dx', 'gl'):
