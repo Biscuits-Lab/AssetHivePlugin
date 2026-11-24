@@ -9,6 +9,12 @@ class ASSETHIVE_API UAssetHiveModelCatalogLibrary : public UBlueprintFunctionLib
     GENERATED_BODY()
 public:
     UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static int32 GetCharacterLodQualityVersion() { return 1; }
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static FString CompleteSkinnedLodsFromStatic(class USkeletalMesh* Model, const FString& SourcePath, const FString& SourceHash, int32 SourceLod, bool bRegenerate, const FString& SourceMaterialsJson = TEXT(""));
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
     static bool VerifyGroomSource(UObject* Model, const FString& SourcePath);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
@@ -33,7 +39,7 @@ public:
     static FString CompleteConfiguredLods(UObject* Model, const TArray<int32>& ManualLevels, bool bRegenerate);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
-    static FString CompleteCharacterLods(UObject* Model, const TArray<int32>& ManualLevels, bool bRegenerate);
+    static FString CompleteCharacterLods(UObject* Model, const TArray<int32>& ManualLevels, bool bRegenerate, bool bSourceChanged = true);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
     static bool AssignExistingSkeleton(class USkeletalMesh* Model, class USkeleton* Skeleton);

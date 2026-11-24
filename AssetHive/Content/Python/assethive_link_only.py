@@ -80,6 +80,26 @@ def dependencies(obj):
     return result
 
 
+def preserve_texture_export_pixels(task, exported):
+    """G8 PNG export can linearize sRGB source values. TGA retains U8 values.
+
+    Keep PNG for 16-bit textures: using TGA there would discard precision.
+    Auto-select the exporter so unsupported source formats cannot hit a native
+    SupportsTexture assertion. No texture property is changed by this export.
+    """
+    with exported.open('rb') as stream:
+        header = stream.read(26)
+    if (len(header) == 26 and header[:8] == b'\x89PNG\r\n\x1a\n'
+            and header[12:16] == b'IHDR' and header[24] == 8 and header[25] in (0, 4)):
+        alternative = exported.with_suffix('.tga')
+        task.filename = str(alternative)
+        task.exporter = None
+        if not unreal.Exporter.run_asset_export_task(task) or not alternative.is_file():
+            raise RuntimeError('无法无损读取 UE 灰度贴图用于核验，未建立关联')
+        return alternative
+    return exported
+
+
 def material_contract(obj, entry, targets):
     from assethive_suit_import import current_material_values
     current = current_material_values(obj, entry)
@@ -136,8 +156,30 @@ def read_links():
 def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.' + uuid.uuid4().hex + '.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
-    os.replace(temporary, path)
+    try:
+        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def write_links(links):
+    path = store_path()
+    # USourceControlHelpers is exposed as unreal.SourceControl (ScriptName).
+    control = getattr(unreal, 'SourceControl', None)
+    enabled = bool(control and control.is_enabled())
+    if enabled and not control.is_available():
+        raise RuntimeError('版本控制不可用，尚未保存共享关联记录；请恢复项目版本控制连接后重试')
+    existed = path.is_file()
+    if enabled and existed and not control.check_out_or_add_file(str(path), True):
+        raise RuntimeError('无法签出项目共享关联记录 Config/AssetHive/Links.json；未修改关联')
+    if existed and not path.stat().st_mode & 0o200:
+        raise RuntimeError('共享关联记录仍为只读；请连接项目版本控制并签出 Config/AssetHive/Links.json 后重试，未修改关联')
+    atomic_json(path, links)
+    if enabled and not existed and not control.check_out_or_add_file(str(path), True):
+        path.unlink()  # Roll back only the new file this call just created.
+        raise RuntimeError('无法将共享关联记录加入版本控制；未建立关联')
 
 
 def check_dir(token):
@@ -147,8 +189,33 @@ def check_dir(token):
 
 
 def prepare(job):
-    from assethive_suit_import import read_registry, same_ue_package
+    from assethive_suit_import import read_registry, same_ue_package, owned_objects
     associations = read_registry()
+    identities = owned_objects([entry['key'] for suit in job['suits'] for entry in suit['entries']])
+    resolved = {}
+    errors = {}
+    for suit in job['suits']:
+        for entry in suit['entries']:
+            try:
+                paths = [associations.get(entry['key'], {}).get('path'), entry['targetPath']]
+                paths += [obj.get_path_name() for obj in identities.get(entry['key'], [])]
+                objects = {}
+                for value in paths:
+                    if not value:
+                        continue
+                    path = package_path(value)
+                    if not path.startswith('/Game/') or '..' in path.split('/'):
+                        raise RuntimeError('Invalid link path')
+                    if unreal.EditorAssetLibrary.does_asset_exist(path):
+                        obj = unreal.EditorAssetLibrary.load_asset(path)
+                        if obj:
+                            # Old paths may be redirectors to the same UObject.
+                            objects[package_path(obj.get_path_name()).casefold()] = obj
+                if len(objects) > 1:
+                    raise RuntimeError('历史位置与目标位置均存在候选，请先确认整套资源位置')
+                resolved[entry['key']] = next(iter(objects.values()), None)
+            except Exception as error:
+                errors[entry['key']] = str(error)
     token = uuid.uuid4().hex
     directory = check_dir(token)
     directory.mkdir(parents=True, exist_ok=True)
@@ -156,7 +223,7 @@ def prepare(job):
     rows = []
     result = {'entries': rows, 'inspectToken': token, 'projectPath': unreal.Paths.convert_relative_path_to_full(unreal.Paths.get_project_file_path())}
     for suit in job['suits']:
-        targets = {entry['key']: entry['targetPath'] for entry in suit['entries']}
+        targets = {entry['key']: resolved[entry['key']].get_path_name() if resolved.get(entry['key']) else entry['targetPath'] for entry in suit['entries']}
         for entry in suit['entries']:
             row = {'assetId': suit['assetId'], 'key': entry['key'], 'name': entry['name'], 'kind': entry['kind'],
                    'partSlot': entry.get('partSlot', ''), 'targetPath': entry['targetPath'], 'status': 'blocked', 'action': 'linkOnly'}
@@ -167,14 +234,9 @@ def prepare(job):
                             'material': unreal.MaterialInstanceConstant, 'groom': getattr(unreal, 'GroomAsset', None)}.get(entry['kind'])
                 if not expected:
                     raise RuntimeError('此类型尚不支持仅关联')
-                candidates = list({package_path(value).casefold(): package_path(value) for value in
-                                   (links.get(entry['key'], {}).get('path'), entry['targetPath']) if value}.values())
-                if any(not path.startswith('/Game/') or '..' in path.split('/') for path in candidates):
-                    raise RuntimeError('Invalid link path')
-                existing = [path for path in candidates if unreal.EditorAssetLibrary.does_asset_exist(path)]
-                if len(existing) > 1:
-                    raise RuntimeError('历史位置与目标位置均存在候选，请先确认整套资源位置')
-                obj = unreal.EditorAssetLibrary.load_asset(existing[0]) if existing else None
+                if entry['key'] in errors:
+                    raise RuntimeError(errors[entry['key']])
+                obj = resolved.get(entry['key'])
                 if not obj:
                     row['status'] = 'missing'
                     raise RuntimeError('当前 UE 中不存在，不会自动导入')
@@ -190,7 +252,7 @@ def prepare(job):
                 baseline = {key: value for key, value in entry.items() if key not in ('bones', 'targetBones')}
                 if entry['kind'] in ('staticMesh', 'skeletalMesh'):
                     subsystem_type = unreal.StaticMeshEditorSubsystem if entry['kind'] == 'staticMesh' else unreal.SkeletalMeshEditorSubsystem
-                    subsystem = unreal.get_editor_subsystem(subsystem_type)
+                    subsystem = unreal.get_editor_subsystem(subsystem_type) or unreal.get_default_object(subsystem_type)
                     count = subsystem.get_lod_count(obj)
                     pending_lods = [lod['index'] for lod in entry.get('config', {}).get('lodSources', []) if lod['index'] >= count]
                     row['pendingLods'] = pending_lods
@@ -201,9 +263,13 @@ def prepare(job):
                         # The next explicit send updates LODs without LOD0 import.
                         baseline['fingerprint'] = None
                 row.update(state=state, dependencies=deps, baseline=baseline, fingerprint=entry.get('fingerprint'))
-                previous = associations.get(entry['key'], {})
-                row['alreadyLinked'] = bool(previous and same_ue_package(previous.get('path'), row['path'])
-                                            and (previous.get('linkedManifestFingerprint') or previous.get('fingerprint')) == entry.get('fingerprint'))
+                from assethive_suit_import import receipt, same_entry_content
+                previous = receipt(obj, associations.get(entry['key'], {}))
+                previous_path = previous.get('path') or (row['path'] if owner == entry['key'] and previous.get('key') == entry['key'] else '')
+                row['alreadyLinked'] = bool(previous and same_ue_package(previous_path, row['path'])
+                                            and ((previous.get('linkedManifestFingerprint') or previous.get('fingerprint')) == entry.get('fingerprint')
+                                                 or same_entry_content(previous, entry)))
+                row['associationFingerprint'] = previous.get('linkedManifestFingerprint') or previous.get('fingerprint')
                 if entry['kind'] == 'material':
                     baseline['appliedMaterial'] = material_contract(obj, entry, targets)
                     baseline['materialBindingVersion'] = 1
@@ -239,7 +305,7 @@ def prepare(job):
                     rows.append(row)
                     atomic_json(directory / 'check.json', result)
                     continue
-                export = directory / (str(len(rows)) + ('.tga' if entry['kind'] == 'texture' else '.fbx'))
+                export = directory / (str(len(rows)) + ('.png' if entry['kind'] == 'texture' else '.fbx'))
                 task = unreal.AssetExportTask()
                 task.object = obj
                 task.filename = str(export)
@@ -247,12 +313,12 @@ def prepare(job):
                 task.prompt = False
                 task.replace_identical = True
                 if entry['kind'] == 'texture':
-                    task.exporter = unreal.TextureExporterTGA()
+                    task.exporter = unreal.TextureExporterPNG()
                 else:
                     task.exporter = unreal.SkeletalMeshExporterFBX() if entry['kind'] == 'skeletalMesh' else unreal.StaticMeshExporterFBX()
                     task.options = unreal.FbxExportOption()
                     task.options.ascii = False
-                    task.options.level_of_detail = bool(entry.get('config', {}).get('lodSources'))
+                    task.options.level_of_detail = True
                     task.options.export_source_mesh = False
                     task.options.collision = False
                     task.options.vertex_color = True
@@ -260,6 +326,8 @@ def prepare(job):
                     task.options.bake_material_inputs = unreal.FbxMaterialBakeMode.DISABLED
                 if not unreal.Exporter.run_asset_export_task(task) or not export.is_file():
                     raise RuntimeError('无法读取 UE 内容用于核验')
+                if entry['kind'] == 'texture':
+                    export = preserve_texture_export_pixels(task, export)
                 lod_sources = entry.get('config', {}).get('lodSources', [])
                 for lod in lod_sources:
                     if digest_file(lod['sourcePath']) != lod['sourceHash']:
@@ -311,8 +379,10 @@ def apply(job):
                     raise RuntimeError('对象已关联其他文件')
                 if row.get('alreadyLinked'):
                     from assethive_suit_import import read_registry, same_ue_package
-                    previous = read_registry().get(row['key'], {})
-                    if not same_ue_package(previous.get('path'), row['path']) or (previous.get('linkedManifestFingerprint') or previous.get('fingerprint')) != row.get('fingerprint'):
+                    from assethive_suit_import import receipt
+                    previous = receipt(obj, read_registry().get(row['key'], {}))
+                    previous_path = previous.get('path') or (row['path'] if previous.get('key') == row['key'] else '')
+                    if not same_ue_package(previous_path, row['path']) or (previous.get('linkedManifestFingerprint') or previous.get('fingerprint')) != row.get('associationFingerprint', row.get('fingerprint')):
                         raise RuntimeError('关联记录已变化，请重新检查')
                     completed.add(row['key'])
                     row.update(status='unchanged', message='已关联；内容与依赖核验通过，无需重复关联')
@@ -330,7 +400,7 @@ def apply(job):
                 row.update(status='failed', message=str(error))
         rows.append(row)
     if json.dumps(links, sort_keys=True) != before:
-        atomic_json(store_path(), links)
+        write_links(links)
     return {'entries': rows, 'inspectToken': job['inspectToken'], 'projectPath': prepared['projectPath']}
 
 
@@ -367,7 +437,7 @@ def normalize_sources(job):
                     raise RuntimeError('无法只读解析源模型')
             if model:
                 if row['kind'] == 'staticMesh':
-                    subsystem = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem)
+                    subsystem = unreal.get_editor_subsystem(unreal.StaticMeshEditorSubsystem) or unreal.get_default_object(unreal.StaticMeshEditorSubsystem)
                     # Interchange assets have no UFbxStaticMeshImportData for
                     # the native parser to copy. Match actual build settings on
                     # the private model, including generated lightmap UVs.

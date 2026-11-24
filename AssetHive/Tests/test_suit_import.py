@@ -49,6 +49,31 @@ class Asset:
 
 
 class SuitImportTests(unittest.TestCase):
+    def test_lod_source_drive_change_is_not_content_change(self):
+        import copy
+        entry = {'key':'mesh','kind':'staticMesh','sourceHash':'lod0', 'config':{'lodSources':[{'index':1,'sourceHash':'lod1','sourcePath':'Z:/Library/lod1.fbx'}]}}
+        saved = copy.deepcopy(entry)
+        saved['config']['lodSources'][0]['sourcePath'] = '//fileshare/share/Artist/AssetLibrary/lod1.fbx'
+        self.assertTrue(module.same_entry_content(saved, entry))
+        saved['config']['lodSources'][0]['sourceHash'] = 'changed'
+        self.assertFalse(module.same_entry_content(saved, entry))
+
+    def test_synced_asset_receipt_wins_over_consumed_link_without_local_cache(self):
+        linked = {'path': '/Game/Test.Test', 'linkOnly': True, 'linkRevision': 'first', 'fingerprint': 'old'}
+        asset = Asset('key', '/Game/Test.Test', {'key': 'key', 'linkRevision': 'first', 'fingerprint': 'updated'})
+        self.assertEqual(module.receipt(asset, linked)['fingerprint'], 'updated')
+        self.assertEqual(module.receipt(asset, {**linked, 'linkRevision': 'second'})['fingerprint'], 'old')
+
+    def test_engine_material_is_a_valid_shared_dependency(self):
+        material = object()
+        entry = {'kind':'staticMesh', 'key':'test:staticMesh:main', 'targetPath':'/Game/Characters/Monster/Test/SM_Test',
+                 'sourcePath':__file__, 'config':{'family':'monster'},
+                 'externalMaterials':{'WorldGridMaterial':'/Engine/EngineMaterials/WorldGridMaterial'}}
+        with patch.object(module, 'load', return_value=material), patch.object(module.unreal, 'MaterialInterface', object, create=True):
+            module.validate_entry(entry)
+        with patch.object(module, 'load', return_value=None), patch.object(module.unreal, 'MaterialInterface', str, create=True):
+            with self.assertRaises(RuntimeError): module.validate_entry(entry)
+
     def test_new_link_supersedes_old_import_and_later_send_consumes_revision(self):
         import json
         import tempfile

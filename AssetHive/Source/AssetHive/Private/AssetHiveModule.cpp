@@ -11,6 +11,7 @@
 #include "Dom/JsonObject.h"
 #include "Misc/MessageDialog.h"
 #include "Misc/Paths.h"
+#include "Misc/ConfigCacheIni.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Framework/Notifications/NotificationManager.h"
@@ -121,6 +122,12 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
         Info->SetNumberField(TEXT("protocolVersion"), 2);
         Info->SetStringField(TEXT("sessionId"), SessionId);
         Info->SetStringField(TEXT("projectPath"), FPaths::ConvertRelativePathToFull(FPaths::GetProjectFilePath()));
+        FString ProjectId;
+        FGuid ProjectGuid;
+        if (GConfig && GConfig->GetString(TEXT("/Script/EngineSettings.GeneralProjectSettings"), TEXT("ProjectID"), ProjectId, GGameIni)
+            && FGuid::Parse(ProjectId, ProjectGuid) && ProjectGuid.IsValid()) {
+            Info->SetStringField(TEXT("projectId"), ProjectGuid.ToString(EGuidFormats::Digits));
+        }
         Info->SetStringField(TEXT("editorPath"), FPlatformProcess::ExecutablePath());
         Info->SetNumberField(TEXT("pid"), FPlatformProcess::GetCurrentProcessId());
         Info->SetStringField(TEXT("importRootPath"), UAssetHiveSettings::GetImportRootPath());

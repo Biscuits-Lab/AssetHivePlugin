@@ -55,6 +55,7 @@ UObject* UAssetHiveModelCatalogLibrary::ParseLinkMeshSource(UObject* ReferenceMo
         if (auto* Data = Cast<UFbxStaticMeshImportData>(Static->GetAssetImportData()))
             Options->StaticMeshImportData = DuplicateObject<UFbxStaticMeshImportData>(Data, Options);
         Options->StaticMeshImportData->bCombineMeshes = true;
+        Options->StaticMeshImportData->bImportMeshLODs = true;
         Options->StaticMeshImportData->bAutoGenerateCollision = false;
     }
     else

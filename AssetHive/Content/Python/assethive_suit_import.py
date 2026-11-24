@@ -58,8 +58,30 @@ def receipt(obj, previous=None):
     except ValueError:
         saved = {}
     if previous and previous.get('linkOnly') and same_ue_package(previous.get('path'), object_path(obj)):
+        # The asset carries the consumed link revision across workspaces. A
+        # fresh checkout has no Saved registry and must not resurrect that link.
+        if previous.get('linkRevision') and saved.get('linkRevision') == previous['linkRevision']:
+            return saved
         return previous
     return saved
+
+
+def same_entry_content(saved, entry):
+    """Local source locations are transport details, never resource identity."""
+    if not saved or saved.get('key') != entry.get('key') or saved.get('kind') != entry.get('kind'):
+        return False
+    def config(value):
+        result = dict(value or {})
+        if 'lodSources' in result:
+            result['lodSources'] = [{k: v for k, v in lod.items() if k != 'sourcePath' or not lod.get('sourceHash')}
+                                    for lod in result['lodSources']]
+        if result.get('skinLodSource', {}).get('sourceHash'):
+            result['skinLodSource'] = {k: v for k, v in result['skinLodSource'].items() if k != 'sourcePath'}
+        return result
+    return (bool(saved.get('sourceHash') or saved.get('fingerprint'))
+            and config(saved.get('config')) == config(entry.get('config'))
+            and all(saved.get(field) == entry.get(field) for field in
+                    ('sourceHash', 'skeletonPath', 'materials', 'externalMaterials', 'textures', 'heroSharedRoles')))
 
 
 def legacy_export_matches(entry, old_key, saved):
@@ -449,6 +471,8 @@ def validate_entry(entry, deleted_owners=()):
             method = 'complete_character_lods' if config['lodPolicy'] == 'lod1-reduction-v2' else 'complete_configured_lods'
             if not library or not hasattr(library, method) or not hasattr(library, 'protect_imported_lod'):
                 raise RuntimeError('请更新 AssetHive UE 插件并重启编辑器，以使用自适应 LOD')
+            if config['lodPolicy'] == 'lod1-reduction-v2' and (not hasattr(library, 'get_character_lod_quality_version') or library.get_character_lod_quality_version() != 1):
+                raise RuntimeError('请更新并重启 UE 插件，以启用 LOD 结构保护；尚未导入任何资源')
     resolve_hero_shared_materials(entry)
     if entry.get('validationError'):
         raise RuntimeError(entry['validationError'])
@@ -478,7 +502,7 @@ def validate_entry(entry, deleted_owners=()):
                 entry['externalMaterials'][slot] = path
             elif len(matches) > 1:
                 raise RuntimeError('公共材质存在多个匹配：' + slot + '；请整理 ' + directory)
-        if not path.startswith('/Game/') or not isinstance(load(path), unreal.MaterialInterface):
+        if not path.startswith(('/Game/', '/Engine/')) or not isinstance(load(path), unreal.MaterialInterface):
             raise RuntimeError('指定的共享材质不存在或类型不正确：' + path)
     if entry['kind'] != 'material' and not os.path.isfile(entry.get('sourcePath', '')):
         raise RuntimeError('Managed source missing: ' + entry.get('sourcePath', ''))
@@ -655,9 +679,12 @@ def inspect(job):
                                             if key else '同名 UE 资产尚未关联；确认关联后更新，UE 对象不会被删除'))
                 else:
                     saved = receipt(obj, previous)
-                    row['action'] = 'unchanged' if saved.get('fingerprint') == entry['fingerprint'] else 'updated'
+                    row['action'] = 'unchanged' if saved.get('fingerprint') == entry['fingerprint'] or same_entry_content(saved, entry) else 'updated'
                     if entry['kind'] in ('staticMesh', 'skeletalMesh'):
-                        lod_report = lod_policy_report(obj, entry)
+                        reset_pending = lod_reset_pending(obj, entry)
+                        lod_report = None if reset_pending else lod_policy_report(obj, entry)
+                        if reset_pending:
+                            row.update(action='updated', message='LOD0 已替换：清理旧 LOD1 及后续等级，仅使用本版本新提供的 LOD')
                         if lod_report:
                             row['lodReport'] = lod_report
                             if (lod_report.get('pending') or lod_report.get('missingManual')) and row['action'] == 'unchanged':
@@ -726,6 +753,18 @@ def inspect(job):
 
 
 def validate_lod_sources(entry):
+    skin_source = entry.get('config', {}).get('skinLodSource')
+    if skin_source:
+        if entry['kind'] != 'skeletalMesh' or skin_source.get('version') != 1 or skin_source.get('sourceLod') not in (0, 1):
+            raise RuntimeError('SM → SK LOD 来源配置无效')
+        library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+        if not library or not hasattr(library, 'complete_skinned_lods_from_static'):
+            raise RuntimeError('请更新并重启 UE 插件，以从 SM LOD1 生成蒙皮 LOD')
+        if not skin_source.get('sourcePath', '').lower().endswith('.fbx'):
+            raise RuntimeError('SM LOD1 来源必须为 FBX')
+        with open(skin_source['sourcePath'], 'rb') as stream:
+            if hashlib.file_digest(stream, 'sha256').hexdigest() != skin_source.get('sourceHash'):
+                raise RuntimeError('SM LOD1 文件已变化，请重新检查')
     levels = entry.get('config', {}).get('lodSources', [])
     for index, source in enumerate(levels, 1):
         if source.get('index') != index or not source.get('sourcePath', '').lower().endswith('.fbx'):
@@ -736,16 +775,36 @@ def validate_lod_sources(entry):
             raise RuntimeError('LOD 文件已变化，请重新检查：' + source['sourcePath'])
 
 
-def lod_policy_report(obj, entry, regenerate=False):
+def lod_policy_report(obj, entry, regenerate=False, source_changed=True):
     policy = entry.get('config', {}).get('lodPolicy')
     if policy not in ('existing-settings-v1', 'lod1-reduction-v2'):
         return None
     library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
+    skin_source = entry.get('config', {}).get('skinLodSource')
+    if skin_source:
+        if not library or not hasattr(library, 'complete_skinned_lods_from_static'):
+            raise RuntimeError('请更新并重启 UE 插件，以从 SM LOD1 生成蒙皮 LOD')
+        source_materials = skin_source.get('sourceMaterials', {})
+        if not source_materials and entry.get('key'):
+            records = read_registry()
+            static_record = records.get(entry['key'].replace(':skeletalMesh:', ':staticMesh:'), {})
+            source_materials = dict(static_record.get('externalMaterials', {}))
+            for slot, key in static_record.get('materials', {}).items():
+                if records.get(key, {}).get('path'):
+                    source_materials[slot] = records[key]['path']
+        args = (obj, skin_source['sourcePath'], skin_source['sourceHash'], skin_source['sourceLod'], regenerate)
+        report = json.loads(library.complete_skinned_lods_from_static(*args,
+                            json.dumps(source_materials, sort_keys=True)) if source_materials
+                            else library.complete_skinned_lods_from_static(*args))
+        if report.get('error'):
+            raise RuntimeError('蒙皮 LOD 生成失败：' + report['error'])
+        return report
     method = 'complete_character_lods' if policy == 'lod1-reduction-v2' else 'complete_configured_lods'
     if not library or not hasattr(library, method):
         raise RuntimeError('请更新 AssetHive UE 插件并重启编辑器，以使用自适应 LOD')
     manual = [0] + [source['index'] for source in entry.get('config', {}).get('lodSources', [])]
-    return json.loads(getattr(library, method)(obj, manual, regenerate))
+    args = (obj, manual, regenerate, source_changed) if policy == 'lod1-reduction-v2' and hasattr(library, 'get_character_lod_quality_version') else (obj, manual, regenerate)
+    return json.loads(getattr(library, method)(*args))
 
 
 def verify_lod_report(entry, report):
@@ -753,13 +812,34 @@ def verify_lod_report(entry, report):
         return
     if not report or report.get('policy') != 'lod1-reduction-v2':
         raise RuntimeError('UE 未返回有效 LOD 验证结果，请更新插件并重试')
+    if report.get('qualityVersion') != 1:
+        raise RuntimeError('请更新并重启 UE 插件，以启用 LOD 结构保护')
     levels = {level['index']: level for level in report.get('levels', [])}
     manual = [0] + [s['index'] for s in entry.get('config', {}).get('lodSources', [])]
     if report.get('missingManual') or any(levels.get(i, {}).get('triangles', 0) <= 0 or levels[i].get('source') != 'imported' for i in manual):
         raise RuntimeError('UE 美术 LOD 未正确挂入或网格为空，请重新发送')
-    if 1 in levels and levels[1].get('source') in ('imported', 'existing'):
-        if report.get('missing') or report.get('pending') or any(levels.get(i, {}).get('triangles', 0) <= 0 for i in range(2, 6)):
+    if entry.get('config', {}).get('skinLodSource') or 1 in levels and levels[1].get('source') in ('imported', 'existing'):
+        if report.get('missing') or report.get('pending') or any(levels.get(i, {}).get('triangles', 0) <= 0 or (levels[i].get('source') == 'generated' and not levels[i].get('structureVerified')) for i in range(2, 6)):
             raise RuntimeError('UE LOD2–5 自动减面未完成，请检查减面模块并重试')
+
+
+def lod_reset_pending(obj, entry):
+    token = entry.get('config', {}).get('lodReset')
+    return bool(token and EAL.get_metadata_tag(obj, 'AssetHive.LodReset') != token)
+
+
+def reset_model_lods(obj, entry):
+    """Explicit base revision invalidation; only called during confirmed send."""
+    kind = unreal.SkeletalMeshEditorSubsystem if entry['kind'] == 'skeletalMesh' else unreal.StaticMeshEditorSubsystem
+    subsystem = unreal.get_editor_subsystem(kind) or unreal.get_default_object(kind)
+    count = subsystem.get_lod_count(obj)
+    if count > 1:
+        ok = subsystem.remove_lods(obj, list(range(1, count))) if entry['kind'] == 'skeletalMesh' else subsystem.remove_lods(obj)
+        if not ok or subsystem.get_lod_count(obj) != 1:
+            raise RuntimeError('旧 LOD 清理失败，未记录本次更新成功')
+    for index in range(1, max(count, 6)):
+        for prefix in ('AssetHive.ComponentLOD.', 'AssetHive.LodSource.', 'AssetHive.SkinLOD.'):
+            EAL.remove_metadata_tag(obj, prefix + str(index))
 
 
 def apply_model_lods(obj, entry, previous=None):
@@ -772,19 +852,26 @@ def apply_model_lods(obj, entry, previous=None):
     subsystem = unreal.get_editor_subsystem(subsystem_type) or unreal.get_default_object(subsystem_type)
     library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
     old_levels = {source['index']: source.get('sourceHash') for source in (previous or {}).get('config', {}).get('lodSources', [])}
+    before = lod_policy_report(obj, entry) if adaptive else None
+    missing_manual = set((before or {}).get('missingManual', []))
+    changed = []
     for source in levels:
-        if entry.get('config', {}).get('lodPolicy') != 'lod1-reduction-v2' and old_levels.get(source['index']) == source.get('sourceHash') and subsystem.get_lod_count(obj) > source['index']:
+        if old_levels.get(source['index']) == source.get('sourceHash') and source['index'] not in missing_manual and subsystem.get_lod_count(obj) > source['index']:
             continue
         if adaptive:
             library.protect_imported_lod(obj, source['index'])
         imported = subsystem.import_lod(obj, source['index'], source['sourcePath'])
         if imported != source['index']:
             raise RuntimeError('UE 导入 LOD 失败：LOD' + str(source['index']) + ' ' + source['sourcePath'])
+        changed.append(source['index'])
         if adaptive:
             library.protect_imported_lod(obj, source['index'])
     if levels and subsystem.get_lod_count(obj) < levels[-1]['index'] + 1:
         raise RuntimeError('UE LOD 数量回读不一致')
-    report = lod_policy_report(obj, entry, True)
+    if previous and not changed and before and not any(before.get(field) for field in ('missing', 'pending', 'missingManual')):
+        verify_lod_report(entry, before)
+        return before
+    report = lod_policy_report(obj, entry, True, source_changed=not previous or 1 in changed)
     verify_lod_report(entry, report)
     return report
 
@@ -840,6 +927,7 @@ def import_file(entry, destination):
             options.static_mesh_import_data.auto_generate_collision = False
         # Normalize each FBX source axis system, independent of editor import presets.
         mesh_import_data = options.skeletal_mesh_import_data if skeletal else options.static_mesh_import_data
+        mesh_import_data.set_editor_property('import_mesh_lods', True)
         mesh_import_data.set_editor_property('convert_scene', True)
         mesh_import_data.set_editor_property('force_front_x_axis', False)
         task.options = options
@@ -1076,12 +1164,19 @@ def apply_job(job):
                         prior = receipt(obj, records.get(key)) if obj else {}
                         lod_only = bool(obj and entry['kind'] in ('staticMesh', 'skeletalMesh')
                             and prior.get('sourceHash') == entry.get('sourceHash')
-                            and {k: v for k, v in prior.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy')}
-                            == {k: v for k, v in entry.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy')})
+                            and {k: v for k, v in prior.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy', 'skinLodSource', 'lodReset', 'ignoreEmbeddedLods')}
+                            == {k: v for k, v in entry.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy', 'skinLodSource', 'lodReset', 'ignoreEmbeddedLods')})
+                        reset = bool(obj and entry['kind'] in ('staticMesh', 'skeletalMesh') and lod_reset_pending(obj, entry))
+                        if reset:
+                            reset_model_lods(obj, entry)
                         if not lod_only:
                             obj = import_file(entry, destination)
                         if entry['kind'] in ('staticMesh', 'skeletalMesh'):
-                            apply_model_lods(obj, entry, prior if lod_only else None)
+                            if not lod_only and entry.get('config', {}).get('ignoreEmbeddedLods'):
+                                reset_model_lods(obj, entry)
+                            apply_model_lods(obj, entry, prior if lod_only and not reset else None)
+                            if entry.get('config', {}).get('lodReset'):
+                                EAL.set_metadata_tag(obj, 'AssetHive.LodReset', entry['config']['lodReset'])
                         timings['importMs'] += round((time.perf_counter() - stage) * 1000)
                     elif entry['kind'] in ('staticMesh', 'skeletalMesh') and entry.get('config', {}).get('lodPolicy') == 'lod1-reduction-v2':
                         # Material repair and a missing artist LOD can coexist.
@@ -1119,6 +1214,8 @@ def apply_job(job):
                 if entry['kind'] in ('staticMesh', 'skeletalMesh'):
                     verify_lod_report(entry, lod_policy_report(obj, entry))
                 saved = {field: value for field, value in entry.items() if field not in ('bones', 'targetBones')}
+                if records.get(key, {}).get('linkRevision'):
+                    saved['linkRevision'] = records[key]['linkRevision']
                 if entry['kind'] == 'material':
                     saved['appliedMaterial'] = current_material_values(obj, entry)
                     saved['materialBindingVersion'] = 1

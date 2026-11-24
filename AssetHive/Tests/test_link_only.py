@@ -12,6 +12,87 @@ spec.loader.exec_module(module)
 
 
 class LinkOnlyTests(unittest.TestCase):
+    def test_gray_export_preserves_u8_and_does_not_downconvert_sixteen_bit(self):
+        import types
+        with tempfile.TemporaryDirectory() as temp:
+            png = Path(temp) / 'texture.png'
+            def header(depth, color):
+                return b'\x89PNG\r\n\x1a\n' + b'\x00\x00\x00\x0dIHDR' + b'\x00\x00\x00\x01' * 2 + bytes([depth, color])
+            calls = []
+            def export(task):
+                calls.append(task.filename)
+                self.assertIsNone(task.exporter)
+                Path(task.filename).write_bytes(b'tga')
+                return True
+            task = types.SimpleNamespace(filename=str(png), exporter=object())
+            with patch.object(module.unreal, 'Exporter', types.SimpleNamespace(run_asset_export_task=export), create=True):
+                for depth, color in [(16, 0), (16, 6), (8, 6)]:
+                    png.write_bytes(header(depth, color))
+                    self.assertEqual(module.preserve_texture_export_pixels(task, png), png)
+                self.assertEqual(calls, [])
+                png.write_bytes(header(8, 0))
+                self.assertEqual(module.preserve_texture_export_pixels(task, png), png.with_suffix('.tga'))
+                self.assertEqual(len(calls), 1)
+            with patch.object(module.unreal, 'Exporter', types.SimpleNamespace(run_asset_export_task=lambda task: False), create=True):
+                with self.assertRaisesRegex(RuntimeError, '无法无损'):
+                    module.preserve_texture_export_pixels(task, png)
+
+    def test_python_source_control_checks_out_readonly_registry(self):
+        import types
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / 'Links.json'
+            file.write_text('{"old":{}}')
+            file.chmod(0o444)
+            calls = []
+            def checkout(path, silent):
+                calls.append(path)
+                Path(path).chmod(0o666)
+                return True
+            control = types.SimpleNamespace(is_enabled=lambda: True, is_available=lambda: True,
+                                            check_out_or_add_file=checkout)
+            try:
+                with patch.object(module, 'store_path', return_value=file), patch.object(module.unreal, 'SourceControl', control, create=True):
+                    module.write_links({'new': {}})
+                self.assertEqual(calls, [str(file)])
+                self.assertEqual(json.loads(file.read_text()), {'new': {}})
+            finally:
+                file.chmod(0o666)
+
+    def test_readonly_registry_without_provider_preserves_original(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / 'Links.json'
+            file.write_text('{"old":{}}')
+            file.chmod(0o444)
+            try:
+                with patch.object(module, 'store_path', return_value=file), patch.object(module.unreal, 'SourceControl', None, create=True):
+                    with self.assertRaisesRegex(RuntimeError, '只读'):
+                        module.write_links({'new': {}})
+                self.assertEqual(json.loads(file.read_text()), {'old': {}})
+                self.assertEqual(list(Path(temp).glob('*.tmp')), [])
+            finally:
+                file.chmod(0o666)
+
+    def test_shared_link_store_checks_out_existing_file_before_replacing(self):
+        import types
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp)/'Links.json'
+            file.write_text('{"old":{}}')
+            control = types.SimpleNamespace(is_enabled=lambda:True, is_available=lambda:True,
+                                            check_out_or_add_file=lambda *args:False)
+            with patch.object(module, 'store_path', return_value=file), patch.object(module.unreal, 'SourceControl', control, create=True):
+                with self.assertRaises(RuntimeError): module.write_links({'new':{}})
+            self.assertEqual(json.loads(file.read_text()), {'old':{}})
+
+    def test_failed_source_control_add_rolls_back_only_new_link_file(self):
+        import types
+        with tempfile.TemporaryDirectory() as temp:
+            file=Path(temp)/'Links.json'
+            control=types.SimpleNamespace(is_enabled=lambda:True,is_available=lambda:True,
+                                           check_out_or_add_file=lambda *args:False)
+            with patch.object(module,'store_path',return_value=file),patch.object(module.unreal,'SourceControl',control,create=True):
+                with self.assertRaises(RuntimeError):module.write_links({'new':{}})
+            self.assertFalse(file.exists())
+
     def test_repeated_material_binding_uses_exact_export_slot_aliases(self):
         class Material:
             def get_name(self): return 'Shared'
