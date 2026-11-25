@@ -43,6 +43,7 @@ public class AssetHive : ModuleRules
             "DynamicMesh",
             "GeometryCore",
             "AnimationCore",
+            "ClothingSystemRuntimeCommon",
             "MeshReductionInterface",
             "MeshUtilitiesCommon",
             "StaticMeshEditor",

@@ -15,6 +15,9 @@
 #include "Dom/JsonObject.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonReader.h"
+#include "Editor.h"
+#include "Subsystems/EditorAssetSubsystem.h"
+#include "HAL/FileManager.h"
 
 bool UAssetHiveModelCatalogLibrary::AssignExistingSkeleton(USkeletalMesh* Model, USkeleton* Skeleton)
 {
@@ -53,9 +56,12 @@ USkeleton* UAssetHiveModelCatalogLibrary::CreateSkeletonForMesh(USkeletalMesh* M
     return Skeleton;
 }
 
-bool UAssetHiveModelCatalogLibrary::UpdateModelLevel(UObject* Model, const FString& SourceIdentity, const FString& InSuitId, const FString& InSuitName, FName SuitPart)
+bool UAssetHiveModelCatalogLibrary::UpdateModelLevel(UObject* Model, const FString& SourceIdentity, const FString& InSuitId, const FString& InSuitName, FName SuitPart, bool bRefreshSharedCatalog)
 {
     if (!Model || !Model->IsA<USkeletalMesh>() || SourceIdentity.IsEmpty()) return false;
+    // Imports already save identity/config in the mesh receipt and geometry in
+    // the mesh itself. Never lock or mutate the shared snapshot during import.
+    if (!bRefreshSharedCatalog) return true;
     FString SuitId = InSuitId, SuitName = InSuitName;
     FName ModelFamily, HeroPart;
     const FString ModelReceiptText = Model->GetOutermost()->GetMetaData().GetValue(Model, TEXT("AssetHive.SuitReceipt"));
@@ -123,6 +129,18 @@ bool UAssetHiveModelCatalogLibrary::UpdateModelLevel(UObject* Model, const FStri
         Catalog = NewObject<UAssetHiveModelPolycountCatalog>(Package, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
         FAssetRegistryModule::AssetCreated(Catalog);
     }
+    const FString Filename = FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension());
+    // The catalog is shared and may be read-only after a Perforce sync.
+    // A failed auxiliary save must never terminate the editor/import job.
+    if (IFileManager::Get().IsReadOnly(*Filename))
+    {
+        UEditorAssetSubsystem* Assets = GEditor ? GEditor->GetEditorSubsystem<UEditorAssetSubsystem>() : nullptr;
+        if (!Assets || !Assets->CheckoutLoadedAsset(Catalog) || IFileManager::Get().IsReadOnly(*Filename))
+        {
+            UE_LOG(LogTemp, Warning, TEXT("AssetHive: model catalog checkout failed; statistics remain pending: %s"), *Filename);
+            return false;
+        }
+    }
     const auto Level = UAssetHiveModelPolycountCatalog::Classify(Triangles);
     if (Catalog->RemoveStaticRecords() > 0) Catalog->MarkPackageDirty();
     auto* Row = Catalog->Models.FindByPredicate([&](const FAssetHiveModelPolycountEntry& Entry) {
@@ -145,7 +163,8 @@ bool UAssetHiveModelCatalogLibrary::UpdateModelLevel(UObject* Model, const FStri
     Catalog->MarkPackageDirty();
     FSavePackageArgs Args;
     Args.TopLevelFlags = RF_Public | RF_Standalone;
+    Args.SaveFlags = SAVE_NoError;
     const bool Saved = UPackage::SavePackage(Catalog->GetOutermost(), Catalog,
-        *FPackageName::LongPackageNameToFilename(PackageName, FPackageName::GetAssetPackageExtension()), Args);
+        *Filename, Args);
     return Saved && Triangles >= 0;
 }

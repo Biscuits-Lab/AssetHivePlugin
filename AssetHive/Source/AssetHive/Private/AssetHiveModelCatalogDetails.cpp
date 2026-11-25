@@ -18,6 +18,11 @@
 #include "Widgets/SBoxPanel.h"
 #include "Misc/ScopedSlowTask.h"
 #include "Styling/AppStyle.h"
+#include "Engine/SkeletalMesh.h"
+#include "UObject/Package.h"
+#include "UObject/MetaData.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
 
 #define LOCTEXT_NAMESPACE "AssetHiveModelCatalog"
 namespace { bool ShowSuitTotals = false; FName SelectedFamily; }
@@ -45,11 +50,30 @@ void FAssetHiveModelCatalogDetails::CustomizeDetails(IDetailLayoutBuilder& Build
         [SNew(STextBlock).Text(FText::Format(LOCTEXT("Total", "{0} 个骨骼模型  ·  {1} 套套装"), FText::AsNumber(Catalog->Models.Num()), FText::AsNumber(Catalog->GetSuitSummaries().Num())))]
         + SHorizontalBox::Slot().AutoWidth().Padding(12, 0)
         [SNew(SButton).Text(LOCTEXT("Refresh", "刷新面数"))
-            .ToolTipText(LOCTEXT("RefreshTip", "读取已记录的模型，补齐或更新实际面数；不会重新导入模型。模型较多时可能需要等待。"))
+            .ToolTipText(LOCTEXT("RefreshTip", "汇总已同步的骨骼模型并更新此表，需要签出和提交此表。日常模型导入不会修改此表。"))
             .OnClicked_Lambda([Catalog, Utilities]() {
                 if (Catalog.IsValid())
                 {
-                    const auto Rows = Catalog->Models;
+                    auto Rows = Catalog->Models;
+                    // Discover imported meshes added by colleagues since the last snapshot.
+                    TArray<FAssetData> Assets;
+                    FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get()
+                        .GetAssetsByClass(USkeletalMesh::StaticClass()->GetClassPathName(), Assets, true);
+                    for (const FAssetData& Asset : Assets)
+                    {
+                        if (!Asset.PackageName.ToString().StartsWith(TEXT("/Game/"))) continue;
+                        if (Rows.ContainsByPredicate([&](const auto& Row) { return Row.Model.ToSoftObjectPath() == Asset.GetSoftObjectPath(); })) continue;
+                        UObject* Model = Asset.GetAsset();
+                        if (!Model) continue;
+                        const FString Text = Model->GetOutermost()->GetMetaData().GetValue(Model, TEXT("AssetHive.SuitReceipt"));
+                        TSharedPtr<FJsonObject> Receipt;
+                        FString Key;
+                        if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Receipt) || !Receipt.IsValid()
+                            || !Receipt->TryGetStringField(TEXT("key"), Key) || Key.IsEmpty()) continue;
+                        auto& Row = Rows.AddDefaulted_GetRef();
+                        Row.Model = Model;
+                        Row.SourceIdentity = Key;
+                    }
                     FScopedSlowTask Task(Rows.Num(), LOCTEXT("Refreshing", "正在读取模型面数…"));
                     Task.MakeDialog(true);
                     for (const auto& Row : Rows)
@@ -57,7 +81,7 @@ void FAssetHiveModelCatalogDetails::CustomizeDetails(IDetailLayoutBuilder& Build
                         if (Task.ShouldCancel()) break;
                         Task.EnterProgressFrame(1);
                         if (UObject* Model = Row.Model.LoadSynchronous())
-                            UAssetHiveModelCatalogLibrary::UpdateModelLevel(Model, Row.SourceIdentity);
+                            UAssetHiveModelCatalogLibrary::UpdateModelLevel(Model, Row.SourceIdentity, Row.SuitId, Row.SuitName, Row.SuitPart, true);
                     }
                 }
                 if (auto Pinned = Utilities.Pin()) Pinned->RequestForceRefresh();

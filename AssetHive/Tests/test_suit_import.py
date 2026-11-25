@@ -7,7 +7,9 @@ import unittest
 from unittest.mock import patch
 
 unreal_stub = types.ModuleType('unreal')
-unreal_stub.EditorAssetLibrary = types.SimpleNamespace(get_metadata_tag=lambda obj, key: obj.tags.get(key, ''))
+unreal_stub.EditorAssetLibrary = types.SimpleNamespace(
+    get_metadata_tag=lambda obj, key: getattr(obj, 'tags', {}).get(key, ''),
+    remove_metadata_tag=lambda obj, key: getattr(obj, 'tags', {}).pop(key, None))
 unreal_stub.MaterialEditingLibrary = types.SimpleNamespace()
 class SlowTask:
     instances = []

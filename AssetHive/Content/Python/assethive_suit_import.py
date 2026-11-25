@@ -164,6 +164,17 @@ def owned_objects(keys):
 
 
 def material_parameters(parent, entry=None):
+    mapping = base_material_parameters(parent, entry)
+    if entry and 'ShadingMask' in entry.get('textures', {}):
+        names = [str(name) for name in MEL.get_texture_parameter_names(parent)]
+        parameter = 'Shading Mask_VT' if entry.get('config', {}).get('virtualTexture', True) else 'Shading Mask'
+        if parameter not in names:
+            raise RuntimeError('当前母材质不支持 ShadingMask 参数：' + parameter + '；' + parent.get_path_name())
+        mapping['ShadingMask'] = parameter
+    return mapping
+
+
+def base_material_parameters(parent, entry=None):
     names = [str(name) for name in MEL.get_texture_parameter_names(parent)]
     if entry and item_material_entry(entry):
         mapping = {'D': 'Diffuse_VT', 'N': 'Normal_VT', 'ORM': 'ORM_VT', 'E': 'Emissive_Tex_VT', 'A': 'OpacityMasked_VT'}
@@ -178,7 +189,7 @@ def material_parameters(parent, entry=None):
     # Verified against Zion M_Char_Suit_ComplexShading via the editor, not guessed from texture order.
     role = entry.get('config', {}).get('materialRole') if entry else ''
     mapping = ({'D': 'Diffuse', 'N': 'Normal', 'ORM': 'ORM', 'A': 'OpacityMasked', 'E': 'Emissive'}
-               if entry and weapon_material_entry(entry) else
+               if entry and weapon_material_entry(entry) and not entry.get('config', {}).get('virtualTexture', False) else
                {'D': 'Diffuse_VT', 'N': 'Normal_VT', 'ORM': 'ORM_VT', 'A': 'OpacityMasked_VT', 'E': 'Emissive_VT'}
                if role == 'monsterSkin' else
                {'D': 'VT_Diffuse', 'N': 'VT_Normal', 'ORM': 'VT_ORM', 'A': 'VT_OpacityMasked', 'E': 'VT_Emissive'})
@@ -357,7 +368,7 @@ def configure_weapon_instance(obj, entry, previous):
     config = entry['config']
     old = previous.get('config', {})
     reparented = old.get('parentPath') != config['parentPath']
-    for field, parameter, value in [('virtualTexture', 'Use VT', False),
+    for field, parameter, value in [('virtualTexture', 'Use VT', bool(config.get('virtualTexture', False))),
                                      ('useOpacityMasked', 'Use OpacityMasked', bool(entry.get('textures', {}).get('A')))]:
         if reparented or old.get(field) != value:
             # This engine's setter returns False even after a successful write; verify the stored value.
@@ -394,6 +405,9 @@ def configure_emissive_instance(obj, entry, previous):
 
 
 def current_material_values(obj, entry):
+    if 'blockoutMaterial' in entry.get('config', {}) and isinstance(obj, (unreal.Material, unreal.MaterialInstanceConstant)):
+        import assethive_blockout
+        return {'parent': '', 'textures': {}, 'blockout': assethive_blockout.values(obj)}
     if not isinstance(obj, unreal.MaterialInstanceConstant):
         return {}
     names = material_parameters(obj, entry)
@@ -406,6 +420,8 @@ def material_conflicts(current, saved, entry):
     applied = saved.get('appliedMaterial', {})
     if not applied:
         return []
+    if 'blockoutMaterial' in entry.get('config', {}):
+        return ['blockout'] if current.get('blockout') != applied.get('blockout') else []
     conflicts = []
     old_config = saved.get('config', {})
     if entry['config'].get('parentPath') != old_config.get('parentPath') and current['parent'] != applied.get('parent'):
@@ -539,6 +555,10 @@ def validate_entry(entry, deleted_owners=()):
     if entry['kind'] == 'texture' and entry['channel'] == 'N' and entry['config'].get('normalFormat', '').lower() not in ('directx', 'opengl', 'dx', 'gl'):
         raise RuntimeError('请确认法线格式 DirectX / OpenGL')
     if entry['kind'] == 'material':
+        if 'blockoutMaterial' in config:
+            import assethive_blockout
+            assethive_blockout.validate(config['blockoutMaterial'])
+            return
         if item_material_entry(entry):
             item_parent(entry)
             return
@@ -687,6 +707,8 @@ def inspect(job):
                             row.update(action='updated', message='LOD0 已替换：清理旧 LOD1 及后续等级，仅使用本版本新提供的 LOD')
                         if lod_report:
                             row['lodReport'] = lod_report
+                            if lod_report.get('waitingForRig'):
+                                row['message'] = '等待新版骨骼模型：SM LOD1 与当前 SK LOD0 不匹配；旧 SK LOD1–5 已清理。新版 SK 发送后将使用已有 SM LOD1 自动生成。'
                             if (lod_report.get('pending') or lod_report.get('missingManual')) and row['action'] == 'unchanged':
                                 row.update(action='updated', message='将重新验证美术 LOD，并补齐自动减面等级')
                             elif lod_report.get('missing'):
@@ -719,7 +741,7 @@ def inspect(job):
             continue
         obj = load(row.get('path'))
         repair = []
-        if entry['kind'] == 'material':
+        if entry['kind'] == 'material' and 'blockoutMaterial' not in entry.get('config', {}):
             parameters = material_parameters(obj, entry)
             overrides = {str(value.parameter_info.name): value.parameter_value for value in obj.get_editor_property('texture_parameter_values')}
             # A deleted override resolves to the parent's fallback texture via MEL.
@@ -792,10 +814,39 @@ def lod_policy_report(obj, entry, regenerate=False, source_changed=True):
             for slot, key in static_record.get('materials', {}).items():
                 if records.get(key, {}).get('path'):
                     source_materials[slot] = records[key]['path']
-        args = (obj, skin_source['sourcePath'], skin_source['sourceHash'], skin_source['sourceLod'], regenerate)
-        report = json.loads(library.complete_skinned_lods_from_static(*args,
-                            json.dumps(source_materials, sort_keys=True)) if source_materials
-                            else library.complete_skinned_lods_from_static(*args))
+        def inspect_skin(build):
+            args = (obj, skin_source['sourcePath'], skin_source['sourceHash'], skin_source['sourceLod'], build)
+            return json.loads(library.complete_skinned_lods_from_static(*args,
+                              json.dumps(source_materials, sort_keys=True)))
+        report = inspect_skin(False)
+        if report.get('error'):
+            raise RuntimeError('蒙皮 LOD 生成失败：' + report['error'])
+        wait_key = json.dumps([entry.get('sourceHash'), report.get('rigHash'),
+                               skin_source['sourceHash'], skin_source['sourceLod'], source_materials], sort_keys=True)
+        tag = 'AssetHive.SkinLOD.WaitingForRig'
+        waiting = EAL.get_metadata_tag(obj, tag) == wait_key
+        if regenerate and not waiting:
+            result = inspect_skin(True)
+            if result.get('error', '').startswith('SM LOD1 is not aligned with SK LOD0; skin transfer rejected'):
+                # All generated descriptions are checked before native installation.
+                # Keep LOD0, but do not leave an obsolete derived chain active.
+                reset_model_lods(obj, entry)
+                EAL.set_metadata_tag(obj, tag, wait_key)
+                waiting = True
+                report = inspect_skin(False)
+            else:
+                report = result
+                if not report.get('error'):
+                    EAL.remove_metadata_tag(obj, tag)
+        if waiting:
+            if report.get('count') != 1:
+                if regenerate:
+                    reset_model_lods(obj, entry)
+                    report = inspect_skin(False)
+                else:
+                    report['pending'] = [1]
+                    return report
+            report.update(waitingForRig=True, pending=[], missing=[], automatic=[])
         if report.get('error'):
             raise RuntimeError('蒙皮 LOD 生成失败：' + report['error'])
         return report
@@ -808,6 +859,13 @@ def lod_policy_report(obj, entry, regenerate=False, source_changed=True):
 
 
 def verify_lod_report(entry, report):
+    if report and report.get('waitingForRig'):
+        if entry.get('kind') != 'skeletalMesh' or not entry.get('config', {}).get('skinLodSource') or report.get('count') != 1 or [r.get('index') for r in report.get('levels', [])] != [0]:
+            raise RuntimeError('等待新版骨骼模型时必须仅保留 SK LOD0')
+        return
+    if reset_base_only(entry) and (not report or report.get('count') != 1
+            or [level.get('index') for level in report.get('levels', [])] != [0]):
+        raise RuntimeError('旧 LOD 清理未完成：本次仅提供 LOD0，UE 必须只保留 LOD0')
     if entry.get('config', {}).get('lodPolicy') != 'lod1-reduction-v2':
         return
     if not report or report.get('policy') != 'lod1-reduction-v2':
@@ -823,9 +881,21 @@ def verify_lod_report(entry, report):
             raise RuntimeError('UE LOD2–5 自动减面未完成，请检查减面模块并重试')
 
 
+def reset_base_only(entry):
+    config = entry.get('config', {})
+    return bool(config.get('lodReset') and config.get('lodResetBaseCount') == 1
+                and not config.get('lodSources') and not config.get('skinLodSource'))
+
+
 def lod_reset_pending(obj, entry):
     token = entry.get('config', {}).get('lodReset')
-    return bool(token and EAL.get_metadata_tag(obj, 'AssetHive.LodReset') != token)
+    if token and EAL.get_metadata_tag(obj, 'AssetHive.LodReset') != token:
+        return True
+    if reset_base_only(entry):
+        kind = unreal.SkeletalMeshEditorSubsystem if entry['kind'] == 'skeletalMesh' else unreal.StaticMeshEditorSubsystem
+        subsystem = unreal.get_editor_subsystem(kind) or unreal.get_default_object(kind)
+        return subsystem.get_lod_count(obj) != 1
+    return False
 
 
 def reset_model_lods(obj, entry):
@@ -1107,6 +1177,10 @@ def apply_job(job):
                         import_data = obj.get_editor_property('asset_import_data')
                         if import_data:
                             import_data.scripted_add_filename(entry['sourcePath'], 0, '')
+                elif entry['kind'] == 'material' and 'blockoutMaterial' in entry.get('config', {}):
+                    if decision != 'keepUE':
+                        import assethive_blockout
+                        obj = assethive_blockout.apply(obj, destination, entry['config']['blockoutMaterial'])
                 elif entry['kind'] == 'material':
                     parent = item_parent(entry) if item_material_entry(entry) else weapon_parent(entry) if weapon_material_entry(entry) else monster_parent(entry) if monster_material_entry(entry) else load(entry['config']['parentPath'])
                     if not obj:
@@ -1164,15 +1238,17 @@ def apply_job(job):
                         prior = receipt(obj, records.get(key)) if obj else {}
                         lod_only = bool(obj and entry['kind'] in ('staticMesh', 'skeletalMesh')
                             and prior.get('sourceHash') == entry.get('sourceHash')
-                            and {k: v for k, v in prior.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy', 'skinLodSource', 'lodReset', 'ignoreEmbeddedLods')}
-                            == {k: v for k, v in entry.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy', 'skinLodSource', 'lodReset', 'ignoreEmbeddedLods')})
+                            and {k: v for k, v in prior.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy', 'skinLodSource', 'lodReset', 'lodResetBaseCount', 'ignoreEmbeddedLods')}
+                            == {k: v for k, v in entry.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy', 'skinLodSource', 'lodReset', 'lodResetBaseCount', 'ignoreEmbeddedLods')})
                         reset = bool(obj and entry['kind'] in ('staticMesh', 'skeletalMesh') and lod_reset_pending(obj, entry))
                         if reset:
                             reset_model_lods(obj, entry)
                         if not lod_only:
                             obj = import_file(entry, destination)
                         if entry['kind'] in ('staticMesh', 'skeletalMesh'):
-                            if not lod_only and entry.get('config', {}).get('ignoreEmbeddedLods'):
+                            if (not lod_only and entry.get('config', {}).get('ignoreEmbeddedLods')
+                                    or (reset or not lod_only) and entry.get('config', {}).get('lodReset')
+                                    and entry['config'].get('lodResetBaseCount') == 1):
                                 reset_model_lods(obj, entry)
                             apply_model_lods(obj, entry, prior if lod_only and not reset else None)
                             if entry.get('config', {}).get('lodReset'):
@@ -1191,12 +1267,14 @@ def apply_job(job):
                         slots = obj.get_editor_property(prop)
                         for index, slot in enumerate(slots):
                             name = mapped_slot_name(slot_name(slot), entry)
-                            if str(slot.material_slot_name) in old_materials and name not in row.get('repair', []) and not adopt_item_materials and decision != 'applyMapping':
+                            if str(slot.material_slot_name) in old_materials and name not in row.get('repair', []) and not adopt_item_materials and decision != 'applyMapping' and entry.get('config', {}).get('materialMode') != 'blockout' and (old_config or {}).get('materialMode') != 'blockout':
                                 slot.material_interface = old_materials[str(slot.material_slot_name)]
                             elif name in entry['materials']:
                                 slot.material_interface = resolved[entry['materials'][name]]
                             elif name in entry.get('externalMaterials', {}):
                                 slot.material_interface = load(entry['externalMaterials'][name])
+                            elif entry.get('config', {}).get('materialMode') == 'blockout' and entry['config'].get('blockoutFallback'):
+                                slot.material_interface = resolved[entry['materials']['DefaultMaterial']]
                             elif entry.get('config', {}).get('family') == 'item' and entry['config'].get('deferMaterials'):
                                 pass  # No Item master has been selected; keep existing/default binding.
                             else:
@@ -1235,7 +1313,7 @@ def apply_job(job):
                                          if is_suit_part else catalog.update_model_level(obj, key))
                     row['polycountStatus'] = 'ready' if ready else 'pending'
                     if row['polycountStatus'] == 'pending':
-                        row['message'] = '模型已发送，面数等级待统计；请确认新版插件已加载'
+                        row['message'] = '模型已发送，面数统计尚未完成或保存；请检查 UE 日志及统计表的版本控制/写入权限'
                 if entry['kind'] in ('staticMesh', 'skeletalMesh'):
                     # Replace the inspection hint with the final outcome, rather
                     # than repeating the same warning twice in the result row.
@@ -1244,6 +1322,8 @@ def apply_job(job):
                     lod_report = lod_policy_report(obj, entry)
                     if lod_report:
                         row['lodReport'] = lod_report
+                        if lod_report.get('waitingForRig'):
+                            row['message'] = '等待新版骨骼模型：已保留 SK LOD0 并清理旧 SK LOD1–5；SM 保持正常。新版 SK 发送后将使用已有 SM LOD1 自动生成。'
                         missing = lod_report.get('missing', [])
                         if missing:
                             prefix = '模型保持不变；' if row['status'] == 'unchanged' else '模型已发送；'
@@ -1267,6 +1347,7 @@ def apply_job(job):
             except Exception as error:
                 row.update(status='failed', message=str(error))
                 unreal.log_error('AssetHive Suit: ' + traceback.format_exc())
+    # Old Blockout materials remain for manual cleanup; never scan/delete them here.
     timings['totalMs'] = round((time.perf_counter() - started) * 1000)
     checked['timings'] = timings
     unreal.log('AssetHiveSuitTiming:' + json.dumps(timings))
@@ -1275,7 +1356,7 @@ def apply_job(job):
 
 def suit_status(job):
     if job.get('capabilityProbe'):
-        capabilities = ['characterStatusV2', 'characterLinkOnlyV1']
+        capabilities = ['characterStatusV2', 'characterLinkOnlyV1', 'characterLodResetV2', 'characterBlockoutV1', 'characterBlockoutInstancesV2', 'characterShadingMaskV1']
         library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
         if library and all(hasattr(library, name) for name in ('parse_link_mesh_source', 'release_link_mesh_source', 'reimport_linked_model', 'get_link_skeleton_bones', 'verify_groom_source', 'copy_groom_import_options')):
             capabilities.append('characterLinkOnlyV2')

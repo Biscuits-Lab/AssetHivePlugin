@@ -48,5 +48,5 @@ public:
     static class USkeleton* CreateSkeletonForMesh(class USkeletalMesh* Model, const FString& PackagePath);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
-    static bool UpdateModelLevel(UObject* Model, const FString& SourceIdentity, const FString& SuitId = TEXT(""), const FString& SuitName = TEXT(""), FName SuitPart = NAME_None);
+    static bool UpdateModelLevel(UObject* Model, const FString& SourceIdentity, const FString& SuitId = TEXT(""), const FString& SuitName = TEXT(""), FName SuitPart = NAME_None, bool bRefreshSharedCatalog = false);
 };

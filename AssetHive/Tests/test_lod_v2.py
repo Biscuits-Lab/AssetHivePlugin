@@ -33,7 +33,7 @@ class LodV2Tests(unittest.TestCase):
             def derive(*args):
                 result = self.report()
                 result['levels'][1]['source'] = 'existing'
-                if args[-1]: events.append('derive')
+                if args[4]: events.append('derive')
                 else: result['pending'] = [1, 2, 3, 4, 5]
                 return json.dumps(result)
             library = types.SimpleNamespace(complete_skinned_lods_from_static=derive)
