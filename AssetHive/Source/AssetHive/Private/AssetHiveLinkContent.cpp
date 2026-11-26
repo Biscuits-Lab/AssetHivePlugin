@@ -25,6 +25,43 @@
 #include "AssetCompilingManager.h"
 #include "UObject/Package.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "StaticMeshAttributes.h"
+#include "Misc/SecureHash.h"
+
+// Per-slot geometry evidence is independent of FBX slot names and vertex order.
+// Missing evidence never authorizes borrowing another mesh's material.
+FString UAssetHiveModelCatalogLibrary::GetStaticMaterialGeometry(UStaticMesh* Model)
+{
+    FMeshDescription* Mesh = Model ? Model->GetMeshDescription(0) : nullptr;
+    if (!Mesh) return TEXT("{}");
+    FStaticMeshAttributes Attributes(*Mesh);
+    const auto Positions = Attributes.GetVertexPositions();
+    const auto Names = Attributes.GetPolygonGroupMaterialSlotNames();
+    TMap<FString, TArray<FString>> Groups;
+    for (const FTriangleID Triangle : Mesh->Triangles().GetElementIDs())
+    {
+        TArray<FString> Corners;
+        for (const FVertexInstanceID Corner : Mesh->GetTriangleVertexInstances(Triangle))
+        {
+            const FVector3f P = Positions[Mesh->GetVertexInstanceVertex(Corner)];
+            Corners.Add(FString::Printf(TEXT("%lld,%lld,%lld"),
+                FMath::RoundToInt64(double(P.X) * 1000.0),
+                FMath::RoundToInt64(double(P.Y) * 1000.0),
+                FMath::RoundToInt64(double(P.Z) * 1000.0)));
+        }
+        Corners.Sort();
+        Groups.FindOrAdd(Names[Mesh->GetTrianglePolygonGroup(Triangle)].ToString()).Add(FString::Join(Corners, TEXT(";")));
+    }
+    TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+    for (auto& Group : Groups)
+    {
+        Group.Value.Sort();
+        Result->SetStringField(Group.Key, FMD5::HashAnsiString(*FString::Join(Group.Value, TEXT("|"))));
+    }
+    FString Json;
+    FJsonSerializer::Serialize(Result, TJsonWriterFactory<>::Create(&Json));
+    return Json;
+}
 
 // The FBX coordinate system, triangulation and build settings must be applied
 // before comparing with UE data. Parse into transient objects ONLY, without

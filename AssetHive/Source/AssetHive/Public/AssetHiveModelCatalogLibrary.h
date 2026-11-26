@@ -33,6 +33,9 @@ public:
     static void ReleaseLinkMeshSource(UObject* Model);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
+    static FString GetStaticMaterialGeometry(class UStaticMesh* Model);
+
+    UFUNCTION(BlueprintCallable, Category="AssetHive")
     static void ProtectImportedLod(UObject* Model, int32 Index);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
@@ -42,7 +45,7 @@ public:
     static FString CompleteCharacterLods(UObject* Model, const TArray<int32>& ManualLevels, bool bRegenerate, bool bSourceChanged = true);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
-    static bool AssignExistingSkeleton(class USkeletalMesh* Model, class USkeleton* Skeleton);
+    static bool AssignExistingSkeleton(class USkeletalMesh* Model, class USkeleton* Skeleton, bool bAllowCompatibleExtensions = false);
 
     UFUNCTION(BlueprintCallable, Category="AssetHive")
     static class USkeleton* CreateSkeletonForMesh(class USkeletalMesh* Model, const FString& PackagePath);

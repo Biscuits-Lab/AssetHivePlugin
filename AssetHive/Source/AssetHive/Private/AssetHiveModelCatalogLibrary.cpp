@@ -19,7 +19,7 @@
 #include "Subsystems/EditorAssetSubsystem.h"
 #include "HAL/FileManager.h"
 
-bool UAssetHiveModelCatalogLibrary::AssignExistingSkeleton(USkeletalMesh* Model, USkeleton* Skeleton)
+bool UAssetHiveModelCatalogLibrary::AssignExistingSkeleton(USkeletalMesh* Model, USkeleton* Skeleton, bool bAllowCompatibleExtensions)
 {
     if (!Model || !Skeleton) return false;
     const FReferenceSkeleton& Source = Model->GetRefSkeleton();
@@ -27,11 +27,29 @@ bool UAssetHiveModelCatalogLibrary::AssignExistingSkeleton(USkeletalMesh* Model,
     for (int32 Index = 0; Index < Source.GetNum(); ++Index)
     {
         const int32 TargetIndex = Target.FindBoneIndex(Source.GetBoneName(Index));
-        if (TargetIndex == INDEX_NONE) return false;
         const int32 Parent = Source.GetParentIndex(Index);
+        if (TargetIndex == INDEX_NONE)
+        {
+            if (!bAllowCompatibleExtensions) return false;
+            int32 Ancestor = Parent;
+            while (Ancestor != INDEX_NONE && Target.FindBoneIndex(Source.GetBoneName(Ancestor)) == INDEX_NONE)
+            {
+                const int32 Next = Source.GetParentIndex(Ancestor);
+                if (Next >= Ancestor) return false;
+                Ancestor = Next;
+            }
+            if (Ancestor == INDEX_NONE) return false;
+            continue;
+        }
         const int32 TargetParent = Target.GetParentIndex(TargetIndex);
         if ((Parent == INDEX_NONE) != (TargetParent == INDEX_NONE)) return false;
         if (Parent != INDEX_NONE && Source.GetBoneName(Parent) != Target.GetBoneName(TargetParent)) return false;
+    }
+    if (bAllowCompatibleExtensions)
+    {
+        Skeleton->Modify();
+        if (!Skeleton->MergeAllBonesToBoneTree(Model, false)) return false;
+        Skeleton->MarkPackageDirty();
     }
     Model->Modify();
     Model->SetSkeleton(Skeleton);

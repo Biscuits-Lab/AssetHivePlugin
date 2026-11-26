@@ -1,44 +1,44 @@
 {
-	"FileVersion": 3,
-	"Version": 10,
-	"VersionName": "1.2.6",
-	"FriendlyName": "AssetHive",
-	"Description": "AssetHive live import over local TCP, with configurable project import root",
-	"Category": "Importers",
-	"CreatedBy": "AssetHive",
-	"CreatedByURL": "",
-	"DocsURL": "",
-	"MarketplaceURL": "",
-	"SupportURL": "",
-	"CanContainContent": true,
-	"EnabledByDefault": true,
-	"IsBetaVersion": false,
-	"Installed": false,
-	"Modules": [
-		{
-			"Name": "AssetHiveRuntime",
-			"Type": "Runtime",
-			"LoadingPhase": "Default"
-		},
-		{
-			"Name": "AssetHive",
-			"Type": "Editor",
-			"LoadingPhase": "Default"
-		}
-	],
-	"IsExperimentalVersion": false,
-	"Plugins": [
-		{
-			"Name": "HairStrands",
-			"Enabled": true
-		},
-		{
-			"Name": "AlembicHairImporter",
-			"Enabled": true
-		},
-		{
-			"Name": "PythonScriptPlugin",
-			"Enabled": true
-		}
-	]
+  "FileVersion": 3,
+  "Version": 11,
+  "VersionName": "1.2.7",
+  "FriendlyName": "AssetHive",
+  "Description": "AssetHive live import over local TCP, with configurable project import root",
+  "Category": "Importers",
+  "CreatedBy": "AssetHive",
+  "CreatedByURL": "",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "CanContainContent": true,
+  "EnabledByDefault": true,
+  "IsBetaVersion": false,
+  "Installed": false,
+  "Modules": [
+    {
+      "Name": "AssetHiveRuntime",
+      "Type": "Runtime",
+      "LoadingPhase": "Default"
+    },
+    {
+      "Name": "AssetHive",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ],
+  "IsExperimentalVersion": false,
+  "Plugins": [
+    {
+      "Name": "HairStrands",
+      "Enabled": true
+    },
+    {
+      "Name": "AlembicHairImporter",
+      "Enabled": true
+    },
+    {
+      "Name": "PythonScriptPlugin",
+      "Enabled": true
+    }
+  ]
 }

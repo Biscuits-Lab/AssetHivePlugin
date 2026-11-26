@@ -36,6 +36,7 @@ script = pathlib.Path(__file__).resolve().parents[1] / 'Content/Python/assethive
 if not script.exists():
     script = pathlib.Path(__file__).with_name('assethive_suit_import.py')
 spec = importlib.util.spec_from_file_location('suit_import', script)
+sys.path.insert(0, str(script.parent))
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
@@ -51,6 +52,25 @@ class Asset:
 
 
 class SuitImportTests(unittest.TestCase):
+    def test_clothing_extensions_allow_branches_but_not_core_changes(self):
+        entry = {'key': 'owner:skeletalMesh:main', 'kind': 'skeletalMesh', 'sourcePath': str(script),
+                 'targetPath': '/Game/Characters/Hero/Asset_PJZ/SK_Test', 'skeletonPath': '/Game/Characters/Hero/Asset_PJZ/SKEL_Test',
+                 'config': {}, 'targetBones': [{'name': 'root', 'parent': ''}, {'name': 'chest', 'parent': 'root'}]}
+        core = [{'name': 'root', 'parent': ''}, {'name': 'chest', 'parent': 'root'}]
+        with patch.object(module, 'load', return_value=object()), patch.object(module.unreal, 'Skeleton', object, create=True):
+            entry['bones'] = core + [{'name': 'cloth1', 'parent': 'chest'}, {'name': 'cloth2', 'parent': 'cloth1'}]
+            module.validate_entry(entry)
+            self.assertEqual(entry['skeletonAddedBones'], ['cloth1', 'cloth2'])
+            for bones in [
+                core + [{'name': 'cloth', 'parent': ''}],
+                core + [{'name': 'cloth', 'parent': 'missing'}],
+                core + [{'name': 'a', 'parent': 'b'}, {'name': 'b', 'parent': 'a'}],
+                [{'name': 'root', 'parent': ''}, {'name': 'chest', 'parent': 'cloth'}, {'name': 'cloth', 'parent': 'root'}],
+            ]:
+                entry['bones'] = bones
+                with self.assertRaises(RuntimeError):
+                    module.validate_entry(entry)
+
     def test_lod_source_drive_change_is_not_content_change(self):
         import copy
         entry = {'key':'mesh','kind':'staticMesh','sourceHash':'lod0', 'config':{'lodSources':[{'index':1,'sourceHash':'lod1','sourcePath':'Z:/Library/lod1.fbx'}]}}
@@ -292,6 +312,21 @@ class SuitImportTests(unittest.TestCase):
         row = self.inspect({moved.path: moved}, {self.entry['key']: [moved]})['entries'][0]
         self.assertEqual(row['action'], 'unchanged')
         self.assertEqual(row['path'], moved.path)
+
+    def test_new_character_layout_does_not_move_existing_weapon(self):
+        entry = {'kind': 'skeletalMesh', 'name': 'SK_WP_VillagerBell_Bell',
+                 'targetPath': '/Game/Characters/Monster/Villager/Weapon/SK_WP_VillagerBell_Bell',
+                 'skeletonPath': '/Game/Characters/Monster/Villager/Weapon/SKEL_WP_VillagerBell_Bell',
+                 'config': {'family': 'monster'}}
+        previous = {'name': 'SK_VillagerBell_Bell',
+                    'targetPath': '/Game/Characters/Monster/Villager/Weapon/Mesh/SkeletalMesh/SK_VillagerBell_Bell',
+                    'skeletonPath': '/Game/Characters/Monster/Villager/Weapon/Mesh/SkeletalMesh/SKEL_VillagerBell_Bell'}
+        module.preserve_existing_character_layout(entry, previous)
+        self.assertEqual(entry['targetPath'], previous['targetPath'])
+        self.assertEqual(entry['skeletonPath'], previous['skeletonPath'])
+        renamed = {**entry, 'targetPath': '/Game/Characters/Monster/Renamed/Weapon/SK_WP_Renamed_Bell'}
+        module.preserve_existing_character_layout(renamed, previous)
+        self.assertIn('/Renamed/', renamed['targetPath'])
 
     def test_duplicate_identity_and_destination_collision_are_blocked(self):
         original = Asset(self.entry['key'], self.entry['targetPath'], self.entry)
