@@ -8,6 +8,38 @@ from assethive_material_handoff import prepare
 
 
 class MaterialHandoffTests(unittest.TestCase):
+    def test_existing_desktop_blockout_identity_and_colour_survive_inspection(self):
+        sk, sm, job = self.fixture()
+        material = {'key': 'desktop-stable-key', 'kind': 'material', 'name': 'MI_Desktop',
+                    'config': {'blockoutMaterial': {'color': [0.1, 0.2, 0.3]}}}
+        sk['materials']['lambert2'] = material['key']
+        job['suits'][0]['entries'].append(material)
+        for _ in range(2):
+            prepare(job, lambda key, target: sm if ':staticMesh:' in key else None,
+                    lambda key: '/Game/ExistingMI', lambda entry, static: {})
+        self.assertEqual(sk['materials']['lambert2'], material['key'])
+        self.assertEqual([item for item in job['suits'][0]['entries'] if item['key'] == material['key']], [material])
+
+    def test_explicit_blockout_with_old_formal_sm_allows_unmatched_slots(self):
+        sk, sm, job = self.fixture()
+        sk['config']['materialMode'] = 'blockout'
+        sm['config'] = {}
+        prepare(job, lambda key, target: sm if ':staticMesh:' in key else None,
+                lambda key: '/Game/FormalMI', lambda entry, static: {})
+        self.assertEqual(sk['unresolvedMaterials'], [])
+        self.assertEqual(len(sk['materials']), 2)
+        self.assertEqual(sk['config']['materialMode'], 'blockout')
+
+    def test_explicit_blockout_does_not_restore_stale_formal_failure(self):
+        sk, sm, job = self.fixture()
+        saved = copy.deepcopy(sk)
+        sk['config']['materialMode'] = 'blockout'
+        sm['config'] = {}
+        prepare(job, lambda key, target: saved if ':skeletalMesh:' in key else sm,
+                lambda key: '/Game/FormalMI', lambda entry, static: {})
+        self.assertEqual(sk['unresolvedMaterials'], [])
+        self.assertEqual(len(sk['materials']), 2)
+
     def fixture(self):
         sk = {'key': 'owner:skeletalMesh:head', 'kind': 'skeletalMesh', 'name': 'SK_Head',
               'sourceHash': 'new', 'targetPath': '/Game/Test/SK_Head', 'config': {'family': 'suit'},
@@ -27,7 +59,7 @@ class MaterialHandoffTests(unittest.TestCase):
         self.assertEqual(sk['config']['materialMode'], 'blockout')
         self.assertEqual(job['suits'][0]['entries'][0]['config']['blockoutMaterial']['color'], [1, 0, 0])
 
-    def test_sm_upgrade_never_changes_unchanged_sk(self):
+    def test_sm_upgrade_updates_unchanged_sk_appearance(self):
         sk, sm, job = self.fixture()
         saved = copy.deepcopy(sk)
         saved['materials'] = {'MI_Rig_head_01': 'old-mi'}
@@ -35,9 +67,38 @@ class MaterialHandoffTests(unittest.TestCase):
         saved['config']['materialMode'] = 'blockout'
         sm['config'] = {}
         prepare(job, lambda key, target: saved if ':skeletalMesh:' in key else sm, lambda key: '/Game/FormalMI', lambda entry, static: {'MI_Rig_head_01': ['MI_Art_head_01']})
-        self.assertEqual(sk['materials'], saved['materials'])
-        self.assertEqual(sk['config']['materialMode'], 'blockout')
-        self.assertFalse(sk['adoptStaticMaterials'])
+        self.assertEqual(sk['materials'], {})
+        self.assertNotIn('materialMode', sk['config'])
+        self.assertTrue(sk['adoptStaticMaterials'])
+        self.assertEqual(sk['sourceHash'], saved['sourceHash'])
+        self.assertEqual(sk['externalMaterials'], {'MI_Rig_head_01': '/Game/FormalMI'})
+        self.assertEqual(sk['unresolvedMaterials'], ['lambert2'])
+
+    def test_same_send_uses_new_sm_mapping_and_tracks_its_dependencies(self):
+        sk, sm, job = self.fixture()
+        sm['sourceHash'] = 'geometry'
+        planned = {**copy.deepcopy(sm), 'kind': 'staticMesh', 'config': {},
+                   'materials': {'MI_Art_head_01': 'new-mi'}}
+        job['suits'][0]['entries'].insert(0, planned)
+        prepare(job, lambda key, target: sm if ':staticMesh:' in key else None,
+                lambda key: '/Game/' + key, lambda entry, static: {'MI_Rig_head_01': ['MI_Art_head_01']})
+        self.assertEqual(sk['materials'], {'MI_Rig_head_01': 'new-mi'})
+        self.assertNotIn('materialMode', sk['config'])
+        self.assertEqual(sm['materials'], {'MI_Art_head_01': 'existing-mi'})
+
+    def test_first_send_uses_verified_source_geometry_without_existing_sm(self):
+        sk, sm, job = self.fixture()
+        sm.update(kind='staticMesh', sourcePath='/source/SM.fbx', sourceHash='new')
+        sm['config'] = {}
+        job['suits'][0]['entries'].insert(0, sm)
+        seen = []
+        def geometry(entry, reference):
+            seen.append(reference)
+            return {'MI_Rig_head_01': ['MI_Art_head_01']}
+        prepare(job, lambda key, target: None, lambda key: '/Game/MI_New', geometry)
+        self.assertEqual(seen, [sm])
+        self.assertEqual(sk['materials'], {'MI_Rig_head_01': 'existing-mi'})
+        self.assertEqual(sk['unresolvedMaterials'], ['lambert2'])
 
     def test_formal_requires_matching_slot_not_arbitrary_order(self):
         sk, sm, job = self.fixture()
@@ -46,6 +107,16 @@ class MaterialHandoffTests(unittest.TestCase):
         self.assertEqual(sk['externalMaterials']['MI_Rig_head_01'], '/Game/FormalMI')
         self.assertEqual(sk['unresolvedMaterials'], ['lambert2'])
         self.assertEqual(len(job['suits'][0]['entries']), 1)
+
+    def test_verified_desktop_material_mapping_is_not_erased_by_static_geometry_mismatch(self):
+        sk, sm, job = self.fixture()
+        sm['config'] = {}
+        sk['materials'] = {'MI_Rig_head_01': 'explicit-material'}
+        sk['externalMaterials'] = {'lambert2': '/Game/Shared/Body'}
+        prepare(job, lambda key, target: sm, lambda key: '/Game/FormalMI', lambda entry, static: {})
+        self.assertEqual(sk['materials'], {'MI_Rig_head_01': 'explicit-material'})
+        self.assertEqual(sk['externalMaterials'], {'lambert2': '/Game/Shared/Body'})
+        self.assertEqual(sk['unresolvedMaterials'], [])
 
     def test_inspection_is_repeatable_and_never_mutates_receipt(self):
         sk, sm, job = self.fixture()

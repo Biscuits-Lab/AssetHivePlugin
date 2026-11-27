@@ -80,7 +80,7 @@ FString UAssetHiveModelCatalogLibrary::CompleteSkinnedLodsFromStatic(USkeletalMe
     TSharedPtr<FJsonObject> SourceMaterials;
     if (!SourceMaterialsJson.IsEmpty() && !FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(SourceMaterialsJson), SourceMaterials))
         return Fail(TEXT("Invalid source material mapping"));
-    const FString Revision = TEXT("skin-v5:") + SourceHash + TEXT(":") + FString::FromInt(SourceLod) + TEXT(":") + RigHash
+    const FString Revision = TEXT("skin-v5:targets-40-15-10-2:") + SourceHash + TEXT(":") + FString::FromInt(SourceLod) + TEXT(":") + RigHash
         + TEXT(":") + FMD5::HashAnsiString(*SourceMaterialsJson);
     TArray<int32> Pending;
     for (int32 Level = 1; Level <= 5; ++Level) {
@@ -422,6 +422,7 @@ FString UAssetHiveModelCatalogLibrary::CompleteSkinnedLodsFromStatic(USkeletalMe
     for (int32 Level = 2; Level <= 5; ++Level) if (!Pending.Contains(Level)) Automatic.Add(MakeShared<FJsonValueNumber>(Level));
     Result->SetStringField(TEXT("policy"), TEXT("lod1-reduction-v2"));
     Result->SetNumberField(TEXT("qualityVersion"), 1);
+    Result->SetStringField(TEXT("reductionProfile"), TEXT("targets-40-15-10-2"));
     Result->SetNumberField(TEXT("skinTransferVersion"), 1);
     Result->SetStringField(TEXT("rigHash"), MeshHash(Model->GetMeshDescription(0)));
     if (MeshHash(Model->GetMeshDescription(0)) != RigHash) return Fail(TEXT("SK LOD0 changed unexpectedly"));

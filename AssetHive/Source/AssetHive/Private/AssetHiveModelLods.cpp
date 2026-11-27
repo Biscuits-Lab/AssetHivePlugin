@@ -219,8 +219,14 @@ FString UAssetHiveModelCatalogLibrary::CompleteCharacterLods(UObject* Model, con
     for (int32 Index = 1; Index <= 4; ++Index) if (HasManual(Index)) {
         SourceStructures.Add(Index, DescribeLodStructure(Sk, Sm, Index));
         const FMeshDescription* Description = Sk ? Sk->GetMeshDescription(Index) : Sm->GetMeshDescription(Index);
-        if (Description) SourceHashes.Add(Index, FString::FromInt(Index) + TEXT(":") + FStaticMeshOperations::ComputeSHAHash(*Description, true).ToString());
+        if (Description) SourceHashes.Add(Index, TEXT("targets-40-15-10-2:") + FString::FromInt(Index) + TEXT(":") + FStaticMeshOperations::ComputeSHAHash(*Description, true).ToString());
     }
+    // Targets are fractions of artist LOD1, even when a later manual LOD is
+    // used as the reduction source. Never overwrite manually supplied levels.
+    auto TargetRatio = [&](int32 Index, int32 Base) {
+        const float Targets[] = {1.f, 1.f, .4f, .15f, .1f, .02f};
+        return FMath::Clamp(Targets[Index] * float(Triangles(1)) / FMath::Max(1, Triangles(Base)), 0.f, 1.f);
+    };
     auto SourceKey = [](int32 Index) { return FString::Printf(TEXT("AssetHive.LodSource.%d"), Index); };
     auto QualityPasses = [&](int32 Index) {
         const auto* Structure = SourceStructures.Find(BaseIndex(Index));
@@ -235,9 +241,9 @@ FString UAssetHiveModelCatalogLibrary::CompleteCharacterLods(UObject* Model, con
         }
         if (!bPlanLod1) { Missing.Add(MakeShared<FJsonValueNumber>(Index)); continue; }
         const int32 Base = BaseIndex(Index);
-        const float Ratio = FMath::Pow(.5f, Index - Base);
+        const float Ratio = TargetRatio(Index, Base);
         const FString SavedSource = Model->GetOutermost()->GetMetaData().GetValue(Model, *SourceKey(Index));
-        const bool bSameSource = SavedSource.IsEmpty() ? Base == 1 && !IsComponentLod(Sm, Index) : SavedSource == SourceHashes.FindRef(Base);
+        const bool bSameSource = !SavedSource.IsEmpty() && SavedSource == SourceHashes.FindRef(Base);
         const bool bConfigured = bSameSource && (Sk
             ? Sk->GetLODInfo(Index) && Sk->GetLODInfo(Index)->ReductionSettings.BaseLOD == Base
                 && Sk->GetLODInfo(Index)->ReductionSettings.NumOfTrianglesPercentage >= Ratio
@@ -354,7 +360,7 @@ FString UAssetHiveModelCatalogLibrary::CompleteCharacterLods(UObject* Model, con
         if (Index >= 2 && !ManualLevels.Contains(Index) && !HasManual(Index)) {
             Level->SetBoolField(TEXT("structureVerified"), QualityPasses(Index));
             Level->SetNumberField(TEXT("baseLod"), BaseIndex(Index));
-            Level->SetBoolField(TEXT("qualityFallback"), Triangles(Index) > FMath::CeilToInt(Triangles(BaseIndex(Index)) * FMath::Pow(.5f, Index - BaseIndex(Index))));
+            Level->SetBoolField(TEXT("qualityFallback"), Triangles(Index) > FMath::CeilToInt(Triangles(BaseIndex(Index)) * TargetRatio(Index, BaseIndex(Index))));
         }
         Level->SetStringField(TEXT("source"), ManualLevels.Contains(Index) ? TEXT("imported") : HasManual(Index) ? TEXT("existing") : TEXT("generated"));
         Levels.Add(MakeShared<FJsonValueObject>(Level));
@@ -369,6 +375,7 @@ FString UAssetHiveModelCatalogLibrary::CompleteCharacterLods(UObject* Model, con
     const auto Result = MakeShared<FJsonObject>();
     Result->SetStringField(TEXT("policy"), TEXT("lod1-reduction-v2"));
     Result->SetNumberField(TEXT("qualityVersion"), 1);
+    Result->SetStringField(TEXT("reductionProfile"), TEXT("targets-40-15-10-2"));
     Result->SetArrayField(TEXT("automatic"), Automatic);
     Result->SetArrayField(TEXT("existing"), Existing);
     Result->SetArrayField(TEXT("pending"), Pending);

@@ -84,8 +84,35 @@ def same_entry_content(saved, entry):
                     ('sourceHash', 'skeletonPath', 'materials', 'externalMaterials', 'textures', 'heroSharedRoles')))
 
 
+def same_mesh_source(saved, entry):
+    """Appearance and LOD changes do not require importing base geometry again."""
+    if entry.get('kind') not in ('staticMesh', 'skeletalMesh'):
+        return False
+    if not saved.get('sourceHash') or saved['sourceHash'] != entry.get('sourceHash'):
+        return False
+    if saved.get('skeletonPath') != entry.get('skeletonPath'):
+        return False
+    independent = {'lodSources', 'lodImportVersion', 'lodPolicy', 'lodReductionProfile', 'skinLodSource',
+                   'lodReset', 'lodResetBaseCount', 'ignoreEmbeddedLods',
+                   'materialMode', 'blockoutFallback', 'itemMaterialVersion', 'deferMaterials'}
+    return ({key: value for key, value in saved.get('config', {}).items() if key not in independent}
+            == {key: value for key, value in entry.get('config', {}).items() if key not in independent})
+
+
 def preserve_existing_character_layout(entry, previous):
     """New Monster/NPC directory rules apply to new assets, not implicit moves."""
+    if previous.get('associationCanonicalPath') and entry.get('targetPath') in (previous['associationCanonicalPath'], previous.get('associationExistingPath')) and previous.get('associationExistingPath'):
+        entry['associationCanonicalPath'] = previous['associationCanonicalPath']
+        entry['associationExistingPath'] = previous['associationExistingPath']
+        entry['targetPath'] = previous['associationExistingPath']
+        if entry['kind'] == 'skeletalMesh' and not entry.get('config', {}).get('skeletonOverride'):
+            entry['skeletonPath'] = previous.get('skeletonPath', entry.get('skeletonPath'))
+            entry['config'] = {**entry['config'], 'ownSkeleton': False, 'createPhysicsAsset': False,
+                               'physicsAssetPath': previous.get('config', {}).get('physicsAssetPath', '')}
+            skeleton = load(entry['skeletonPath'])
+            if skeleton:
+                entry['targetBones'] = json.loads(unreal.AssetHiveModelCatalogLibrary.get_link_skeleton_bones(skeleton))
+        return
     if entry.get('config', {}).get('family') not in ('monster', 'npc'):
         return
     def normalized(path):
@@ -109,8 +136,21 @@ def preserve_existing_character_layout(entry, previous):
         entry['config']['physicsAssetPath'] = old_physics
 
 
+def legacy_blockout_key_matches(entry, old_key, saved):
+    """同一主体同一槽的旧 12 位标识升级，保持 UE 材质对象及引用。"""
+    current = re.fullmatch(r'(.+:blockout:)([a-f0-9]{16}):mi', entry.get('key', ''))
+    previous = re.fullmatch(r'(.+:blockout:)([a-f0-9]{12}):mi', old_key or '')
+    return bool(current and previous and current[1] == previous[1] and current[2].startswith(previous[2])
+                and entry.get('kind') == saved.get('kind') == 'material'
+                and 'blockoutMaterial' in entry.get('config', {}) and 'blockoutMaterial' in saved.get('config', {})
+                and saved.get('name') == entry.get('name') and saved.get('targetPath')
+                and same_ue_package(saved['targetPath'], entry.get('targetPath')))
+
+
 def legacy_export_matches(entry, old_key, saved):
     """Match only the same exported resource after its AssetHive owner ID changed."""
+    if legacy_blockout_key_matches(entry, old_key, saved):
+        return True
     if not old_key or ':' not in old_key or ':' not in entry.get('key', ''):
         return False
     return (old_key.split(':', 1)[1] == entry['key'].split(':', 1)[1]
@@ -423,7 +463,8 @@ def configure_emissive_instance(obj, entry, previous):
     had_emissive = bool(previous.get('textures', {}).get('E'))
     if not reparented and (not has_emissive or had_emissive):
         return
-    parameter = 'UseEmissive' if item_material_entry(entry) else 'Use Emissive'
+    parameter = ('EyeEmissive_UseEmissive' if config.get('materialRole') == 'hero_eye'
+                 else 'UseEmissive' if item_material_entry(entry) else 'Use Emissive')
     MEL.set_material_instance_static_switch_parameter_value(obj, parameter, has_emissive)
     if MEL.get_material_instance_static_switch_parameter_value(obj, parameter) != has_emissive:
         raise RuntimeError('材质实例参数设置失败：' + parameter)
@@ -519,6 +560,9 @@ def validate_entry(entry, deleted_owners=()):
         raise RuntimeError(entry['validationError'])
     path = entry.get('targetPath', '')
     root = ITEM_ROOT if entry.get('config', {}).get('family') == 'item' else NPC_ROOT if entry.get('config', {}).get('family') == 'npc' else MONSTER_ROOT if entry.get('config', {}).get('family') == 'monster' else WEAPON_ROOT if weapon_entry(entry) else ROOT
+    existing_association = entry.get('associationExistingPath') == path and load(path)
+    if existing_association and str(EAL.get_metadata_tag(existing_association, KEY)) in ('', entry['key'], *entry.get('associationReferenceKeys', [])):
+        root = '/Game/'
     if not path.startswith(root) or any(segment in ('', '.', '..') for segment in path[1:].split('/')):
         raise RuntimeError('Invalid Suit destination: ' + path)
     if entry['kind'] not in ('texture', 'material', 'staticMesh', 'skeletalMesh', 'groom'):
@@ -601,6 +645,8 @@ def validate_entry(entry, deleted_owners=()):
             return
         if config.get('materialRole', '').startswith('hero_'):
             expected = {'hero_face': 'M_Char_Face', 'hero_hair': 'M_Char_Hair', 'hero_eyebrow': 'M_Char_EyeBrow', 'hero_eye': 'M_Char_Eye_CustomIris'}.get(config['materialRole'])
+            if config['materialRole'] == 'hero_eye' and config.get('virtualTexture'):
+                expected = 'M_Char_Eye_CustomIris_VT'
             if config.get('parentPath') != '/Game/MaterialLibrary/Character/Common/' + str(expected):
                 raise RuntimeError('脸部/头发母材质映射不正确')
             parent = load(config['parentPath'])
@@ -652,6 +698,10 @@ def relocate_resource(obj, source, target):
 
 
 def inspect(job):
+    if job.get('associationSync'):
+        from types import SimpleNamespace
+        import assethive_association_sync
+        assethive_association_sync.prepare(job, SimpleNamespace(**globals()))
     records = read_registry()
     import assethive_material_handoff
     planned = {entry['key']: entry for suit in job['suits'] for entry in suit['entries']}
@@ -679,7 +729,16 @@ def inspect(job):
             raise RuntimeError('请更新 AssetHive UE 插件，以核验 SM/SK 材质对应的模型分区')
         reference = load(static.get('path'))
         model = None
+        parsed_reference = None
         try:
+            if not reference and static.get('sourcePath'):
+                with open(static['sourcePath'], 'rb') as stream:
+                    if hashlib.file_digest(stream, 'sha256').hexdigest() != static.get('sourceHash'):
+                        raise RuntimeError('美术模型在检查后发生变化，请重新检查')
+                parsed_reference = library.parse_link_mesh_source(unreal.StaticMesh(), static['sourcePath'])
+                reference = parsed_reference
+            if not reference:
+                return {}
             model = library.parse_link_mesh_source(reference, entry['sourcePath'])
             if not model:
                 return {}
@@ -690,6 +749,8 @@ def inspect(job):
         finally:
             if model:
                 library.release_link_mesh_source(model)
+            if parsed_reference:
+                library.release_link_mesh_source(parsed_reference)
     assethive_material_handoff.prepare(job, saved_material_entry,
                                       lambda key: records.get(key, {}).get('path') or planned.get(key, {}).get('targetPath'),
                                       material_geometry_matches)
@@ -765,14 +826,16 @@ def inspect(job):
                 row['path'] = object_path(obj)
                 if key != entry['key']:
                     old = receipt(obj) or records.get(key, {})
-                    if key and not legacy_export_matches(entry, key, old):
+                    shared_adoption = job.get('associationSync') and key in entry.get('associationReferenceKeys', [])
+                    if key and not shared_adoption and not legacy_export_matches(entry, key, old):
                         raise RuntimeError('此目标属于另一个库资产，不能覆盖')
-                    if key and key.split(':', 1)[0] in deleted_owners:
+                    legacy_blockout = legacy_blockout_key_matches(entry, key, old)
+                    if legacy_blockout or key and key.split(':', 1)[0] in deleted_owners:
                         saved = reassociated_receipt(old, key, entry['key'])
                         same = all(saved.get(field) == entry.get(field) for field in
                                    ('sourceHash', 'config', 'skeletonPath', 'textures', 'materials', 'externalMaterials'))
                         row.update(action='relinked' if same else 'updated', oldKey=key,
-                                   message='旧库资产已删除，已自动匹配；确认发送后重新关联')
+                                   message='本次更新旧版 Blockout 记录，保留原材质对象' if legacy_blockout else '旧库资产已删除，已自动匹配；确认发送后重新关联')
                         if entry['kind'] == 'material':
                             current = current_material_values(obj, entry)
                             row['currentMaterial'] = current
@@ -792,7 +855,7 @@ def inspect(job):
                         reset_pending = lod_reset_pending(obj, entry)
                         lod_report = None if reset_pending else lod_policy_report(obj, entry)
                         if reset_pending:
-                            row.update(action='updated', message='LOD0 已替换：清理旧 LOD1 及后续等级，仅使用本版本新提供的 LOD')
+                            row.update(action='updated', message='本次将更新基础模型并清理失效的旧 LOD；有配套 LOD1 时自动生成后续等级')
                         if lod_report:
                             row['lodReport'] = lod_report
                             if lod_report.get('waitingForRig'):
@@ -820,6 +883,10 @@ def inspect(job):
                 row.update(status='missing', action='restore', message='UE 中已缺失：选择补回或跳过本次')
         except Exception as error:
             row.update(status='blocked', message=str(error))
+        if entry.get('associationMergePaths'):
+            row['sharedMergePaths'] = entry['associationMergePaths']
+            if row['action'] == 'unchanged':
+                row['action'] = 'updated'
         row['effectiveDependencies'] = list(entry.get('materials', entry.get('textures', {})).values())
         row['effectiveUnresolvedMaterials'] = entry.get('unresolvedMaterials', [])
         if entry.get('kind') == 'skeletalMesh':
@@ -1347,12 +1414,9 @@ def apply_job(job):
                     adopt_item_materials = bool(old_config and old_config.get('deferMaterials') and entry.get('config', {}).get('itemMaterialVersion') and decision != 'keepUE')
                     if row['action'] != 'repair':
                         stage = time.perf_counter()
-                        # A LOD-only update must not reimport LOD0 or recreate helpers.
+                        # Keep base geometry/skin for appearance and LOD-only updates.
                         prior = receipt(obj, records.get(key)) if obj else {}
-                        lod_only = bool(obj and entry['kind'] in ('staticMesh', 'skeletalMesh')
-                            and prior.get('sourceHash') == entry.get('sourceHash')
-                            and {k: v for k, v in prior.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy', 'skinLodSource', 'lodReset', 'lodResetBaseCount', 'ignoreEmbeddedLods')}
-                            == {k: v for k, v in entry.get('config', {}).items() if k not in ('lodSources', 'lodImportVersion', 'lodPolicy', 'skinLodSource', 'lodReset', 'lodResetBaseCount', 'ignoreEmbeddedLods')})
+                        lod_only = bool(obj and same_mesh_source(prior, entry))
                         reset = bool(obj and entry['kind'] in ('staticMesh', 'skeletalMesh') and lod_reset_pending(obj, entry))
                         if reset:
                             reset_model_lods(obj, entry)
@@ -1414,6 +1478,16 @@ def apply_job(job):
                     stage = time.perf_counter()
                     save(obj, saved)
                     timings['saveMs'] += round((time.perf_counter() - stage) * 1000)
+                if job.get('associationSync') and entry.get('associationMergePaths'):
+                    duplicates = [load(path) for path in entry['associationMergePaths']]
+                    allowed = set(entry.get('associationReferenceKeys', [])) | {key}
+                    if any(not item or item == obj or str(EAL.get_metadata_tag(item, KEY)) not in allowed for item in duplicates):
+                        raise RuntimeError('旧共享副本归属发生变化，请重新检查')
+                    if not EAL.consolidate_assets(obj, duplicates):
+                        raise RuntimeError('共享引用未全部同步，请联系 TA 检查 UE 保存权限后重试')
+                    for alias in entry.get('associationReferenceKeys', []):
+                        if alias != key:
+                            records.pop(alias, None)
                 row['path'] = object_path(obj)
                 row['status'] = 'unchanged' if row['action'] == 'unchanged' else 'success'
                 resolved[key] = obj
@@ -1469,7 +1543,7 @@ def apply_job(job):
 
 def suit_status(job):
     if job.get('capabilityProbe'):
-        capabilities = ['characterStatusV2', 'characterLinkOnlyV1', 'characterLodResetV2', 'characterBlockoutV1', 'characterBlockoutInstancesV2', 'characterShadingMaskV1', 'characterMaterialHandoffV1']
+        capabilities = ['characterStatusV2', 'characterLinkOnlyV1', 'characterLodResetV2', 'characterBlockoutV1', 'characterBlockoutInstancesV2', 'characterShadingMaskV1', 'characterMaterialHandoffV1', 'characterAssociationSyncV1']
         library = getattr(unreal, 'AssetHiveModelCatalogLibrary', None)
         if library and all(hasattr(library, name) for name in ('parse_link_mesh_source', 'release_link_mesh_source', 'reimport_linked_model', 'get_link_skeleton_bones', 'verify_groom_source', 'copy_groom_import_options')):
             capabilities.append('characterLinkOnlyV2')

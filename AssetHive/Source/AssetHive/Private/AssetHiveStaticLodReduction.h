@@ -62,7 +62,7 @@ inline bool Reduce(const FMeshDescription& Source, float Ratio, FMeshDescription
         bool bAccepted = false;
         // A shared ladder makes successive LOD candidate sets nested, avoiding
         // a coarser level becoming heavier just because its retry steps differ.
-        for (float Keep : {.0625f, .125f, .25f, .5f, .65f, .8f, .9f, .95f}) {
+        for (float Keep : {.02f, .1f, .15f, .4f, .5f, .65f, .8f, .9f, .95f}) {
             if (Keep < Ratio) continue;
             FMeshReductionSettings Settings;
             Settings.PercentTriangles = Keep;

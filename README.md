@@ -2,7 +2,14 @@
 
 Download the plugin from [Releases](https://github.com/Biscuits-Lab/AssetHivePlugin/releases).
 
-The current source version is **1.2.1**. Extract the AssetHive folder into your project Plugins directory and rebuild it with your project's engine. Close Unreal Editor before replacing an existing installation.
+The current source version is **1.2.8**. Extract the AssetHive folder into your project Plugins directory and rebuild it with your project's engine. Close Unreal Editor before replacing an existing installation.
+
+## 1.2.8
+
+- Synchronize existing character assets from AssetHive while retaining their UE paths and compatible skeleton/physics references.
+- Reuse explicitly registered shared materials and textures, including references to older copies.
+- Fix character material handoff, Blockout identity upgrades, ShadingMask updates and non-cloth LOD generation.
+- Character textures default to VT. Zion eye materials use the VT variant while retaining regular height sampling for iris parallax; sync the accompanying project material assets through P4.
 
 The older 1.1.0 release included Windows x64 editor binaries for Unreal Engine 5.5.4 (BuildId 37670630); those binaries do not apply to the current source version.
 

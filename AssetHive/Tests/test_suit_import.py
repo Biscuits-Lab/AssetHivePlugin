@@ -71,6 +71,55 @@ class SuitImportTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     module.validate_entry(entry)
 
+    def test_appearance_and_lods_preserve_base_but_source_and_skeleton_changes_do_not(self):
+        import copy
+        old = {'kind': 'skeletalMesh', 'sourceHash': 'geometry', 'skeletonPath': '/Game/Rig',
+               'config': {'family': 'suit', 'materialMode': 'blockout', 'blockoutFallback': True}}
+        new = copy.deepcopy(old)
+        new['config'] = {'family': 'suit', 'lodPolicy': 'lod1-reduction-v2', 'lodReductionProfile': 'targets-40-15-10-2'}
+        new['externalMaterials'] = {'Body': '/Game/MI_Formal'}
+        self.assertTrue(module.same_mesh_source(old, new))
+        for field, value in [('sourceHash', 'new-geometry'), ('skeletonPath', '/Game/NewRig')]:
+            changed = {**new, field: value}
+            self.assertFalse(module.same_mesh_source(old, changed))
+        new['config']['updateReferencePose'] = True
+        self.assertFalse(module.same_mesh_source(old, new))
+
+    def test_apply_formal_appearance_preserves_existing_sk_and_does_not_import_geometry(self):
+        import copy
+        import hashlib
+        from contextlib import ExitStack
+        entry = {'key': 'owner:skeletalMesh:main', 'name': 'SK_Test', 'kind': 'skeletalMesh',
+                 'sourcePath': str(script), 'sourceHash': hashlib.sha256(script.read_bytes()).hexdigest(),
+                 'targetPath': '/Game/Test/SK_Test', 'skeletonPath': '/Game/Test/Rig',
+                 'config': {'family': 'monster'}, 'materials': {},
+                 'externalMaterials': {'Body': '/Game/Test/MI_Formal'}, 'adoptStaticMaterials': True}
+        old = copy.deepcopy(entry)
+        old['config']['materialMode'] = 'blockout'
+        old['externalMaterials']['Body'] = '/Game/Test/MI_BO'
+        slot = types.SimpleNamespace(material_slot_name='Body', material_interface=object(),
+                                     get_editor_property=lambda name: 'Body')
+        mesh = Asset(entry['key'], entry['targetPath'], old)
+        mesh.get_editor_property = lambda name: [slot] if name == 'materials' else None
+        mesh.set_editor_property = lambda name, value: None
+        material = object()
+        checked = {'inspectToken': 'token', 'entries': [{'key': entry['key'], 'name': entry['name'],
+                   'kind': entry['kind'], 'assetId': 'owner', 'status': 'ready', 'action': 'updated',
+                   'path': entry['targetPath']}]}
+        job = {'inspectToken': 'token', 'suits': [{'assetId': 'owner', 'entries': [entry]}]}
+        with ExitStack() as stack:
+            for name, value in [('inspect', checked), ('read_registry', {}), ('source_control_issue', ''),
+                                ('lod_reset_pending', False), ('lod_policy_report', None),
+                                ('apply_model_lods', None), ('verify_lod_report', None),
+                                ('synchronize_owned_helpers', None), ('write_registry', None), ('save', None)]:
+                stack.enter_context(patch.object(module, name, return_value=value))
+            stack.enter_context(patch.object(module, 'load', side_effect=lambda path: material if path == '/Game/Test/MI_Formal' else mesh))
+            importer = stack.enter_context(patch.object(module, 'import_file'))
+            result = module.apply_job(job)
+        self.assertEqual(result['entries'][0]['status'], 'success', result)
+        self.assertIs(slot.material_interface, material)
+        importer.assert_not_called()
+
     def test_lod_source_drive_change_is_not_content_change(self):
         import copy
         entry = {'key':'mesh','kind':'staticMesh','sourceHash':'lod0', 'config':{'lodSources':[{'index':1,'sourceHash':'lod1','sourcePath':'Z:/Library/lod1.fbx'}]}}
@@ -144,6 +193,17 @@ class SuitImportTests(unittest.TestCase):
         saved = {**entry, 'targetPath':'/Game/Characters/Monster/B/SM_Main'}
         self.assertFalse(module.legacy_export_matches(entry, 'old:staticMesh:main', saved))
         self.assertTrue(module.legacy_export_matches(entry, 'old:staticMesh:main', {**saved, 'targetPath':entry['targetPath']}))
+
+    def test_old_blockout_key_length_is_only_migrated_for_the_same_owner_slot_and_object(self):
+        old_key = 'one:skeletalMesh:head:blockout:0123456789ab:mi'
+        old = {'kind': 'material', 'key': old_key, 'name': 'MI_BO_Head_0123456789ab', 'targetPath': '/Game/Test/MI_BO_Head_0123456789ab', 'config': {'blockoutMaterial': {}}}
+        entry = {**old, 'key': 'one:skeletalMesh:head:blockout:0123456789abcdef:mi'}
+        self.assertTrue(module.legacy_blockout_key_matches(entry, old_key, old))
+        self.assertTrue(module.legacy_export_matches(entry, old_key, old))
+        self.assertFalse(module.legacy_blockout_key_matches(entry, old_key.replace('one:', 'other:'), old))
+        self.assertFalse(module.legacy_blockout_key_matches(entry, old_key.replace(':head:', ':arm:'), old))
+        self.assertFalse(module.legacy_blockout_key_matches(entry, old_key, {**old, 'targetPath': '/Game/Other/MI_BO_Head_0123456789ab'}))
+        self.assertFalse(module.legacy_blockout_key_matches(entry, old_key, {**old, 'config': {}}))
 
     def test_verified_sidecar_supersedes_stale_native_receipt_at_exact_object(self):
         obj = Asset('', '/Game/Existing.SM_Existing', {})
@@ -228,6 +288,14 @@ class SuitImportTests(unittest.TestCase):
             writer.reset_mock()
             module.configure_emissive_instance(object(), entry, entry)
             writer.assert_not_called()
+
+    def test_eye_emissive_uses_project_eye_switch(self):
+        entry = {'config': {'family': 'suit', 'materialRole': 'hero_eye', 'parentPath': '/Game/MaterialLibrary/Character/Common/M_Char_Eye_CustomIris_VT'}, 'textures': {'E': 'eye-e'}}
+        values = {}
+        with patch.object(module.MEL, 'set_material_instance_static_switch_parameter_value', side_effect=lambda obj, key, value: values.update({key: value}), create=True), \
+             patch.object(module.MEL, 'get_material_instance_static_switch_parameter_value', side_effect=lambda obj, key: values.get(key), create=True):
+            module.configure_emissive_instance(object(), entry, {})
+        self.assertEqual(values, {'EyeEmissive_UseEmissive': True})
 
     def test_item_upgrade_requires_choice_for_custom_material_but_not_engine_default(self):
         entry = {'kind': 'staticMesh', 'config': {'family': 'item', 'itemMaterialVersion': 1}, 'materials': {'Mat': 'managed-mi'}}
