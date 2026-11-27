@@ -101,6 +101,12 @@ def same_mesh_source(saved, entry):
 
 def preserve_existing_character_layout(entry, previous):
     """New Monster/NPC directory rules apply to new assets, not implicit moves."""
+    if entry.get('monsterWeaponNamingVersion') == 1:
+        old = previous.get('targetPath', '')
+        directory, _, name = old.rpartition('/')
+        corrected = re.sub(r'^(MI|T)_(?!WP_)', r'\1_WP_', name)
+        if old and corrected != name and directory + '/' + corrected == entry.get('targetPath'):
+            return
     if previous.get('associationCanonicalPath') and entry.get('targetPath') in (previous['associationCanonicalPath'], previous.get('associationExistingPath')) and previous.get('associationExistingPath'):
         entry['associationCanonicalPath'] = previous['associationCanonicalPath']
         entry['associationExistingPath'] = previous['associationExistingPath']
@@ -697,7 +703,38 @@ def relocate_resource(obj, source, target):
     return target, moved
 
 
+def normalize_monster_weapon_names(job):
+    """Correct 2.3.10 appearance names in Python; no desktop/DLL rebuild required."""
+    remapped = {}
+    for suit in job.get('suits', []):
+        for entry in suit.get('entries', []):
+            if entry.get('config', {}).get('family') != 'monster':
+                continue
+            folder, prefix = {'material': ('Material', 'MI'), 'texture': ('Texture', 'T')}.get(entry.get('kind'), ('', ''))
+            old = entry.get('targetPath', '')
+            directory, _, name = old.rpartition('/')
+            if not folder or not directory.endswith('/Weapon/' + folder) or not name.startswith(prefix + '_'):
+                continue
+            corrected = name if name.startswith(prefix + '_WP_') else prefix + '_WP_' + name[len(prefix) + 1:]
+            entry['monsterWeaponNamingVersion'] = 1
+            entry['name'] = corrected
+            if corrected == name:
+                continue
+            entry['weaponPreviousPath'] = old
+            entry['targetPath'] = directory + '/' + corrected
+            if 'associationNames' in entry:
+                entry['associationNames'] = list(dict.fromkeys([*entry['associationNames'], name, corrected]))
+            remapped[old] = entry['targetPath']
+            remapped[old + '.' + name] = entry['targetPath'] + '.' + corrected
+    for suit in job.get('suits', []):
+        for entry in suit.get('entries', []):
+            for field in ('externalMaterials', 'linkMaterialPaths'):
+                if field in entry:
+                    entry[field] = {slot: remapped.get(path, path) for slot, path in entry[field].items()}
+
+
 def inspect(job):
+    normalize_monster_weapon_names(job)
     if job.get('associationSync'):
         from types import SimpleNamespace
         import assethive_association_sync
@@ -784,6 +821,10 @@ def inspect(job):
             if len(matches) > 1:
                 raise RuntimeError('多个 UE 对象具有相同来源身份，请先明确目标')
             target_obj = load(entry['targetPath'])
+            previous_name_obj = load(entry.get('weaponPreviousPath'))
+            if previous_name_obj and target_obj and previous_name_obj != target_obj:
+                raise RuntimeError('新旧武器名称对应不同 UE 对象，请联系 TA 核对，未覆盖')
+            target_obj = target_obj or previous_name_obj
             legacy_matches = []
             if not matches and not target_obj:
                 for old_key in legacy_keys.get(entry['key'], []):

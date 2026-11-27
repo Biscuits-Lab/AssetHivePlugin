@@ -52,6 +52,55 @@ class Asset:
 
 
 class SuitImportTests(unittest.TestCase):
+    def test_monster_weapon_appearance_names_keep_number_and_wp(self):
+        import copy
+        root = '/Game/Characters/Monster/5_Minion/Minion_Villager/Mesh/Weapon'
+        entries = [dict(key='villager:' + kind, kind=kind, name=name,
+                        targetPath=root + '/' + folder + '/' + name, config={'family': 'monster'})
+                   for kind, folder, name in [('material', 'Material', 'MI_Villager_02_Bell'),
+                                             ('texture', 'Texture', 'T_Villager_02_Bell_Parta_01_D')]]
+        old_path = entries[0]['targetPath']
+        entries.append({'kind': 'skeletalMesh', 'config': {'family': 'monster'},
+                        'externalMaterials': {'Bell': old_path + '.MI_Villager_02_Bell'}})
+        job = {'suits': [{'entries': entries}]}
+        module.normalize_monster_weapon_names(job)
+        self.assertEqual(entries[0]['name'], 'MI_WP_Villager_02_Bell')
+        self.assertEqual(entries[1]['name'], 'T_WP_Villager_02_Bell_Parta_01_D')
+        self.assertEqual(entries[2]['externalMaterials']['Bell'], root + '/Material/MI_WP_Villager_02_Bell.MI_WP_Villager_02_Bell')
+        previous = {'targetPath': old_path, 'name': 'MI_Villager_02_Bell'}
+        module.preserve_existing_character_layout(entries[0], previous)
+        self.assertEqual(entries[0]['targetPath'], root + '/Material/MI_WP_Villager_02_Bell')
+        snapshot = copy.deepcopy(job)
+        module.normalize_monster_weapon_names(job)
+        self.assertEqual(job, snapshot)
+
+    def test_weapon_prefix_patch_does_not_touch_other_families_or_body(self):
+        import copy
+        entries = [dict(kind='texture', name='T_Villager_02_D', config={'family': family}, targetPath=path)
+                   for family, path in [('monster', '/Game/Characters/Monster/Mesh/Texture/T_Villager_02_D'),
+                                        ('npc', '/Game/Characters/NPC/Mesh/Weapon/Texture/T_Villager_02_D'),
+                                        ('weapon', '/Game/Characters/Weapon_PJZ/X/Texture/T_Villager_02_D')]]
+        job = {'suits': [{'entries': entries}]}
+        snapshot = copy.deepcopy(job)
+        module.normalize_monster_weapon_names(job)
+        self.assertEqual(job, snapshot)
+
+    def test_weapon_prefix_renames_owned_old_asset_but_blocks_distinct_collision(self):
+        import copy
+        path = '/Game/Characters/Monster/5_Minion/Minion_Villager/Mesh/Weapon/Texture/T_Villager_02_Bell_D'
+        self.entry.update(targetPath=path, name='T_Villager_02_Bell_D', config={'family': 'monster'})
+        self.records = {self.entry['key']: {**self.entry, 'path': path}}
+        original = copy.deepcopy(self.job)
+        asset = Asset(self.entry['key'], path, self.entry)
+        corrected = path.replace('/T_', '/T_WP_')
+        result = self.inspect({path: asset})
+        self.assertEqual(result['entries'][0]['action'], 'renamed')
+        self.assertEqual(result['entries'][0]['targetPath'], corrected)
+        self.job = original
+        result = self.inspect({path: asset, corrected: Asset('other', corrected, {})})
+        self.assertEqual(result['entries'][0]['status'], 'blocked')
+        self.assertIn('新旧武器名称对应不同 UE 对象', result['entries'][0]['message'])
+
     def test_clothing_extensions_allow_branches_but_not_core_changes(self):
         entry = {'key': 'owner:skeletalMesh:main', 'kind': 'skeletalMesh', 'sourcePath': str(script),
                  'targetPath': '/Game/Characters/Hero/Asset_PJZ/SK_Test', 'skeletonPath': '/Game/Characters/Hero/Asset_PJZ/SKEL_Test',
