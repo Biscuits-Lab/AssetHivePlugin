@@ -2,7 +2,15 @@
 
 Download the plugin from [Releases](https://github.com/Biscuits-Lab/AssetHivePlugin/releases).
 
-The current source version is **1.2.8**. Extract the AssetHive folder into your project Plugins directory and rebuild it with your project's engine. Close Unreal Editor before replacing an existing installation.
+The current source version is **1.2.9**. Extract the AssetHive folder into your project Plugins directory and rebuild it with your project's engine. Close Unreal Editor before replacing an existing installation.
+
+## 1.2.9
+
+- Import Mask channel groups with independent UV selection, UV2 AO and texel-density-based tiling.
+- Import Nanite Foliage USDA and wind data, including Nanite Assembly when instances are present.
+- Mesh reimport updates skeletal meshes, skeletons, physics assets and assemblies while preserving unselected materials and textures.
+- Organize variants into SKM, Skel, Assembly and PhyAssets folders, with shared MI and Tex folders.
+- Fix monster weapon material and texture naming.
 
 ## 1.2.8
 
