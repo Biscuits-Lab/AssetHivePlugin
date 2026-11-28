@@ -35,7 +35,7 @@ public:
     UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Destructible Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Fixed parent MI used for Destructible 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Destructible/MI_Env_Destructible_VT_UV.MI_Env_Destructible_VT_UV"))
     TSoftObjectPtr<UMaterialInterface> AssetDestructibleParentMaterial;
 
-    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="MEGA Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Fixed parent MI used for MEGA 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Mega/MI_Env_Mega.MI_Env_Mega"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Mask Base Parent Material", AllowedClasses="/Script/Engine.MaterialInterface", ToolTip="Fixed parent MI used for Mask 3D assets. Default: /Game/MaterialLibrary/Environment/MI_Mask/MI_Env_Mask_BakedDiffuse_Base.MI_Env_Mask_BakedDiffuse_Base"))
     TSoftObjectPtr<UMaterialInterface> AssetMegaParentMaterial;
 
     UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Diffuse Texture Parameter", ToolTip="Texture parameter receiving the 3D asset Diffuse texture. Default: Diffuse_VT"))
@@ -50,10 +50,10 @@ public:
     UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Base Masked Texture Parameter", ToolTip="Texture parameter receiving OpacityMasked for the Base Masked parent. Default: Mask_VT"))
     FString AssetMaskParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="MEGA UV2 Mask Texture Parameter", ToolTip="Texture parameter receiving the MEGA UV2 Mask texture. Default: Mega Mask_UV2"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Mask Texture Parameter", ToolTip="Texture parameter receiving the Mask texture. Default: Mask"))
     FString AssetMegaMaskParameter;
 
-    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Emissive Texture Parameter", ToolTip="Texture parameter receiving Emissive for Base/MEGA parents. Default: Emissive_Tex_VT"))
+    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Emissive Texture Parameter", ToolTip="Texture parameter receiving Emissive for Base/Mask parents. Default: Emissive_Tex_VT"))
     FString AssetEmissiveParameter;
 
     UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Material", meta=(DisplayName="Destructible Emissive Texture Parameter", ToolTip="Texture parameter receiving Emissive for the Destructible parent. Default: Emissive_Tex"))
@@ -81,7 +81,7 @@ public:
     UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Kits Max LOD0 Triangles", ToolTip="Kits 3D assets use a fixed triangle budget on import, independent of size. Default: 100000"))
     int32 Asset3DKitsMaxLOD0Triangles = 100000;
 
-    UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="MEGA Max LOD0 Triangles", ToolTip="MEGA 3D assets use a fixed triangle budget on import, independent of size. Default: 100000"))
+    UPROPERTY(config)
     int32 Asset3DMegaMaxLOD0Triangles = 100000;
 
     UPROPERTY(EditAnywhere, config, Category="2. 3D Assets|Mesh", meta=(DisplayName="Destructible Max LOD0 Triangles", ToolTip="Destructible 3D assets use a fixed triangle budget on import, independent of size. Default: 100000"))

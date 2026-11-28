@@ -30,12 +30,12 @@ UAssetHiveSettings::UAssetHiveSettings()
     AssetBaseParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_VT_Simple.MI_Env_Base_VT_Simple")));
     AssetBaseMaskedParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_Masked_VT_Simple.MI_Env_Base_Masked_VT_Simple")));
     AssetDestructibleParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Destructible/MI_Env_Destructible_VT_UV.MI_Env_Destructible_VT_UV")));
-    AssetMegaParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Mega/MI_Env_Mega.MI_Env_Mega")));
+    AssetMegaParentMaterial = TSoftObjectPtr<UMaterialInterface>(FSoftObjectPath(TEXT("/Game/MaterialLibrary/Environment/MI_Mask/MI_Env_Mask_BakedDiffuse_Base.MI_Env_Mask_BakedDiffuse_Base")));
     AssetAlbedoParameter = TEXT("Diffuse_VT");
     AssetNormalParameter = TEXT("Normal_VT");
     AssetORMTextureParameter = TEXT("ORM_VT");
     AssetMaskParameter = TEXT("Mask_VT");
-    AssetMegaMaskParameter = TEXT("Mega Mask_UV2");
+    AssetMegaMaskParameter = TEXT("Mask");
     AssetEmissiveParameter = TEXT("Emissive_Tex_VT");
     AssetDestructibleEmissiveParameter = TEXT("Emissive_Tex");
     AssetUseEmissiveSwitch = TEXT("UseEmissive");
@@ -264,7 +264,7 @@ FString UAssetHiveSettings::GetAssetParentMaterialPath(const FString& AssetType,
 {
     const UAssetHiveSettings* Settings = GetDefault<UAssetHiveSettings>();
     const TSoftObjectPtr<UMaterialInterface>* Configured = &Settings->AssetBaseParentMaterial;
-    if (AssetType.Equals(TEXT("MEGA"), ESearchCase::IgnoreCase))
+    if (AssetType.Equals(TEXT("Mask"), ESearchCase::IgnoreCase) || AssetType.Equals(TEXT("MEGA"), ESearchCase::IgnoreCase))
     {
         Configured = &Settings->AssetMegaParentMaterial;
     }
@@ -317,7 +317,7 @@ FString UAssetHiveSettings::GetAssetMaskParameter()
 FString UAssetHiveSettings::GetAssetMegaMaskParameter()
 {
     const FString Value = GetDefault<UAssetHiveSettings>()->AssetMegaMaskParameter.TrimStartAndEnd();
-    return Value.IsEmpty() ? TEXT("Mega Mask_UV2") : Value;
+    return Value.IsEmpty() ? TEXT("Mask") : Value;
 }
 
 FString UAssetHiveSettings::GetAssetEmissiveParameter(const FString& AssetType)

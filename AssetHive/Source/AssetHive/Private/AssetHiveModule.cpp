@@ -110,6 +110,8 @@ void FAssetHiveModule::OnTCPMessageReceived(const FString& Message)
                                                  MakeShared<FJsonValueString>(TEXT("plantCantileverWeights")),
                                                  MakeShared<FJsonValueString>(TEXT("meshOnlyOverwrite")),
                                                  MakeShared<FJsonValueString>(TEXT("selectiveOverwrite")),
+                                                 MakeShared<FJsonValueString>(TEXT("maskMaterials")),
+                                                 MakeShared<FJsonValueString>(TEXT("naniteFoliage")),
                                                  MakeShared<FJsonValueString>(TEXT("characterSuitV1")),
                                                  MakeShared<FJsonValueString>(TEXT("characterLodsV2")),
                                                  MakeShared<FJsonValueString>(TEXT("characterLodTargets40_15_10_2")),

@@ -39,6 +39,14 @@
     {
       "Name": "PythonScriptPlugin",
       "Enabled": true
+    },
+    {
+      "Name": "USDImporter",
+      "Enabled": true
+    },
+    {
+      "Name": "DynamicWind",
+      "Enabled": true
     }
   ]
 }

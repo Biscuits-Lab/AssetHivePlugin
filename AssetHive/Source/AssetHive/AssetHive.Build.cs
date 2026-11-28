@@ -31,6 +31,8 @@ public class AssetHive : ModuleRules
             "Json",
             "JsonUtilities",
             "PythonScriptPlugin",
+            "DynamicWind",
+            "DynamicWindEditor",
             "LevelEditor",
             "MaterialEditor",
             "UnrealEd",

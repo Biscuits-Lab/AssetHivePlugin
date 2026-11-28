@@ -38,12 +38,12 @@ bool FAssetHiveSettingsTest::RunTest(const FString& Parameters)
     TestEqual(TEXT("3D base parent default"), UAssetHiveSettings::GetAssetParentMaterialPath(TEXT("Objects"), false), FString(TEXT("/Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_VT_Simple.MI_Env_Base_VT_Simple")));
     TestEqual(TEXT("3D masked parent default"), UAssetHiveSettings::GetAssetParentMaterialPath(TEXT("Props"), true), FString(TEXT("/Game/MaterialLibrary/Environment/MI_Base/MI_Env_Base_Masked_VT_Simple.MI_Env_Base_Masked_VT_Simple")));
     TestEqual(TEXT("3D destructible parent default"), UAssetHiveSettings::GetAssetParentMaterialPath(TEXT("Destructible"), true), FString(TEXT("/Game/MaterialLibrary/Environment/MI_Destructible/MI_Env_Destructible_VT_UV.MI_Env_Destructible_VT_UV")));
-    TestEqual(TEXT("3D MEGA parent ignores masked"), UAssetHiveSettings::GetAssetParentMaterialPath(TEXT("MEGA"), true), FString(TEXT("/Game/MaterialLibrary/Environment/MI_Mega/MI_Env_Mega.MI_Env_Mega")));
+    TestEqual(TEXT("3D MEGA parent ignores masked"), UAssetHiveSettings::GetAssetParentMaterialPath(TEXT("MEGA"), true), FString(TEXT("/Game/MaterialLibrary/Environment/MI_Mask/MI_Env_Mask_BakedDiffuse_Base.MI_Env_Mask_BakedDiffuse_Base")));
     TestEqual(TEXT("3D diffuse parameter"), UAssetHiveSettings::GetAssetAlbedoParameter(), FString(TEXT("Diffuse_VT")));
     TestEqual(TEXT("3D normal parameter"), UAssetHiveSettings::GetAssetNormalParameter(), FString(TEXT("Normal_VT")));
     TestEqual(TEXT("3D ORM parameter"), UAssetHiveSettings::GetAssetORMTextureParameter(), FString(TEXT("ORM_VT")));
     TestEqual(TEXT("3D base masked parameter"), UAssetHiveSettings::GetAssetMaskParameter(), FString(TEXT("Mask_VT")));
-    TestEqual(TEXT("3D MEGA mask parameter"), UAssetHiveSettings::GetAssetMegaMaskParameter(), FString(TEXT("Mega Mask_UV2")));
+    TestEqual(TEXT("3D MEGA mask parameter"), UAssetHiveSettings::GetAssetMegaMaskParameter(), FString(TEXT("Mask")));
     TestEqual(TEXT("3D emissive parameter"), UAssetHiveSettings::GetAssetEmissiveParameter(TEXT("Objects")), FString(TEXT("Emissive_Tex_VT")));
     TestEqual(TEXT("3D destructible emissive parameter"), UAssetHiveSettings::GetAssetEmissiveParameter(TEXT("Destructible")), FString(TEXT("Emissive_Tex")));
     TestEqual(TEXT("3D emissive switch"), UAssetHiveSettings::GetAssetUseEmissiveSwitch(), FString(TEXT("UseEmissive")));
